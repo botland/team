@@ -3,6 +3,11 @@
   "required": ["vectors", "adversarial_markdown"],
   "properties": {
     "adversarial_markdown": { "type": "string" },
+    "paths_touched": {
+      "type": "array",
+      "maxItems": 40,
+      "items": { "type": "string" }
+    },
     "vectors": {
       "type": "array",
       "maxItems": 15,

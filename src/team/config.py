@@ -48,7 +48,7 @@ ROLES: Dict[str, Dict[str, Any]] = {
     "adversarial": {
         "default": "grok",
         "runtimes": ("claude", "grok"),
-        "capability": "read-only",
+        "capability": "write-tests",
         "optional": True,
     },
     "debugger": {
@@ -86,7 +86,10 @@ PHASE_ORDER = [
     "implementer",
     "final-test",
     "debugger",
+    "repair",
+    "verify-test",
     "adversarial",
+    "adversarial-test",
     "reviewer",
     "guardian",
 ]
@@ -102,6 +105,9 @@ PHASE_ALIASES = {
     "replan": "replan",
     "audit": "scout",
     "assess": "assess",
+    "repair": "repair",
+    "verify": "verify-test",
+    "attack": "adversarial",
 }
 
 AUDIT_PHASE_ORDER = [
@@ -143,9 +149,12 @@ class Config:
         self.force = False
         self.stop_after: Optional[str] = None
         self.depth = "medium"
+        self.role_overrides: set = set()
 
     def assignment(self, role: str) -> str:
-        if self.fake and role != "tester":
+        if self.fake:
+            if role == "tester" and self.roles.get(role) == "host":
+                return "host"
             return "fake"
         return self.roles[role]
 
@@ -201,6 +210,7 @@ def load_config(
         for item in assign:
             role, runtime = _parse_assign(item)
             _set_role(cfg, role, runtime)
+            cfg.role_overrides.add(role)
     if skip:
         for item in skip:
             for part in str(item).split(","):

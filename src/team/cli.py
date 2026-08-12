@@ -77,9 +77,18 @@ def _parser() -> argparse.ArgumentParser:
     v.add_argument("slug")
     v.set_defaults(func=cmd_review)
 
-    p_re = sub.add_parser("replan", help="Claude/assigned architect writes a design delta")
+    p_re = sub.add_parser("replan", help="Architect writes a design delta")
     p_re.add_argument("slug")
+    p_re.add_argument(
+        "--continue",
+        dest="do_continue",
+        action="store_true",
+        help="Apply design-replan.md as design.md and resume from TDD design",
+    )
     p_re.set_defaults(func=cmd_replan)
+
+    lst = sub.add_parser("list", help="List .team/work runs in the target repo")
+    lst.set_defaults(func=cmd_list)
 
     s = sub.add_parser("status", help="Print phase rail from state.json (no model)")
     s.add_argument("slug")
@@ -130,9 +139,12 @@ def _cfg(args, **kwargs):
 
 def cmd_feature(args) -> int:
     brief = " ".join(args.brief).strip()
-    if brief.startswith("--"):
-        # leftover flags after subcommand
-        pass
+    if any(tok.startswith("--") for tok in (args.brief or [])):
+        print(
+            "Put flags before the brief, e.g.: team feature --dry-run Add a greet helper",
+            file=sys.stderr,
+        )
+        return 2
     if not brief:
         print("Need a feature brief, e.g.: team feature Add a greet helper", file=sys.stderr)
         return 2
@@ -184,6 +196,31 @@ def cmd_replan(args) -> int:
     print("== team replan %s" % args.slug)
     pipe.replan()
     print("wrote %s" % (pipe.work / "design-replan.md"))
+    if args.do_continue:
+        pipe.apply_replan()
+        _print_done(pipe)
+    return 0
+
+
+def cmd_list(args) -> int:
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+    root = repo / ".team" / "work"
+    if not root.is_dir():
+        print("no runs in %s" % root)
+        return 0
+    print("%-28s %-8s %-18s %s" % ("SLUG", "MODE", "PHASE", "STOP"))
+    found = False
+    for child in sorted(root.iterdir()):
+        if not (child / "state.json").is_file():
+            continue
+        found = True
+        state = State.load(child)
+        print(
+            "%-28s %-8s %-18s %s"
+            % (state.slug, state.mode, state.phase, state.stop_reason or "(in progress)")
+        )
+    if not found:
+        print("no runs in %s" % root)
     return 0
 
 

@@ -10,7 +10,7 @@ This is the team orchestrator. It is not an application feature repo.
 - Role → runtime assignment is data (`config.toml`, `--assign`). Do not hard-code Claude or Grok inside a phase except as a default in `ROLES`.
 - Persona text has one home: `personas/*.md`.
 - Do not write outside this repository when changing the engine (no `~/vibe.rc`, no `~/.team`, no target-app source).
-- `feature` implements. `audit` is the status-audit workflow (scout → assess → review) and must not write outside `.team/work/`.
+- `feature` implements (including debugger repair, adversarial tests, and `replan --continue`). `audit` is scout → assess → review and must not write outside `.team/work/`.
 - Both CLIs run **headless**. Claude needs `-p`; Grok needs `--prompt-file` and `--no-alt-screen`. Do not add `--fullscreen` or drop `-p`.
 - Repo-agnostic reasoning lives in `docs/engineering.md` and is injected into every agent prompt. Do not fork it into personas. Target-repo product law stays in that repo.
 
@@ -23,6 +23,6 @@ This is the team orchestrator. It is not an application feature repo.
 1. Add the persona under `personas/`.
 2. Register it in `src/team/config.py` `ROLES` with default runtime and allowed runtimes.
 3. Add a schema if it has structured output.
-4. Add a phase function and a `PHASE_ORDER` entry if it runs in `feature`.
+4. Add a phase function and a `PHASE_ORDER` or `AUDIT_PHASE_ORDER` entry.
 5. Extend `FakeRuntime` canned output.
 6. Keep defaults aligned with “reasoning on Claude, execution on Grok” unless the role is explicitly flexible-only.

@@ -405,9 +405,16 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
                     "title": "empty name",
                     "threat": "greet may return empty",
                     "covered_by_existing_test": False,
+                    "path": "%s/test_adversarial.py" % test_root,
                 }
             ],
-            "adversarial_markdown": "Try greet with an empty name.",
+            "adversarial_markdown": "Added a test for an empty greet.",
+            "paths_touched": ["%s/test_adversarial.py" % test_root],
+        },
+        "tester": {
+            "passed": True,
+            "report_markdown": "Host suite is authoritative; fake tester has nothing to add.",
+            "command_used": "true",
         },
         "debugger": {
             "owner": "implementer",
@@ -483,8 +490,16 @@ def _maybe_write_fake_files(phase: str, repo: Path, extra: Dict[str, Any]) -> No
                 "def test_greet_returns_hello():\n    assert True\n",
                 encoding="utf-8",
             )
-    if phase == "implementer":
+    if phase == "implementer" or phase.startswith("repair-implementer"):
         path = repo / code_root / "greet.py"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
             path.write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
+    if phase == "adversarial":
+        path = repo / test_root / "test_adversarial.py"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text(
+                "def test_adversarial_empty_ok():\n    assert True\n",
+                encoding="utf-8",
+            )

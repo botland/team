@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["passed", "report_markdown"],
+  "properties": {
+    "passed": { "type": "boolean" },
+    "report_markdown": { "type": "string" },
+    "command_used": { "type": "string" }
+  }
+}

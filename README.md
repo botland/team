@@ -22,7 +22,7 @@ Roles are data. Change them per machine (`config.toml`), per repo (`.team/config
 | test-writer | grok | tests under `test_root` |
 | implementer | grok | production under `code_root` |
 | tester | host | orchestrator runs the suite |
-| adversarial | grok | `adversarial.md` (report only) |
+| adversarial | grok | attack tests under `test_root` + `adversarial.md` |
 | debugger | claude | `diagnosis.md` (on failure) |
 | reviewer | **both** | `review-claude.md`, `review-grok.md`, merged `review.md` |
 | guardian | claude | `guardian.md` |
@@ -50,6 +50,8 @@ team status oauth-login
 team audit
 team audit ~/llm what's missing
 team audit --depth thorough what's missing
+team list
+team replan add-x --continue
 team roles
 team init
 ```
@@ -87,7 +89,11 @@ Each run lives in the **target** repo, not in this engine:
   review.md
   guardian.md
   adversarial.md
+  adversarial-test-report.md
   diagnosis.md            # only if tests failed
+  repair-summary.md       # after debugger repair
+  verify-test-report.md
+  followups.md            # open classes from review + guardian
   design-replan.md        # only after team replan
   scout.md / scout.json   # audit only
   status.md               # audit only
@@ -106,8 +112,10 @@ Each run lives in the **target** repo, not in this engine:
 2. **Baseline vs final.** The host runs `test_command` (or a discovered command) before and after implement. Verdicts: `PASS`, `FAIL`, `UNVERIFIED`, `REGRESSION`, `BROKEN_BASELINE`.
 3. **Consults are files.** A writer that is not ready returns questions. The orchestrator calls the named role and resumes the writer. Cross-vendor (Grok implementer → Claude architect) is the same path.
 4. **Dual review.** When `reviewer=both`, Claude and Grok review independently and never see each other’s report. Merge is deterministic (concat + overlap on path+title).
-5. **Replan is a delta.** `design-replan.md` uses unchanged / changed / new / removed criteria and structural changes. It does not start implement.
-6. **Audit is read-only.** After scout / assess / review, new dirty paths must sit under `.team/work/` only. Claims of done/WIP/missing need path-level evidence; the reviewer treats the scout inventory as untrusted.
+5. **Replan is a delta.** `design-replan.md` uses unchanged / changed / new / removed criteria and structural changes. `team replan --continue` applies it as `design.md` and resumes from TDD design.
+6. **Failed tests get one repair hop.** Debugger names an owner (`implementer` or `test-writer`); that role patches once; the host re-runs the suite.
+7. **Adversarial writes tests.** Attack vectors become files under `test_root`, then the host runs the suite again.
+8. **Audit is read-only.** After scout / assess / review, new dirty paths must sit under `.team/work/` only. Claims of done/WIP/missing need path-level evidence; the reviewer treats the scout inventory as untrusted.
 
 ## Config
 

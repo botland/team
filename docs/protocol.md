@@ -14,7 +14,13 @@ Every phase reads files and may write files. Chat context is not the handoff.
 | `impl-summary.md` | implementer | untrusted claim |
 | `baseline-report.md` | orchestrator | authoritative pre-impl suite |
 | `test-report.md` | orchestrator (+ optional tester commentary) | authoritative post-impl suite |
-| `adversarial.md` | adversarial | attack list; not a suite |
+| `adversarial.md` | adversarial | attack list |
+| tests under `test_root` (attack) | adversarial | new failing/contract tests |
+| `adversarial-test-report.md` | orchestrator | suite after attack tests |
+| `diagnosis.md` | debugger | root cause; owner |
+| `repair-summary.md` | implementer or test-writer | one repair hop |
+| `verify-test-report.md` | orchestrator | suite after repair |
+| `followups.md` | orchestrator | open classes from review + guardian |
 | `diagnosis.md` | debugger | claim about a failure |
 | `review-*.md` | each reviewer | independent; they must not read each other |
 | `review.md` | orchestrator merge | human-facing |

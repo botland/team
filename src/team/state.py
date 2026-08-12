@@ -27,10 +27,20 @@ class State:
     stop_reason: str = ""
     mode: str = "feature"
     depth: str = "medium"
+    diagnosis_owner: str = ""
+    adversarial_run: Dict[str, Any] = field(default_factory=dict)
 
     def mark(self, phase: str) -> None:
         if phase not in self.phases_done:
             self.phases_done.append(phase)
+        self.phase = phase
+
+    def rewind_to(self, phase: str, order: List[str]) -> None:
+        if phase not in order:
+            return
+        keep = set(order[: order.index(phase)])
+        self.phases_done = [p for p in self.phases_done if p in keep]
+        self.skipped = [p for p in self.skipped if p in keep]
         self.phase = phase
 
     def save(self, work: Path) -> None:

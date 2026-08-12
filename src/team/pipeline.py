@@ -247,22 +247,9 @@ class Pipeline:
                     continue
             if self.done(phase) and start is None:
                 continue
-            if self.should_skip(phase) and phase in ("critic", "adversarial", "guardian", "debugger"):
-                self.state.skipped.append(phase)
-                self.state.mark(phase)
-                self.save()
-                self.log("%s  skipped" % phase.upper())
-                continue
-            if phase == "debugger" and (self.state.final.get("status") == "PASS"):
-                self.state.skipped.append(phase)
-                self.state.mark(phase)
-                self.save()
-                self.log("DEBUGGER  skipped (tests passed)")
-                continue
-            if phase == "debugger" and self.should_skip("debugger"):
-                self.state.skipped.append(phase)
-                self.state.mark(phase)
-                self.save()
+            skip_reason = self._skip_reason(phase)
+            if skip_reason:
+                self._skip(phase, skip_reason)
                 continue
             handler = {
                 "architect": self.phase_architect,
@@ -273,13 +260,16 @@ class Pipeline:
                 "implementer": self.phase_implementer,
                 "final-test": self.phase_final_test,
                 "debugger": self.phase_debugger,
+                "repair": self.phase_repair,
+                "verify-test": self.phase_verify_test,
                 "adversarial": self.phase_adversarial,
+                "adversarial-test": self.phase_adversarial_test,
                 "reviewer": self.phase_reviewer,
                 "guardian": self.phase_guardian,
                 "scout": self.phase_scout,
                 "assess": self.phase_assess,
             }[phase]
-            self.log("== %s (%s)" % (phase, self.cfg.assignment(role_for_phase(phase))))
+            self.log("== %s (%s)" % (phase, self.cfg.assignment(role_for_phase(phase, self.state))))
             handler()
             self.state.mark(phase)
             self.save()
@@ -299,9 +289,49 @@ class Pipeline:
                 self.save()
                 self.log("stop: --stop-after %s" % phase)
                 return self.state
+        self._write_followups()
         self.state.stop_reason = "complete"
         self.save()
         return self.state
+
+    def _skip(self, phase: str, reason: str) -> None:
+        if phase not in self.state.skipped:
+            self.state.skipped.append(phase)
+        self.state.mark(phase)
+        self.save()
+        self.log("%s  skipped (%s)" % (phase.upper(), reason))
+
+    def _tests_passed(self) -> bool:
+        return (self.state.final.get("status") or "") == "PASS"
+
+    def _skip_reason(self, phase: str) -> str:
+        user_skip = {
+            "critic",
+            "adversarial",
+            "guardian",
+            "debugger",
+            "repair",
+            "verify-test",
+            "adversarial-test",
+        }
+        if self.should_skip(phase) and phase in user_skip:
+            return "requested"
+        if phase == "debugger" and self._tests_passed():
+            return "tests passed"
+        if phase == "repair":
+            if self._tests_passed():
+                return "tests passed"
+            if "debugger" in self.state.skipped:
+                return "no diagnosis"
+            owner = self.state.diagnosis_owner
+            if owner not in ("implementer", "test-writer"):
+                return "owner=%s cannot auto-repair" % (owner or "unknown")
+        if phase == "verify-test":
+            if "repair" in self.state.skipped:
+                return "no repair"
+        if phase == "adversarial-test" and "adversarial" in self.state.skipped:
+            return "no adversarial tests"
+        return ""
 
     def phase_architect(self) -> None:
         prompt = self._prompt(
@@ -516,24 +546,33 @@ class Pipeline:
         run["comparison"] = comparison
         self.state.final = run
         md = testhost.render_report("Final test run", run, comparison)
-        if self.cfg.assignment("tester") in ("claude", "grok", "fake"):
-            prompt = self._prompt(
-                "tester",
-                [
-                    self._listed_artifacts(["baseline-report.md", "tdd-summary.md", "impl-summary.md"]),
-                    "The orchestrator already ran: %s (exit %s, status %s)."
-                    % (cmd, run.get("exit"), run.get("status")),
-                    "Do not edit files. Add commentary only if you re-read the log.",
-                    "You may re-run the same command. Your passed flag is advisory;",
-                    "the orchestrator exit code is authoritative.",
-                ],
-            )
-            try:
-                self.invoke("tester", "tester", prompt, "write_summary.json", capability="execute")
-            except PipelineError as exc:
-                self.log("tester agent failed (host report kept): %s" % exc)
+        md = self._maybe_tester_agent(md, cmd, run, "tester")
         self.write_artifact("test-report.md", md)
         self.log("final %s verdict=%s" % (run["status"], comparison["verdict"]))
+
+    def _maybe_tester_agent(self, host_md: str, cmd: str, run: Dict[str, Any], phase: str) -> str:
+        if self.cfg.assignment("tester") not in ("claude", "grok", "fake"):
+            return host_md
+        prompt = self._prompt(
+            "tester",
+            [
+                self._listed_artifacts(["baseline-report.md", "tdd-summary.md", "impl-summary.md"]),
+                "The orchestrator already ran: %s (exit %s, status %s)."
+                % (cmd, run.get("exit"), run.get("status")),
+                "Do not edit files. You may re-run the same command.",
+                "Your passed flag is advisory; the orchestrator exit code is authoritative.",
+                "Fill report_markdown with commentary (failing names, surprises).",
+            ],
+        )
+        try:
+            result = self.invoke("tester", phase, prompt, "tester.json", capability="execute")
+        except PipelineError as exc:
+            self.log("tester agent failed (host report kept): %s" % exc)
+            return host_md
+        extra = as_str(result.output.get("report_markdown"))
+        if not extra:
+            return host_md
+        return host_md.rstrip() + "\n\n## Tester agent\n\n" + extra.rstrip() + "\n"
 
     def phase_debugger(self) -> None:
         if self.state.final.get("status") == "PASS":
@@ -557,9 +596,81 @@ class Pipeline:
         result = self.invoke("debugger", "debugger", prompt, "debugger.json")
         md = as_str(result.output.get("diagnosis_markdown")) or json.dumps(result.output, indent=2)
         self.write_artifact("diagnosis.md", md)
-        self.log("debugger owner=%s" % as_str(result.output.get("owner")))
+        owner = as_str(result.output.get("owner")) or "unknown"
+        self.state.diagnosis_owner = owner
+        self.log("debugger owner=%s" % owner)
+
+    def phase_repair(self) -> None:
+        owner = self.state.diagnosis_owner or "implementer"
+        before = gitutil.porcelain_paths(self.repo)
+        if owner == "test-writer":
+            prompt = self._prompt(
+                "test-writer",
+                [
+                    self._listed_artifacts(
+                        ["design.md", "test-contract.md", "diagnosis.md", "test-report.md"]
+                    ),
+                    "REPAIR. Diagnosis says the tests are wrong. Fix tests only.",
+                    "Edit ONLY under test_root=%r. NEVER edit production." % self.cfg.test_root,
+                    "Return summary and paths_touched.",
+                ],
+            )
+            result = self.invoke(
+                "test-writer",
+                "repair-test-writer",
+                prompt,
+                "write_summary.json",
+                capability="write-tests",
+                resume=True,
+            )
+            self.write_artifact(
+                "repair-summary.md",
+                as_str(result.output.get("summary")) or "(no repair summary)",
+            )
+            self._verify_write("repair", [self.cfg.test_root], before)
+        else:
+            prompt = self._prompt(
+                "implementer",
+                [
+                    self._listed_artifacts(
+                        ["design.md", "test-contract.md", "diagnosis.md", "test-report.md"]
+                    ),
+                    "REPAIR. Diagnosis says production is wrong. Fix production only.",
+                    "Edit ONLY under code_root=%r. NEVER edit tests." % self.cfg.code_root,
+                    "Return summary and paths_touched.",
+                ],
+            )
+            result = self.invoke(
+                "implementer",
+                "repair-implementer",
+                prompt,
+                "write_summary.json",
+                capability="write-code",
+                resume=True,
+            )
+            self.write_artifact(
+                "repair-summary.md",
+                as_str(result.output.get("summary")) or "(no repair summary)",
+            )
+            self._verify_write("repair", [self.cfg.code_root], before)
+        self.log("repair via %s" % owner)
+
+    def phase_verify_test(self) -> None:
+        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+        self.cfg.test_command = cmd
+        run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
+        comparison = testhost.compare(self.state.baseline, run)
+        run = dict(run)
+        run["comparison"] = comparison
+        self.state.final = run
+        md = testhost.render_report("Verify test run (after repair)", run, comparison)
+        md = self._maybe_tester_agent(md, cmd, run, "tester-verify")
+        self.write_artifact("verify-test-report.md", md)
+        self.write_artifact("test-report.md", md)
+        self.log("verify %s verdict=%s" % (run["status"], comparison["verdict"]))
 
     def phase_adversarial(self) -> None:
+        before = gitutil.porcelain_paths(self.repo)
         prompt = self._prompt(
             "adversarial",
             [
@@ -572,15 +683,38 @@ class Pipeline:
                         "test-report.md",
                     ]
                 ),
-                "List attack vectors. Do not edit files.",
+                "Hunt attack vectors, then WRITE tests under test_root=%r that try to break the implementation."
+                % self.cfg.test_root,
+                "Do not edit production (code_root=%r)." % self.cfg.code_root,
+                "Do not weaken existing tests. At most 15 vectors, highest risk first.",
+                "Return vectors, adversarial_markdown, and paths_touched (new test paths).",
             ],
         )
-        result = self.invoke("adversarial", "adversarial", prompt, "adversarial.json")
+        result = self.invoke(
+            "adversarial",
+            "adversarial",
+            prompt,
+            "adversarial.json",
+            capability="write-tests",
+        )
         md = as_str(result.output.get("adversarial_markdown")) or json.dumps(
             result.output, indent=2
         )
         self.write_artifact("adversarial.md", md)
+        self._verify_write("adversarial", [self.cfg.test_root], before)
         self.log("adversarial %d vector(s)" % len(as_list(result.output.get("vectors"))))
+
+    def phase_adversarial_test(self) -> None:
+        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+        self.cfg.test_command = cmd
+        run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
+        comparison = testhost.compare(self.state.final or self.state.baseline, run)
+        run = dict(run)
+        run["comparison"] = comparison
+        self.state.adversarial_run = run
+        md = testhost.render_report("Adversarial test run", run, comparison)
+        self.write_artifact("adversarial-test-report.md", md)
+        self.log("adversarial-test %s verdict=%s" % (run["status"], comparison["verdict"]))
 
     def phase_reviewer(self) -> None:
         if self.state.mode == "audit":
@@ -836,8 +970,53 @@ class Pipeline:
         self.save()
         self.log("replan written to design-replan.md")
 
+    def apply_replan(self) -> None:
+        delta = self.read_artifact("design-replan.md")
+        if not delta:
+            raise PipelineError("apply-replan needs design-replan.md (run team replan first)")
+        self.write_artifact("design.md", delta)
+        order = _phase_order(self.state)
+        self.state.rewind_to("tdd-design", order)
+        self.state.stop_reason = ""
+        self.save()
+        self.log("applied design-replan.md → design.md; resuming at tdd-design")
+        self.run(start="tdd-design")
 
-def role_for_phase(phase: str) -> str:
+    def _write_followups(self) -> None:
+        lines = ["# Open classes", ""]
+        found = False
+        for path in sorted((self.work / "prompts").glob("reviewer-*.result.json")):
+            try:
+                data = load_json(path)
+            except Exception:
+                continue
+            for item in as_list(data.get("findings")):
+                found = True
+                title = item.get("title") or "(untitled)"
+                sev = item.get("severity") or "?"
+                loc = item.get("path") or ""
+                lines.append("- **%s** %s%s" % (sev, title, (" (`%s`)" % loc) if loc else ""))
+        gpath = self.work / "prompts" / "guardian.result.json"
+        if gpath.is_file():
+            try:
+                data = load_json(gpath)
+            except Exception:
+                data = {}
+            for item in as_list(data.get("risks")):
+                found = True
+                title = item.get("title") or "(untitled)"
+                loc = item.get("path") or ""
+                lines.append("- **invariant** %s%s" % (title, (" (`%s`)" % loc) if loc else ""))
+        if not found:
+            lines.append("- (none recorded in reviewer/guardian structured output)")
+        self.write_artifact("followups.md", "\n".join(lines) + "\n")
+
+
+def role_for_phase(phase: str, state: Optional[State] = None) -> str:
+    if phase == "repair" and state is not None:
+        if state.diagnosis_owner == "test-writer":
+            return "test-writer"
+        return "implementer"
     return {
         "architect": "architect",
         "critic": "critic",
@@ -847,7 +1026,10 @@ def role_for_phase(phase: str) -> str:
         "implementer": "implementer",
         "final-test": "tester",
         "debugger": "debugger",
+        "repair": "implementer",
+        "verify-test": "tester",
         "adversarial": "adversarial",
+        "adversarial-test": "tester",
         "reviewer": "reviewer",
         "guardian": "guardian",
         "scout": "scout",
@@ -941,11 +1123,14 @@ def load_pipeline(cfg: Config, slug: str) -> Pipeline:
         cfg.test_root = state.test_root
     if not cfg.test_command:
         cfg.test_command = state.test_command
-    if state.assignment:
-        # keep CLI overrides already on cfg.roles; fill missing from state
-        for role, runtime in state.assignment.items():
-            if role in cfg.roles and cfg.roles[role] == ROLES.get(role, {}).get("default"):
-                # only restore if user did not pass --assign this session... 
-                # simpler: CLI load_config already applied assign. Prefer cfg.
-                pass
+    if state.depth:
+        cfg.depth = state.depth
+    for role, runtime in (state.assignment or {}).items():
+        if role not in cfg.roles:
+            continue
+        if role in cfg.role_overrides:
+            continue
+        allowed = ROLES.get(role, {}).get("runtimes") or ()
+        if runtime in allowed or runtime == "fake":
+            cfg.roles[role] = runtime
     return Pipeline(cfg, state, work)
