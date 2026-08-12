@@ -92,6 +92,9 @@ class FakePipelineTests(unittest.TestCase):
         self.assertTrue((work / "test-contract.md").is_file())
         state = State.load(work)
         self.assertEqual(state.stop_reason, "dry_run")
+        prompt = (work / "prompts" / "architect.prompt.md").read_text(encoding="utf-8")
+        self.assertIn("Enumerate the space", prompt)
+        self.assertIn("Close the class", prompt)
 
     def test_resume_after_dry_run(self):
         self._run(

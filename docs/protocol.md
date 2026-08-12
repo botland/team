@@ -28,3 +28,5 @@ Every phase reads files and may write files. Chat context is not the handoff.
 | `report.md` | orchestrator (audit) | **primary human artifact for audit** (status + review) |
 
 Reviewers and the guardian must read the repository and these files. They must not treat summaries as evidence.
+
+Every phase prompt includes `docs/engineering.md` from the engine (class vs instance, seams, vacuous guards). That file is not copied into the target repo.

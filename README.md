@@ -151,3 +151,18 @@ Requires `git` and Python 3.9+. No third-party packages.
 - Target path must be a git repo (`~/tmp` is not one)
 
 Override binaries with `TEAM_CLAUDE` / `TEAM_GROK`.
+
+## Headless, always
+
+`bin/team` never opens a TUI. The two CLIs disable interactive chrome differently:
+
+| Runtime | How this repo turns the TUI off |
+|---------|----------------------------------|
+| Claude | `-p` / `--print` plus `--output-format json` |
+| Grok | `--prompt-file` (headless trigger) plus `--no-alt-screen` (beats a fullscreen user config) |
+
+Both children also get `CI=1`. Prompt text is written under `.team/work/<slug>/prompts/` so you can inspect what ran without sitting in either TUI.
+
+## Shared engineering rules
+
+Every agent prompt includes [`docs/engineering.md`](docs/engineering.md): enumerate the space, close the class, boundary vs approximation, seams, vacuous guards, spec as input. That file is repo-agnostic. Product law stays in the target's own `AGENTS.md`.

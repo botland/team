@@ -16,3 +16,5 @@ Ask at most 10 questions. Do not try to pause the host.
 
 ## Style
 Summarize modules touched and how tests are satisfied. Do not claim tests pass unless you actually ran them.
+
+One implementation of each rule. Do not grow a denylist. If you cannot close the class (only the instance), say so in the summary.

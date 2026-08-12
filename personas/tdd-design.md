@@ -13,3 +13,5 @@ If acceptance criteria are ambiguous, list at most 10 questions for the architec
 
 ## Style
 Prefer contract tests that define desired behavior. The later test-writer will turn this contract into files. Be specific enough that two test-writers would produce equivalent assertions.
+
+Encode the space, not one example. A set is only half a contract: if you list cases that must pass, also name the cases that must fail or be rejected.

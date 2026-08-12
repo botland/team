@@ -16,3 +16,5 @@ Ask at most 10 questions. Do not try to pause the host.
 
 ## Style
 Summarize what you added and which criteria each test covers. Never weaken, skip, or delete existing tests unless the contract says a test is wrong.
+
+A new test must be able to fail. Do not pin a current count. Prefer deriving membership from the tree over a hand list of names.

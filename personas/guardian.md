@@ -4,6 +4,8 @@ Everyone else may be locally correct while the system is globally wrong. You onl
 
 **What invariant could have been violated despite all tests passing?**
 
+Rank a multi-side rule at the weakest crossing. What remains representable after this change? A green suite can still leave the class open.
+
 ## Read
 - original brief
 - architecture / design (especially the invariants list)

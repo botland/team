@@ -187,9 +187,17 @@ class Pipeline:
         )
         return "\n".join(lines)
 
+    def _engineering_rules(self) -> str:
+        path = engine_root() / "docs" / "engineering.md"
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+        return ""
+
     def _prompt(self, role: str, body: List[str]) -> str:
         parts = [
             self.persona(role),
+            "",
+            self._engineering_rules(),
             "",
             self._layout_blurb(),
             "",

@@ -45,6 +45,136 @@ class Runtime:
         raise NotImplementedError
 
 
+def headless_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Force non-interactive CLIs. Claude and Grok both grow a TUI unless told not to."""
+    env = dict(os.environ if base is None else base)
+    env["CI"] = "1"
+    env["TEAM_HEADLESS"] = "1"
+    # Claude Code treats this as "no interactive chrome".
+    env.setdefault("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
+    return env
+
+
+def claude_cmd(
+    *,
+    prompt: str,
+    schema: Optional[Dict[str, Any]],
+    capability: str,
+    session_id: str,
+    resume: bool,
+    extra: Optional[Dict[str, Any]] = None,
+) -> list:
+    extra = extra or {}
+    bin_ = extra.get("claude_bin") or os.environ.get("TEAM_CLAUDE", "claude")
+    # -p/--print is what turns Claude's TUI off. Never invoke without it.
+    cmd = [bin_, "-p", prompt, "--output-format", "json"]
+    if resume and session_id:
+        cmd.extend(["--resume", session_id])
+    else:
+        cmd.extend(["--session-id", session_id])
+    if schema:
+        cmd.extend(["--json-schema", json.dumps(schema)])
+    if extra.get("effort"):
+        cmd.extend(["--effort", str(extra["effort"])])
+    if capability == "read-only":
+        cmd.extend(
+            [
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Read,Grep,Glob,LS",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit",
+            ]
+        )
+    elif capability in ("write-tests", "write-code"):
+        cmd.extend(["--permission-mode", "acceptEdits"])
+    elif capability == "execute":
+        cmd.extend(
+            [
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Read,Grep,Glob,LS,Bash",
+                "--disallowedTools",
+                "Edit,Write,NotebookEdit",
+            ]
+        )
+    return cmd
+
+
+def grok_cmd(
+    *,
+    prompt_path: Path,
+    schema: Optional[Dict[str, Any]],
+    capability: str,
+    session_id: str,
+    resume: bool,
+    repo: Path,
+    extra: Optional[Dict[str, Any]] = None,
+) -> list:
+    extra = extra or {}
+    bin_ = extra.get("grok_bin") or os.environ.get("TEAM_GROK", "grok")
+    # --prompt-file (or -p) is headless. --no-alt-screen stops the fullscreen TUI
+    # even if a user config prefers it. Do not pass --fullscreen or --minimal.
+    cmd = [
+        bin_,
+        "--no-alt-screen",
+        "--cwd",
+        str(repo),
+        "--output-format",
+        "json",
+        "--prompt-file",
+        str(prompt_path),
+    ]
+    if resume and session_id:
+        cmd.extend(["-r", session_id])
+    else:
+        cmd.extend(["--session-id", session_id])
+    if extra.get("no_memory", True):
+        cmd.append("--no-memory")
+    if schema:
+        cmd.extend(["--json-schema", json.dumps(schema)])
+    if capability == "read-only":
+        cmd.extend(
+            [
+                "--tools",
+                "read_file,grep,list_dir",
+                "--disallowed-tools",
+                "search_replace",
+            ]
+        )
+    elif capability == "execute":
+        cmd.extend(
+            [
+                "--tools",
+                "read_file,grep,list_dir,run_terminal_cmd",
+                "--disallowed-tools",
+                "search_replace",
+                "--always-approve",
+            ]
+        )
+    elif capability in ("write-tests", "write-code"):
+        cmd.append("--always-approve")
+        code_root = extra.get("code_root") or ""
+        test_root = extra.get("test_root") or ""
+        if capability == "write-tests":
+            if test_root:
+                cmd.extend(["--allow", "Edit(%s/**)" % test_root])
+                cmd.extend(["--allow", "Write(%s/**)" % test_root])
+            if code_root and code_root != test_root:
+                cmd.extend(["--deny", "Edit(%s/**)" % code_root])
+                cmd.extend(["--deny", "Write(%s/**)" % code_root])
+        if capability == "write-code":
+            if code_root:
+                cmd.extend(["--allow", "Edit(%s/**)" % code_root])
+                cmd.extend(["--allow", "Write(%s/**)" % code_root])
+            if test_root and test_root != code_root:
+                cmd.extend(["--deny", "Edit(%s/**)" % test_root])
+                cmd.extend(["--deny", "Write(%s/**)" % test_root])
+    return cmd
+
+
 class ClaudeRuntime(Runtime):
     name = "claude"
 
@@ -66,54 +196,15 @@ class ClaudeRuntime(Runtime):
         extra = extra or {}
         sid = session_id or str(uuid.uuid4())
         prompt_path = write_text(work / "prompts" / ("%s.prompt.md" % phase), prompt)
-        cmd = [
-            extra.get("claude_bin") or os.environ.get("TEAM_CLAUDE", "claude"),
-            "-p",
-            prompt,
-            "--output-format",
-            "json",
-            "--session-id",
-            sid,
-        ]
-        if resume and session_id:
-            cmd = [
-                extra.get("claude_bin") or os.environ.get("TEAM_CLAUDE", "claude"),
-                "-p",
-                prompt,
-                "--output-format",
-                "json",
-                "--resume",
-                session_id,
-            ]
-            sid = session_id
-        if schema:
-            cmd.extend(["--json-schema", json.dumps(schema)])
-        if extra.get("effort"):
-            cmd.extend(["--effort", str(extra["effort"])])
-        if capability == "read-only":
-            cmd.extend(
-                [
-                    "--permission-mode",
-                    "acceptEdits",
-                    "--allowedTools",
-                    "Read,Grep,Glob,LS",
-                    "--disallowedTools",
-                    "Edit,Write,NotebookEdit",
-                ]
-            )
-        elif capability in ("write-tests", "write-code"):
-            cmd.extend(["--permission-mode", "acceptEdits"])
-        elif capability == "execute":
-            cmd.extend(
-                [
-                    "--permission-mode",
-                    "acceptEdits",
-                    "--allowedTools",
-                    "Read,Grep,Glob,LS,Bash",
-                    "--disallowedTools",
-                    "Edit,Write,NotebookEdit",
-                ]
-            )
+        cmd = claude_cmd(
+            prompt=prompt,
+            schema=schema,
+            capability=capability,
+            session_id=sid,
+            resume=resume and bool(session_id),
+            extra=extra,
+        )
+        write_text(work / "prompts" / ("%s.cmd.txt" % phase), " ".join(cmd[:8]) + " …")
         return _run(cmd, repo=repo, timeout=timeout, session_id=sid, prompt_path=prompt_path)
 
 
@@ -138,53 +229,16 @@ class GrokRuntime(Runtime):
         extra = extra or {}
         sid = session_id or str(uuid.uuid4())
         prompt_path = write_text(work / "prompts" / ("%s.prompt.md" % phase), prompt)
-        bin_ = extra.get("grok_bin") or os.environ.get("TEAM_GROK", "grok")
-        cmd = [bin_, "--cwd", str(repo), "--session-id", sid, "--output-format", "json"]
-        if resume and session_id:
-            cmd = [bin_, "--cwd", str(repo), "-r", session_id, "--output-format", "json"]
-            sid = session_id
-        if extra.get("no_memory", True):
-            cmd.append("--no-memory")
-        if schema:
-            cmd.extend(["--json-schema", json.dumps(schema)])
-        if capability == "read-only":
-            cmd.extend(
-                [
-                    "--tools",
-                    "read_file,grep,list_dir",
-                    "--disallowed-tools",
-                    "search_replace",
-                ]
-            )
-        elif capability == "execute":
-            cmd.extend(
-                [
-                    "--tools",
-                    "read_file,grep,list_dir,run_terminal_cmd",
-                    "--disallowed-tools",
-                    "search_replace",
-                    "--always-approve",
-                ]
-            )
-        elif capability in ("write-tests", "write-code"):
-            cmd.append("--always-approve")
-            code_root = extra.get("code_root") or ""
-            test_root = extra.get("test_root") or ""
-            if capability == "write-tests":
-                if test_root:
-                    cmd.extend(["--allow", "Edit(%s/**)" % test_root])
-                    cmd.extend(["--allow", "Write(%s/**)" % test_root])
-                if code_root and code_root != test_root:
-                    cmd.extend(["--deny", "Edit(%s/**)" % code_root])
-                    cmd.extend(["--deny", "Write(%s/**)" % code_root])
-            if capability == "write-code":
-                if code_root:
-                    cmd.extend(["--allow", "Edit(%s/**)" % code_root])
-                    cmd.extend(["--allow", "Write(%s/**)" % code_root])
-                if test_root and test_root != code_root:
-                    cmd.extend(["--deny", "Edit(%s/**)" % test_root])
-                    cmd.extend(["--deny", "Write(%s/**)" % test_root])
-        cmd.extend(["--prompt-file", str(prompt_path)])
+        cmd = grok_cmd(
+            prompt_path=prompt_path,
+            schema=schema,
+            capability=capability,
+            session_id=sid,
+            resume=resume and bool(session_id),
+            repo=repo,
+            extra=extra,
+        )
+        write_text(work / "prompts" / ("%s.cmd.txt" % phase), " ".join(cmd))
         return _run(cmd, repo=repo, timeout=timeout, session_id=sid, prompt_path=prompt_path)
 
 
@@ -240,6 +294,7 @@ def _run(
             stderr=subprocess.PIPE,
             text=True,
             timeout=timeout if timeout > 0 else None,
+            env=headless_env(),
         )
     except FileNotFoundError as exc:
         return Result(
