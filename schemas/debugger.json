@@ -1,0 +1,9 @@
+{
+  "type": "object",
+  "required": ["owner", "diagnosis_markdown"],
+  "properties": {
+    "owner": { "type": "string" },
+    "diagnosis_markdown": { "type": "string" },
+    "root_cause": { "type": "string" }
+  }
+}

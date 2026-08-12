@@ -1,0 +1,14 @@
+{
+  "type": "object",
+  "required": ["ready", "consult", "questions"],
+  "properties": {
+    "ready": { "type": "boolean" },
+    "consult": { "type": "string" },
+    "questions": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string" }
+    },
+    "summary": { "type": "string" }
+  }
+}

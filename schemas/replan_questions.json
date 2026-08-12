@@ -1,0 +1,17 @@
+{
+  "type": "object",
+  "required": ["questions_for_tdd", "questions_for_implementer"],
+  "properties": {
+    "questions_for_tdd": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string" }
+    },
+    "questions_for_implementer": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string" }
+    },
+    "notes": { "type": "string" }
+  }
+}

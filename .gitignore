@@ -1,0 +1,9 @@
+config.toml
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.team/work/
+.coverage
+htmlcov/

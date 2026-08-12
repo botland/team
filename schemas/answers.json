@@ -1,0 +1,7 @@
+{
+  "type": "object",
+  "required": ["answers_markdown"],
+  "properties": {
+    "answers_markdown": { "type": "string" }
+  }
+}

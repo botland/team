@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "required": ["design_markdown", "code_root", "test_root"],
+  "properties": {
+    "design_markdown": { "type": "string" },
+    "code_root": { "type": "string" },
+    "test_root": { "type": "string" },
+    "acceptance_criteria": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "type": "string" }
+    },
+    "structural_touchpoints": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "type": "string" }
+    },
+    "invariants": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "type": "string" }
+    }
+  }
+}

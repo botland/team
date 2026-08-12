@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "required": ["findings", "summary"],
+  "properties": {
+    "summary": { "type": "string" },
+    "findings": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["severity", "title", "evidence"],
+        "properties": {
+          "severity": { "type": "string" },
+          "title": { "type": "string" },
+          "evidence": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      }
+    },
+    "review_markdown": { "type": "string" }
+  }
+}

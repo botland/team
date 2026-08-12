@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "required": ["vectors", "adversarial_markdown"],
+  "properties": {
+    "adversarial_markdown": { "type": "string" },
+    "vectors": {
+      "type": "array",
+      "maxItems": 15,
+      "items": {
+        "type": "object",
+        "required": ["title", "threat"],
+        "properties": {
+          "title": { "type": "string" },
+          "threat": { "type": "string" },
+          "covered_by_existing_test": { "type": "boolean" },
+          "path": { "type": "string" }
+        }
+      }
+    }
+  }
+}

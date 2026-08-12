@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "required": ["components"],
+  "properties": {
+    "roots": {
+      "type": "array",
+      "maxItems": 20,
+      "items": { "type": "string" }
+    },
+    "components": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "required": ["name", "path", "state", "evidence"],
+        "properties": {
+          "name": { "type": "string" },
+          "path": { "type": "string" },
+          "state": { "type": "string" },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "notes": { "type": "string" }
+  }
+}

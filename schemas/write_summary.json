@@ -1,0 +1,12 @@
+{
+  "type": "object",
+  "required": ["summary", "paths_touched"],
+  "properties": {
+    "summary": { "type": "string" },
+    "paths_touched": {
+      "type": "array",
+      "maxItems": 40,
+      "items": { "type": "string" }
+    }
+  }
+}

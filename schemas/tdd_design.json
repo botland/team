@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "required": ["ready", "questions", "test_contract_markdown"],
+  "properties": {
+    "ready": { "type": "boolean" },
+    "questions": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string" }
+    },
+    "test_contract_markdown": { "type": "string" },
+    "criteria_map": {
+      "type": "array",
+      "maxItems": 20,
+      "items": {
+        "type": "object",
+        "required": ["criterion", "tests"],
+        "properties": {
+          "criterion": { "type": "string" },
+          "tests": {
+            "type": "array",
+            "maxItems": 10,
+            "items": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

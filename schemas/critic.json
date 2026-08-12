@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "required": ["accepts", "critic_markdown"],
+  "properties": {
+    "accepts": { "type": "boolean" },
+    "issues": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string" }
+    },
+    "critic_markdown": { "type": "string" }
+  }
+}

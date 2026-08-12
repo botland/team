@@ -1,0 +1,30 @@
+# Copy to config.toml (gitignored) for machine-local defaults,
+# or to <target-repo>/.team/config.toml for a project.
+
+[paths]
+# Leave empty to let the architect discover roots.
+code_root = ""
+test_root = ""
+test_command = ""
+
+[roles]
+# Runtimes: claude | grok | both | host
+# "both" is only valid for reviewer.
+# "host" is only valid for tester (orchestrator runs the suite).
+architect = "claude"
+critic = "claude"
+tdd-design = "claude"
+test-writer = "grok"
+implementer = "grok"
+tester = "host"
+adversarial = "grok"
+debugger = "claude"
+reviewer = "both"
+guardian = "claude"
+scout = "grok"
+
+[run]
+# Skip optional phases: critic, adversarial, guardian
+skip = []
+# Seconds per model call. 0 = no limit.
+phase_timeout = 1800

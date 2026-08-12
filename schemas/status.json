@@ -1,0 +1,8 @@
+{
+  "type": "object",
+  "required": ["status_markdown", "summary"],
+  "properties": {
+    "status_markdown": { "type": "string" },
+    "summary": { "type": "string" }
+  }
+}

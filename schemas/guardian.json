@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "required": ["risks", "guardian_markdown"],
+  "properties": {
+    "guardian_markdown": { "type": "string" },
+    "risks": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["title", "evidence"],
+        "properties": {
+          "title": { "type": "string" },
+          "evidence": { "type": "string" },
+          "path": { "type": "string" }
+        }
+      }
+    }
+  }
+}
