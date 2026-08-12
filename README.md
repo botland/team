@@ -45,6 +45,10 @@ team feature --stop-after tdd-design Add OAuth login with Google
 team resume oauth-login
 team resume oauth-login --from implementer
 team review oauth-login
+team review
+team review --pr 12
+team review --since reviewed-20260801-1200
+team review --stamp
 team replan oauth-login
 team status oauth-login
 team audit
@@ -69,6 +73,8 @@ team --assign reviewer=claude --skip critic,adversarial feature Add X
 - `--skip critic,guardian,adversarial,debugger` — drop optional phases.
 
 `team audit` is the status-audit pipeline (Grok `/audit`): scout → architect assess → dual review. It writes no production or test files. The human artifact is `report.md` (status + review). First leftover token is the repo if it is an existing directory, same as the Grok skill. Unlike `feature`, audit is allowed on a non-git tree.
+
+`team review` without a slug is the vibe.rc `aireview` idea: **not only PRs**. Default scope is every commit since the last dedicated `reviewed-*` tag (`gittag` in vibe.rc). If none, the last git tag; if none, the whole branch. `--pr N` reviews a PR (`gh pr diff`, else merge-base with main/master). `--stamp` (default on for `--pr`, like vibe.rc tagging after a PR review) writes `reviewed-YYYYMMDD-HHMM` so the next unscoped review starts there.
 
 ## Artifacts (the protocol)
 

@@ -32,6 +32,9 @@ Every phase reads files and may write files. Chat context is not the handoff.
 | `scout.md` / `scout.json` | scout (audit) | untrusted inventory |
 | `status.md` | architect assess (audit) | status claims to verify |
 | `report.md` | orchestrator (audit) | **primary human artifact for audit** (status + review) |
+| `range.md` | orchestrator (range review) | scope: since `reviewed-*` tag, `--since`, or `--pr` |
+| `git/log.txt` | orchestrator | commits in the range (authoritative) |
+| `git/diff.patch` | orchestrator | diff for the range (authoritative) |
 
 Reviewers and the guardian must read the repository and these files. They must not treat summaries as evidence.
 

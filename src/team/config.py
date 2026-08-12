@@ -116,6 +116,11 @@ AUDIT_PHASE_ORDER = [
     "reviewer",
 ]
 
+RANGE_PHASE_ORDER = [
+    "reviewer",
+    "guardian",
+]
+
 DEFAULT_AUDIT_QUERY = "Status of this workspace: WIP, finished, missing"
 
 DEPTH_ALIASES = {

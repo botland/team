@@ -10,12 +10,20 @@ from team.config import (
     AUDIT_PHASE_ORDER,
     DEFAULT_AUDIT_QUERY,
     PHASE_ORDER,
+    RANGE_PHASE_ORDER,
     ROLES,
     default_roles,
     load_config,
     resolve_phase,
 )
-from team.pipeline import PipelineError, load_pipeline, start_audit, start_feature
+from team.pipeline import (
+    PipelineError,
+    load_pipeline,
+    start_audit,
+    start_feature,
+    start_range_review,
+)
+from team import gitutil
 from team.state import State, require_work, work_dir
 from team.util import engine_root, slugify, write_text
 
@@ -73,8 +81,25 @@ def _parser() -> argparse.ArgumentParser:
     r.add_argument("--dry-run", action="store_true")
     r.set_defaults(func=cmd_resume)
 
-    v = sub.add_parser("review", help="Run dual review (+ guardian) on an existing run")
-    v.add_argument("slug")
+    v = sub.add_parser(
+        "review",
+        help="Review a work slug, or commits since the last reviewed-* tag (not only PRs)",
+    )
+    v.add_argument(
+        "slug",
+        nargs="?",
+        default="",
+        help="Existing .team/work/<slug> to re-review. Omit for a commit-range review.",
+    )
+    v.add_argument("--pr", default="", help="Review this PR number (gh pr diff, else merge-base)")
+    v.add_argument("--since", default="", help="Review commits since this tag/ref (overrides last dedicated tag)")
+    v.add_argument(
+        "--stamp",
+        action="store_true",
+        help="Create a reviewed-YYYYMMDD-HHMM tag after the review (vibe.rc gittag)",
+    )
+    v.add_argument("--no-stamp", action="store_true", help="Do not create a reviewed-* tag")
+    v.add_argument("--force", action="store_true")
     v.set_defaults(func=cmd_review)
 
     p_re = sub.add_parser("replan", help="Architect writes a design delta")
@@ -177,15 +202,49 @@ def cmd_resume(args) -> int:
 
 
 def cmd_review(args) -> int:
-    cfg = _cfg(args)
-    pipe = load_pipeline(cfg, args.slug)
-    print("== team review %s" % args.slug)
-    pipe.phase_reviewer()
-    pipe.state.mark("reviewer")
-    if pipe.state.mode != "audit" and "guardian" not in cfg.skip:
-        pipe.phase_guardian()
-        pipe.state.mark("guardian")
-    pipe.save()
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+    slug = args.slug or ""
+    range_requested = bool(args.pr or args.since or not slug)
+    work_exists = bool(slug) and (work_dir(repo, slug) / "state.json").is_file()
+    if work_exists and not args.pr and not args.since:
+        cfg = _cfg(args)
+        pipe = load_pipeline(cfg, slug)
+        print("== team review %s" % slug)
+        pipe.phase_reviewer()
+        pipe.state.mark("reviewer")
+        if pipe.state.mode != "audit" and "guardian" not in cfg.skip:
+            pipe.phase_guardian()
+            pipe.state.mark("guardian")
+        pipe.save()
+        _print_done(pipe)
+        return 0
+    if slug and not range_requested:
+        print("No run at %s (missing state.json)" % work_dir(repo, slug), file=sys.stderr)
+        return 1
+    cfg = _cfg(args, force=args.force)
+    stamp = bool(args.stamp) or (bool(args.pr) and not args.no_stamp)
+    if args.no_stamp:
+        stamp = False
+    if args.pr:
+        slug = slug or ("review-pr-%s" % args.pr)
+        desc = "PR %s" % args.pr
+    else:
+        slug = slug or "review-since-tag"
+        desc = "commits since last dedicated tag"
+    print("== team review %s" % slug)
+    print("repo: %s" % cfg.repo)
+    print("scope: %s" % desc)
+    pipe = start_range_review(cfg, slug=slug, pr=args.pr, since=args.since)
+    print("range: %s" % pipe.state.brief)
+    pipe.run()
+    if stamp and pipe.state.stop_reason == "complete":
+        try:
+            tag = gitutil.stamp_reviewed(cfg.repo)
+            pipe.state.stamp_tag = tag
+            pipe.save()
+            print("tag: %s" % tag)
+        except gitutil.GitError as exc:
+            print("stamp failed: %s" % exc, file=sys.stderr)
     _print_done(pipe)
     return 0
 
@@ -237,7 +296,12 @@ def cmd_status(args) -> int:
     print("test_root: %s" % state.test_root)
     print("assign: %s" % _fmt_roles(state.assignment or default_roles()))
     print("")
-    order = AUDIT_PHASE_ORDER if state.mode == "audit" else PHASE_ORDER
+    if state.mode == "audit":
+        order = AUDIT_PHASE_ORDER
+    elif state.mode == "range":
+        order = RANGE_PHASE_ORDER
+    else:
+        order = PHASE_ORDER
     done = set(state.phases_done)
     skipped = set(state.skipped)
     print("mode: %s" % state.mode)

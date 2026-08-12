@@ -29,6 +29,10 @@ class State:
     depth: str = "medium"
     diagnosis_owner: str = ""
     adversarial_run: Dict[str, Any] = field(default_factory=dict)
+    range_base: str = ""
+    range_kind: str = ""
+    range_pr: str = ""
+    stamp_tag: str = ""
 
     def mark(self, phase: str) -> None:
         if phase not in self.phases_done:

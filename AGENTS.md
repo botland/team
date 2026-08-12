@@ -11,6 +11,7 @@ This is the team orchestrator. It is not an application feature repo.
 - Persona text has one home: `personas/*.md`.
 - Do not write outside this repository when changing the engine (no `~/vibe.rc`, no `~/.team`, no target-app source).
 - `feature` implements (including debugger repair, adversarial tests, and `replan --continue`). `audit` is scout → assess → review and must not write outside `.team/work/`.
+- `team review` without a slug is a **commit-range** review (since last `reviewed-*` tag, else last tag, else the branch). `--pr` is optional. Do not assume reviews are PR-only.
 - Both CLIs run **headless**. Claude needs `-p`; Grok needs `--prompt-file` and `--no-alt-screen`. Do not add `--fullscreen` or drop `-p`.
 - Repo-agnostic reasoning lives in `docs/engineering.md` and is injected into every agent prompt. Do not fork it into personas. Target-repo product law stays in that repo.
 

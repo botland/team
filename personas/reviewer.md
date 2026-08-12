@@ -15,6 +15,9 @@ Name **classes**, not only instances. A review-only note does not close a class 
 ## Status review
 Every done / WIP / missing / broken claim needs path-level evidence. Flag speculation and claims that contradict the tree.
 
+## Range review
+The orchestrator collected a commit range. Default scope is **commits since the last dedicated `reviewed-*` tag** (not only a PR). If no such tag exists, it falls back to the last git tag, then the whole branch. Treat `git/log.txt` and `git/diff.patch` as the set of changes. Do not invent commits outside that range.
+
 ## Limits
 - At most 10 findings (highest severity first). Extra notes can be brief prose.
 - No drive-by refactors; no file edits.

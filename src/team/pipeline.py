@@ -10,6 +10,7 @@ from team import gitutil, testhost
 from team.config import (
     AUDIT_PHASE_ORDER,
     PHASE_ORDER,
+    RANGE_PHASE_ORDER,
     ROLES,
     Config,
     persona_path,
@@ -720,6 +721,9 @@ class Pipeline:
         if self.state.mode == "audit":
             self.phase_status_reviewer()
             return
+        if self.state.mode == "range":
+            self.phase_range_reviewer()
+            return
         assignment = self.cfg.assignment("reviewer")
         if assignment == "both":
             runtimes = ["claude", "grok"]
@@ -906,6 +910,55 @@ class Pipeline:
         self._verify_readonly("reviewer", before)
         self.log("audit review written (%s)" % ", ".join(runtimes))
 
+    def phase_range_reviewer(self) -> None:
+        assignment = self.cfg.assignment("reviewer")
+        if assignment == "both":
+            runtimes = ["claude", "grok"]
+        else:
+            runtimes = [assignment]
+        artifacts = ["brief.md", "range.md", "git/log.txt", "git/diff.patch"]
+
+        def one(runtime: str) -> Result:
+            prompt = self._prompt(
+                "reviewer",
+                [
+                    self._listed_artifacts(artifacts),
+                    "RANGE REVIEW. The orchestrator already collected the commit range.",
+                    "git/log.txt and git/diff.patch are authoritative. Do not invent commits.",
+                    "This is not a PR-only review: the range may be 'since the last reviewed-* tag'.",
+                    "READ-ONLY. Inspect the actual files those commits touched.",
+                    "At most 10 findings (severity, title, evidence, path).",
+                    "You are the %s reviewer. Do not assume another reviewer exists."
+                    % runtime,
+                ],
+            )
+            return self.invoke(
+                "reviewer",
+                "reviewer-%s" % runtime,
+                prompt,
+                "review.json",
+                runtime_name=runtime,
+            )
+
+        before = gitutil.porcelain_paths(self.repo) if gitutil.is_git_repo(self.repo) else []
+        parts = []
+        if len(runtimes) == 1:
+            ordered = runtimes
+            results = [one(runtimes[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futs = [(rt, pool.submit(one, rt)) for rt in runtimes]
+                ordered = [rt for rt, _ in futs]
+                results = [fut.result() for _, fut in futs]
+        for rt, result in zip(ordered, results):
+            md = as_str(result.output.get("review_markdown")) or as_str(result.output.get("summary"))
+            self.write_artifact("review-%s.md" % rt, md)
+            parts.append((rt, result.output, md))
+        merged = merge_reviews(parts)
+        self.write_artifact("review.md", merged)
+        self._verify_readonly("reviewer", before)
+        self.log("range review written (%s)" % ", ".join(runtimes))
+
     def phase_guardian(self) -> None:
         prompt = self._prompt(
             "guardian",
@@ -1040,6 +1093,8 @@ def role_for_phase(phase: str, state: Optional[State] = None) -> str:
 def _phase_order(state: State) -> List[str]:
     if state.mode == "audit":
         return AUDIT_PHASE_ORDER
+    if state.mode == "range":
+        return RANGE_PHASE_ORDER
     return PHASE_ORDER
 
 
@@ -1107,6 +1162,61 @@ def start_audit(cfg: Config, query: str, slug: str) -> Pipeline:
         mode="audit",
         depth=cfg.depth,
         phase="scout",
+    )
+    state.save(work)
+    return Pipeline(cfg, state, work)
+
+
+def start_range_review(
+    cfg: Config,
+    *,
+    slug: str,
+    pr: str = "",
+    since: str = "",
+) -> Pipeline:
+    repo = cfg.repo
+    if not gitutil.is_git_repo(repo):
+        raise PipelineError("%s is not a git repository (range review needs git)" % repo)
+    work = work_dir(repo, slug)
+    if (work / "state.json").is_file() and not cfg.force:
+        raise PipelineError("work already exists at %s (use --force or team resume %s)" % (work, slug))
+    if work.exists() and cfg.force:
+        shutil.rmtree(work)
+    work.mkdir(parents=True, exist_ok=True)
+    (work / "consult").mkdir(exist_ok=True)
+    (work / "git").mkdir(exist_ok=True)
+    (work / "prompts").mkdir(exist_ok=True)
+    if pr:
+        log, diff, how = gitutil.pr_bundle(repo, pr)
+        base, kind = pr, "pr"
+        count = len([ln for ln in log.splitlines() if ln.strip()])
+        desc = gitutil.describe_range(pr, "pr", count) + " [%s]" % how
+    else:
+        base, kind = gitutil.resolve_review_base(repo, since)
+        log = gitutil.range_log(repo, base)
+        diff = gitutil.range_diff(repo, base)
+        count = gitutil.commit_count(repo, base)
+        desc = gitutil.describe_range(base, kind, count)
+    write_text(work / "brief.md", desc + "\n")
+    write_text(work / "range.md", "# Range\n\n%s\n\n- base: `%s`\n- kind: %s\n- commits: %d\n" % (desc, base or "(root)", kind, count))
+    write_text(work / "git" / "log.txt", log or "(empty range)\n")
+    write_text(work / "git" / "diff.patch", diff or "(empty diff)\n")
+    names = gitutil.range_name_only(repo, base) if kind != "pr" else []
+    gitutil.write_path_list(work / "git" / "names.txt", names)
+    snap = gitutil.snapshot(repo)
+    gitutil.write_path_list(work / "git" / "start.txt", snap["paths"])
+    state = State(
+        slug=slug,
+        brief=desc,
+        repo=str(repo),
+        engine_root=str(engine_root()),
+        assignment=dict(cfg.roles),
+        git={"start": snap, "range_base": base, "range_kind": kind},
+        mode="range",
+        phase="reviewer",
+        range_base=base,
+        range_kind=kind,
+        range_pr=pr,
     )
     state.save(work)
     return Pipeline(cfg, state, work)
