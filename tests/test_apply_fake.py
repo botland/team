@@ -473,6 +473,89 @@ class FakeApplyTests(unittest.TestCase):
             (p / "review.md").is_file() for p in (work / "seq").iterdir()
         ))
 
+    def test_seq_writes_checkpoint(self):
+        work = self._feature()
+        self._inject_mixed(work)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "--seq",
+                "--no-review",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        checks = list((work / "seq").glob("*/checkpoint.json"))
+        self.assertEqual(len(checks), 2)
+        data = json.loads(checks[0].read_text(encoding="utf-8"))
+        self.assertIn("head_before", data)
+        self.assertIn("touched", data)
+        self.assertIn("suite", data)
+
+    def test_seq_reopen_and_list_show_status(self):
+        work = self._feature()
+        self._inject_mixed(work)
+        self.assertEqual(
+            main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "--test-command",
+                    "true",
+                    "apply",
+                    "--seq",
+                    "--no-review",
+                    "add-greet-helper",
+                ]
+            ),
+            0,
+        )
+        data = json.loads((work / "findings.json").read_text(encoding="utf-8"))
+        first = data["seq"]["steps"][0]["id"]
+        second = data["seq"]["steps"][1]["id"]
+        review_before = (work / "review.md").read_text(encoding="utf-8")
+        buf = StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "apply",
+                    "--seq",
+                    "--reopen",
+                    first,
+                    "add-greet-helper",
+                ]
+            )
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertEqual(State.load(work).stop_reason, "seq-reopened")
+        self.assertEqual((work / "review.md").read_text(encoding="utf-8"), review_before)
+        self.assertTrue((work / "seq" / first / "reopen.md").is_file())
+        seq = json.loads((work / "findings.json").read_text(encoding="utf-8"))["seq"]
+        self.assertEqual(seq["resume"], first)
+        self.assertIn(second, seq["stale"])
+        listed = StringIO()
+        with mock.patch("sys.stdout", listed):
+            self.assertEqual(main(["--repo", str(self.repo), "list"]), 0)
+        text = listed.getvalue()
+        self.assertIn(first, text)
+        self.assertIn("reopened", text)
+        self.assertIn(second, text)
+        self.assertIn("stale", text)
+        status = StringIO()
+        with mock.patch("sys.stdout", status):
+            self.assertEqual(
+                main(["--repo", str(self.repo), "status", "add-greet-helper"]), 0
+            )
+        self.assertIn(first, status.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

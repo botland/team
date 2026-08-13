@@ -513,6 +513,7 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
             "owner": "implementer",
             "root_cause": "fake diagnosis",
             "diagnosis_markdown": "Fake diagnosis: inspect greet implementation.",
+            "disposition": "retry",
         },
         "guardian": {
             "risks": [],

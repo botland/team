@@ -26,6 +26,9 @@ Every phase reads files and may write files. Chat context is not the handoff.
 | `apply-summary.md` | orchestrator (apply) | hops taken + suite result |
 | `apply-seq.md` | orchestrator (`apply --seq`) | one-class log; stop/retry/skip on failure |
 | `seq/<id>/` | orchestrator (`apply --seq`) | finding, plan, suite, class `review.md` (not the slug `review.md`) |
+| `seq/<id>/checkpoint.json` | orchestrator | trusted: heads, snapshots, touched paths, suite, assumptions |
+| `seq/<id>/delta.patch` | orchestrator | product-file diff for that class |
+| `seq/<id>/reopen.md` | orchestrator (`--reopen`) | which later ids went stale |
 | `apply-tdd-summary.md` | test-writer (apply) | untrusted claim |
 | `apply-impl-summary.md` | implementer (apply) | untrusted claim |
 | `apply-test-report.md` | orchestrator (apply) | suite after apply |

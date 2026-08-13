@@ -194,8 +194,10 @@ def _parser() -> argparse.ArgumentParser:
         description=(
             "Route review findings by kind: architecture → replan, test → contract+tests, "
             "implementation → production. Unstructured findings trigger a re-review first.\n"
-            "  team apply <slug> --seq   one class at a time, highest first, until failure\n"
-            "Class reviews land in seq/<id>/review.md; review.md is left alone."
+            "  team apply <slug> --seq   one class at a time until failure\n"
+            "  team apply <slug> --seq --reopen ID   reopen an earlier class; later ids go stale\n"
+            "Class reviews land in seq/<id>/review.md; review.md is left alone.\n"
+            "team list shows each class id and status."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -224,6 +226,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="With --seq: mark the last failed class skipped and continue",
     )
+    p_ap.add_argument(
+        "--reopen",
+        default="",
+        metavar="ID",
+        help=(
+            "With --seq: reopen an applied or failed class, mark later classes "
+            "stale, and stop. Next --seq retries that class."
+        ),
+    )
     p_ap.set_defaults(func=cmd_apply)
 
     p_re = sub.add_parser(
@@ -243,7 +254,10 @@ def _parser() -> argparse.ArgumentParser:
     lst = sub.add_parser(
         "list",
         help="List .team/work runs in the target repo",
-        description="Print slug, mode, phase, and stop reason for each run.",
+        description=(
+            "Print slug, mode, phase, and stop reason for each run. "
+            "apply --seq class ids and their status are listed under the slug."
+        ),
     )
     lst.set_defaults(func=cmd_list)
 
@@ -693,11 +707,18 @@ def cmd_apply(args) -> int:
     if args.skip_failed and not args.seq:
         print("error: --skip-failed requires --seq", file=sys.stderr)
         return 2
+    if args.reopen and not args.seq:
+        print("error: --reopen requires --seq", file=sys.stderr)
+        return 2
+    if args.reopen and args.skip_failed:
+        print("error: --reopen and --skip-failed cannot be combined", file=sys.stderr)
+        return 2
     pipe.apply_review(
         dry_run=args.dry_run,
         rereview=not args.no_review,
         seq=args.seq,
         skip_failed=args.skip_failed,
+        reopen=args.reopen,
     )
     _print_done(pipe)
     if pipe.state.stop_reason == "seq-failed":
@@ -763,6 +784,12 @@ def cmd_list(args) -> int:
             "%-28s %-8s %-18s %s"
             % (state.slug, state.mode, state.phase, state.stop_reason or "(in progress)")
         )
+        for row in findings_mod.latest_seq_rows(findings_mod.load_seq_state(child)):
+            title = (row.get("title") or "")[:40]
+            print(
+                "  %-12s %-10s %-16s %s"
+                % (row.get("id"), row.get("status"), row.get("kind") or "-", title)
+            )
     if not found:
         print("no runs in %s" % root)
     return 0
@@ -780,6 +807,15 @@ def cmd_status(args) -> int:
     print("code_root: %s" % state.code_root)
     print("test_root: %s" % state.test_root)
     print("assign: %s" % _fmt_roles(state.assignment or default_roles()))
+    rows = findings_mod.latest_seq_rows(findings_mod.load_seq_state(work))
+    if rows:
+        print("")
+        print("%-12s %-10s %-16s %s" % ("CLASS", "STATUS", "KIND", "TITLE"))
+        for row in rows:
+            print(
+                "%-12s %-10s %-16s %s"
+                % (row.get("id"), row.get("status"), row.get("kind") or "-", row.get("title") or "")
+            )
     print("")
     if state.mode == "audit":
         order = AUDIT_PHASE_ORDER

@@ -106,6 +106,42 @@ def delta_paths(before: Sequence[str], after: Sequence[str]) -> List[str]:
     return sorted(p for p in after if p not in prior)
 
 
+def product_paths(paths: Iterable[str]) -> List[str]:
+    """Fence paths that are not orchestrator work files."""
+    out = []
+    for path in paths:
+        rel = posix(path)
+        if not rel or rel.startswith(".team/"):
+            continue
+        out.append(rel)
+    return out
+
+
+def worktree_diff(repo: Path, paths: Sequence[str]) -> str:
+    """Unified diff of product paths vs HEAD, including new untracked files."""
+    chunks: List[str] = []
+    for rel in product_paths(paths):
+        tracked = git(repo, "diff", "HEAD", "--", rel, check=False)
+        if tracked.strip():
+            chunks.append(tracked if tracked.endswith("\n") else tracked + "\n")
+            continue
+        path = repo / rel
+        if not path.is_file():
+            continue
+        listed = git(repo, "ls-files", "--", rel, check=False).strip()
+        if listed:
+            continue
+        proc = subprocess.run(
+            ["git", "-C", str(repo), "diff", "--no-index", "--", "/dev/null", rel],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        if proc.stdout.strip():
+            chunks.append(proc.stdout if proc.stdout.endswith("\n") else proc.stdout + "\n")
+    return "".join(chunks)
+
+
 def changed_paths(repo: Path, before: dict, after: dict) -> List[str]:
     """Every path whose content, existence, or committed state differs."""
     before = before or {}

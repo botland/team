@@ -307,7 +307,14 @@ def is_review_finding(item: Dict[str, Any]) -> bool:
 
 
 def empty_seq_state() -> Dict[str, Any]:
-    return {"applied": [], "skipped": [], "failed": "", "steps": []}
+    return {
+        "applied": [],
+        "skipped": [],
+        "stale": [],
+        "failed": "",
+        "resume": "",
+        "steps": [],
+    }
 
 
 def load_seq_state(work: Path) -> Dict[str, Any]:
@@ -324,7 +331,9 @@ def load_seq_state(work: Path) -> Dict[str, Any]:
     return {
         "applied": [as_str(x) for x in as_list(seq.get("applied")) if as_str(x)],
         "skipped": [as_str(x) for x in as_list(seq.get("skipped")) if as_str(x)],
+        "stale": [as_str(x) for x in as_list(seq.get("stale")) if as_str(x)],
         "failed": as_str(seq.get("failed")),
+        "resume": as_str(seq.get("resume")),
         "steps": [row for row in as_list(seq.get("steps")) if isinstance(row, dict)],
     }
 
@@ -351,7 +360,11 @@ def seq_candidates(
     findings: Iterable[Dict[str, Any]],
     seq: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    done = set(seq.get("applied") or []) | set(seq.get("skipped") or [])
+    done = (
+        set(seq.get("applied") or [])
+        | set(seq.get("skipped") or [])
+        | set(seq.get("stale") or [])
+    )
     out: List[Dict[str, Any]] = []
     for item in findings:
         if not is_review_finding(item):
@@ -371,10 +384,11 @@ def pick_next_seq(
     seq: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
     candidates = seq_candidates(findings, seq)
-    failed = as_str(seq.get("failed"))
-    if failed:
+    for key in (as_str(seq.get("failed")), as_str(seq.get("resume"))):
+        if not key:
+            continue
         for item in candidates:
-            if item.get("id") == failed:
+            if item.get("id") == key:
                 return item
     ranked = sorted(candidates, key=seq_key)
     return ranked[0] if ranked else None
@@ -401,15 +415,24 @@ def mark_seq_step(
     fid = as_str(item.get("id")) or finding_id(item)
     applied = [x for x in as_list(seq.get("applied")) if as_str(x) and as_str(x) != fid]
     skipped = [x for x in as_list(seq.get("skipped")) if as_str(x) and as_str(x) != fid]
+    stale = [x for x in as_list(seq.get("stale")) if as_str(x) and as_str(x) != fid]
     failed = as_str(seq.get("failed"))
+    resume = as_str(seq.get("resume"))
     if failed == fid:
         failed = ""
+    if resume == fid and status != "reopened":
+        resume = ""
     if status == "applied":
         applied.append(fid)
     elif status == "skipped":
         skipped.append(fid)
     elif status == "failed":
         failed = fid
+    elif status == "stale":
+        stale.append(fid)
+    elif status == "reopened":
+        resume = fid
+        failed = ""
     step = {
         "id": fid,
         "status": status,
@@ -424,20 +447,133 @@ def mark_seq_step(
     return {
         "applied": applied,
         "skipped": skipped,
+        "stale": stale,
         "failed": failed,
+        "resume": resume,
         "steps": steps,
     }
 
 
 def seq_status_for(item: Dict[str, Any], seq: Dict[str, Any]) -> str:
     fid = as_str(item.get("id")) or finding_id(item)
+    if fid in set(seq.get("stale") or []):
+        return "stale"
     if fid in set(seq.get("applied") or []):
         return "applied"
     if fid in set(seq.get("skipped") or []):
         return "skipped"
     if fid and fid == as_str(seq.get("failed")):
         return "failed"
+    if fid and fid == as_str(seq.get("resume")):
+        return "reopened"
     return ""
+
+
+def seq_known_ids(seq: Dict[str, Any]) -> List[str]:
+    seen = []
+    for step in as_list(seq.get("steps")):
+        if not isinstance(step, dict):
+            continue
+        fid = as_str(step.get("id"))
+        if fid and fid not in seen:
+            seen.append(fid)
+    return seen
+
+
+def seq_item_from_log(seq: Dict[str, Any], fid: str) -> Dict[str, Any]:
+    item = {"id": fid, "kind": "", "title": "(untitled)", "path": ""}
+    for step in as_list(seq.get("steps")):
+        if not isinstance(step, dict):
+            continue
+        if as_str(step.get("id")) != fid:
+            continue
+        item = {
+            "id": fid,
+            "kind": as_str(step.get("kind")),
+            "title": as_str(step.get("title")) or "(untitled)",
+            "path": as_str(step.get("path")),
+        }
+    return item
+
+
+def latest_seq_rows(seq: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """One row per class id, last log status, overlaying current sets."""
+    rows: Dict[str, Dict[str, Any]] = {}
+    order: List[str] = []
+    for step in as_list(seq.get("steps")):
+        if not isinstance(step, dict):
+            continue
+        fid = as_str(step.get("id"))
+        if not fid:
+            continue
+        if fid not in rows:
+            order.append(fid)
+        rows[fid] = {
+            "id": fid,
+            "status": as_str(step.get("status")) or "?",
+            "kind": as_str(step.get("kind")),
+            "title": as_str(step.get("title")) or "(untitled)",
+            "path": as_str(step.get("path")),
+        }
+    out = []
+    for fid in order:
+        row = dict(rows[fid])
+        overlay = seq_status_for(row, seq)
+        if overlay:
+            row["status"] = overlay
+        out.append(row)
+    return out
+
+
+def reopen_prefix(seq: Dict[str, Any], fid: str) -> Dict[str, Any]:
+    """Open fid again and mark every later class stale."""
+    fid = as_str(fid)
+    if not fid:
+        raise FindingsError("reopen needs a class id")
+    steps = [row for row in as_list(seq.get("steps")) if isinstance(row, dict)]
+    last_idx = None
+    for i, step in enumerate(steps):
+        if as_str(step.get("id")) == fid:
+            last_idx = i
+    if last_idx is None:
+        raise FindingsError("no seq class %s" % fid)
+    current = seq_status_for({"id": fid}, seq) or as_str(steps[last_idx].get("status"))
+    if current not in ("applied", "failed"):
+        raise FindingsError(
+            "can reopen an applied or failed class, not %s (%s)" % (fid, current or "open")
+        )
+    later: List[str] = []
+    seen = set()
+    for step in steps[last_idx + 1 :]:
+        sid = as_str(step.get("id"))
+        if not sid or sid == fid or sid in seen:
+            continue
+        seen.add(sid)
+        later.append(sid)
+    out = dict(seq)
+    for sid in later:
+        out = mark_seq_step(out, seq_item_from_log(out, sid), status="stale")
+    out = mark_seq_step(out, seq_item_from_log(out, fid), status="reopened")
+    return out
+
+
+def extract_assumptions(markdown: str) -> List[str]:
+    keep = ("changed assumptions", "new acceptance criteria", "structural changes")
+    lines: List[str] = []
+    current = False
+    for raw in (markdown or "").splitlines():
+        if raw.startswith("#"):
+            current = raw.lstrip("#").strip().lower() in keep
+            continue
+        if not current:
+            continue
+        text = raw.strip()
+        if text.startswith("-"):
+            text = text[1:].strip()
+        if not text or text.lower() in ("none", "- none"):
+            continue
+        lines.append(text)
+    return lines
 
 
 def importance_key(item: Dict[str, Any]) -> tuple:
@@ -597,8 +733,10 @@ def render_seq_log(seq: Dict[str, Any], *, slug: str = "") -> str:
         lines.append("- artifacts: `seq/%s/`" % fid)
         lines.append("")
     failed = as_str(seq.get("failed"))
+    resume = as_str(seq.get("resume"))
+    stale = [as_str(x) for x in as_list(seq.get("stale")) if as_str(x)]
+    cmd = "team apply %s --seq" % slug if slug else "team apply <slug> --seq"
     if failed:
-        cmd = "team apply %s --seq" % slug if slug else "team apply <slug> --seq"
         lines.extend(
             [
                 "## Stopped",
@@ -608,8 +746,27 @@ def render_seq_log(seq: Dict[str, Any], *, slug: str = "") -> str:
                 "",
                 "- retry the same class: `%s`" % cmd,
                 "- skip it and continue: `%s --skip-failed`" % cmd,
+                "- reopen an earlier class: `%s --reopen <id>`" % cmd,
                 "- review a finished class: `team review %s --seq %s`"
                 % (slug or "<slug>", failed),
+                "",
+            ]
+        )
+    if resume:
+        lines.extend(
+            [
+                "## Reopened",
+                "",
+                "Next `--seq` retries `%s`. Later classes are stale, not skipped." % resume,
+                "",
+            ]
+        )
+    if stale:
+        lines.extend(
+            [
+                "## Stale",
+                "",
+                ", ".join("`%s`" % sid for sid in stale),
                 "",
             ]
         )

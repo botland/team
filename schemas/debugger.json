@@ -4,6 +4,14 @@
   "properties": {
     "owner": { "type": "string" },
     "diagnosis_markdown": { "type": "string" },
-    "root_cause": { "type": "string" }
+    "root_cause": { "type": "string" },
+    "disposition": {
+      "type": "string",
+      "description": "retry | skip | reopen. Suggestion only; orchestrator does not execute reopen."
+    },
+    "reopen_id": {
+      "type": "string",
+      "description": "Earlier applied class id when disposition is reopen."
+    }
   }
 }

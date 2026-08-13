@@ -28,6 +28,8 @@ class State:
     mode: str = "feature"
     depth: str = "medium"
     diagnosis_owner: str = ""
+    diagnosis_disposition: str = ""
+    diagnosis_reopen_id: str = ""
     adversarial_run: Dict[str, Any] = field(default_factory=dict)
     range_base: str = ""
     range_kind: str = ""

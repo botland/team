@@ -18,6 +18,8 @@ from team.findings import (
     pick_next_seq,
     related_guardian,
     render_followups,
+    reopen_prefix,
+    latest_seq_rows,
     take_important,
 )
 from team.util import dump_json
@@ -227,6 +229,56 @@ class FindingsTests(unittest.TestCase):
         )
         md = render_followups([item], seq=seq)
         self.assertIn("**applied**", md)
+
+    def test_reopen_marks_later_stale_and_resumes(self):
+        arch = {
+            "kind": "architecture",
+            "severity": "high",
+            "title": "one egress",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        impl = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "credential",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        seq = {"applied": [], "skipped": [], "stale": [], "failed": "", "resume": "", "steps": []}
+        seq = mark_seq_step(seq, dict(arch, id=finding_id(arch)), status="applied")
+        seq = mark_seq_step(seq, dict(impl, id=finding_id(impl)), status="failed", suite="FAIL")
+        seq = reopen_prefix(seq, finding_id(arch))
+        self.assertEqual(seq["resume"], finding_id(arch))
+        self.assertIn(finding_id(impl), seq["stale"])
+        self.assertNotIn(finding_id(arch), seq["applied"])
+        nxt = pick_next_seq([arch, impl], seq)
+        self.assertEqual(nxt["id"], finding_id(arch))
+        from team.findings import seq_candidates
+
+        ids = [row["id"] for row in seq_candidates([arch, impl], seq)]
+        self.assertEqual(ids, [finding_id(arch)])
+        rows = latest_seq_rows(seq)
+        by_id = {r["id"]: r["status"] for r in rows}
+        self.assertEqual(by_id[finding_id(arch)], "reopened")
+        self.assertEqual(by_id[finding_id(impl)], "stale")
+
+    def test_reopen_rejects_skipped(self):
+        item = {
+            "kind": "implementation",
+            "title": "x",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        seq = mark_seq_step(
+            {"applied": [], "skipped": [], "stale": [], "failed": "", "resume": "", "steps": []},
+            dict(item, id=finding_id(item)),
+            status="skipped",
+        )
+        from team.findings import FindingsError
+
+        with self.assertRaises(FindingsError):
+            reopen_prefix(seq, finding_id(item))
 
 
 if __name__ == "__main__":

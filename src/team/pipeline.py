@@ -28,7 +28,16 @@ from team.runners import (
 )
 from team.schemas import validate as validate_schema
 from team.state import State, work_dir
-from team.util import as_bool, as_list, as_str, engine_root, explicit_roots, load_json, write_text
+from team.util import (
+    as_bool,
+    as_list,
+    as_str,
+    dump_json,
+    engine_root,
+    explicit_roots,
+    load_json,
+    write_text,
+)
 
 
 class PipelineError(RuntimeError):
@@ -731,9 +740,18 @@ class Pipeline:
             return host_md
         return host_md.rstrip() + "\n\n## Tester agent\n\n" + extra.rstrip() + "\n"
 
-    def phase_debugger(self) -> None:
+    def phase_debugger(self, *, seq_applied: Optional[List[Dict[str, Any]]] = None) -> None:
         if self.state.final.get("status") == "PASS":
             return
+        extra_prompt = ""
+        if seq_applied:
+            extra_prompt = (
+                "SEQ APPLY. Set disposition to retry, skip, or reopen.\n"
+                "retry = this class is wrong. skip = drop this class. "
+                "reopen = an earlier applied class was wrong; set reopen_id to that id.\n"
+                "Do not reopen yourself. Applied classes:\n"
+                + json.dumps(seq_applied, indent=2)
+            )
         prompt = self._prompt(
             "debugger",
             [
@@ -748,6 +766,7 @@ class Pipeline:
                 ),
                 "Tests failed. Diagnose root cause. Do not edit files.",
                 "owner must be one of implementer|test-writer|architect|unknown.",
+                extra_prompt,
             ],
         )
         result = self.invoke("debugger", "debugger", prompt, "debugger.json")
@@ -755,6 +774,8 @@ class Pipeline:
         self.write_artifact("diagnosis.md", md)
         owner = as_str(result.output.get("owner")) or "unknown"
         self.state.diagnosis_owner = owner
+        self.state.diagnosis_disposition = as_str(result.output.get("disposition")) or "retry"
+        self.state.diagnosis_reopen_id = as_str(result.output.get("reopen_id"))
         self.log("debugger owner=%s" % owner)
         cause = as_str(result.output.get("root_cause")) or as_str(
             result.output.get("diagnosis_markdown")
@@ -1267,6 +1288,7 @@ class Pipeline:
         rereview: bool = True,
         seq: bool = False,
         skip_failed: bool = False,
+        reopen: str = "",
     ) -> None:
         if self.state.mode == "audit":
             raise PipelineError("audit is read-only; apply needs a feature or range work slug")
@@ -1311,6 +1333,9 @@ class Pipeline:
             self.log("apply: unclassified findings remain; needs-classification")
             return
         if seq:
+            if reopen:
+                self._seq_reopen(reopen, review_findings=findings, guardian=guardian)
+                return
             self._apply_seq(
                 review_findings=findings,
                 guardian=guardian,
@@ -1425,6 +1450,43 @@ class Pipeline:
             findings_mod.collect_all(self.work), sort=True, more_hint="followups.md"
         )
 
+    def _seq_reopen(
+        self,
+        fid: str,
+        *,
+        review_findings: List[Dict[str, Any]],
+        guardian: List[Dict[str, Any]],
+    ) -> None:
+        seq = findings_mod.load_seq_state(self.work)
+        try:
+            seq = findings_mod.reopen_prefix(seq, fid)
+        except findings_mod.FindingsError as exc:
+            raise PipelineError(str(exc))
+        findings_mod.write_findings(self.work, review_findings + guardian, seq=seq)
+        self._write_followups(seq=seq)
+        later = [
+            row["id"]
+            for row in findings_mod.latest_seq_rows(seq)
+            if row.get("status") == "stale"
+        ]
+        item = findings_mod.seq_item_from_log(seq, fid)
+        seq_dir = self.work / "seq" / fid
+        seq_dir.mkdir(parents=True, exist_ok=True)
+        write_text(
+            seq_dir / "reopen.md",
+            "# Reopen `%s`\n\n%s\n\nStale: %s\n"
+            % (
+                fid,
+                item.get("title") or "",
+                ", ".join("`%s`" % sid for sid in later) or "(none)",
+            ),
+        )
+        self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
+        self.state.stop_reason = "seq-reopened"
+        self.save()
+        self.log("seq: reopened %s; %d later class(es) stale" % (fid, len(later)))
+        self.log("next: team apply %s --seq" % self.state.slug)
+
     def _apply_seq(
         self,
         *,
@@ -1524,6 +1586,7 @@ class Pipeline:
             findings_mod.render_seq_plan([item], failed=""),
         )
         shutil.copyfile(self.work / "apply-plan.md", seq_dir / "plan.md")
+        start = self._snapshot()
         self.log("seq class %s [%s] %s" % (fid, item.get("kind"), item.get("title")))
         hops: List[str] = []
         kind = item.get("kind")
@@ -1562,8 +1625,14 @@ class Pipeline:
 
             if run.get("status") != "PASS" and not self.should_skip("debugger"):
                 try:
-                    self.phase_debugger()
+                    applied_rows = [
+                        row
+                        for row in findings_mod.latest_seq_rows(seq)
+                        if row.get("status") == "applied"
+                    ]
+                    self.phase_debugger(seq_applied=applied_rows)
                     hops.append("debugger owner=%s" % (self.state.diagnosis_owner or "?"))
+                    self._log_seq_disposition(seq, item)
                     if self.state.diagnosis_owner in ("implementer", "test-writer"):
                         self.phase_repair()
                         self.phase_verify_test()
@@ -1574,6 +1643,7 @@ class Pipeline:
                     hops.append("debugger skipped (%s)" % exc)
 
             suite = str((self.state.final or run).get("status") or run.get("status") or "")
+            self._write_seq_checkpoint(seq_dir, item, start=start, hops=hops, suite=suite)
             self._seq_copy_artifacts(seq_dir)
             if suite != "PASS":
                 seq = findings_mod.mark_seq_step(
@@ -1602,6 +1672,9 @@ class Pipeline:
                 findings_mod.collect_all(self.work),
                 seq=seq,
             )
+            self._write_seq_checkpoint(
+                seq_dir, item, start=start, hops=hops, suite=suite, status="applied"
+            )
             self._seq_copy_artifacts(seq_dir)
             write_text(
                 seq_dir / "summary.md",
@@ -1610,6 +1683,9 @@ class Pipeline:
             )
             return True
         except PipelineError as exc:
+            self._write_seq_checkpoint(
+                seq_dir, item, start=start, hops=hops, suite="ERROR", status="failed"
+            )
             seq = findings_mod.mark_seq_step(
                 seq, item, status="failed", hops=hops, suite="ERROR"
             )
@@ -1621,6 +1697,86 @@ class Pipeline:
             write_text(seq_dir / "summary.md", "failed: %s\n" % exc)
             self.log("seq class %s error: %s" % (fid, exc))
             return False
+
+    def _write_seq_checkpoint(
+        self,
+        seq_dir: Path,
+        item: Dict[str, Any],
+        *,
+        start: Dict[str, Any],
+        hops: List[str],
+        suite: str,
+        status: str = "",
+    ) -> None:
+        end = self._snapshot()
+        touched = gitutil.product_paths(gitutil.changed_paths(self.repo, start, end))
+        patch = gitutil.worktree_diff(self.repo, touched) if gitutil.is_git_repo(self.repo) else ""
+        if patch:
+            write_text(seq_dir / "delta.patch", patch)
+        assumptions = []
+        if item.get("kind") == "architecture":
+            assumptions = findings_mod.extract_assumptions(
+                self.read_artifact("design-replan.md")
+            )
+        dump_json(
+            seq_dir / "checkpoint.json",
+            {
+                "id": item.get("id") or "",
+                "kind": item.get("kind") or "",
+                "title": item.get("title") or "",
+                "path": item.get("path") or "",
+                "status": status or ("failed" if suite != "PASS" else "applied"),
+                "head_before": start.get("head") or "",
+                "head_after": end.get("head") or "",
+                "start": start,
+                "end": end,
+                "touched": touched,
+                "suite": suite,
+                "hops": list(hops),
+                "assumptions": assumptions,
+            },
+        )
+
+    def _log_seq_disposition(self, seq: Dict[str, Any], item: Dict[str, Any]) -> None:
+        disposition = (self.state.diagnosis_disposition or "retry").strip().lower()
+        reopen_id = (self.state.diagnosis_reopen_id or "").strip()
+        applied = {
+            row["id"]
+            for row in findings_mod.latest_seq_rows(seq)
+            if row.get("status") == "applied"
+        }
+        if disposition == "reopen":
+            if reopen_id and reopen_id in applied:
+                self.log("debugger suggests reopen %s (not executed)" % reopen_id)
+                self.log("  team apply %s --seq --reopen %s" % (self.state.slug, reopen_id))
+            else:
+                self.log(
+                    "debugger disposition=reopen ignored (need applied reopen_id, got %r)"
+                    % reopen_id
+                )
+                disposition = "retry"
+        elif disposition == "skip":
+            self.log("debugger suggests skip (not executed)")
+            self.log("  team apply %s --seq --skip-failed" % self.state.slug)
+        else:
+            disposition = "retry"
+        if disposition == "retry":
+            path = as_str(item.get("path"))
+            for row in findings_mod.latest_seq_rows(seq):
+                if row.get("status") != "applied":
+                    continue
+                if row.get("kind") != "architecture":
+                    continue
+                if path and as_str(row.get("path")) == path:
+                    self.log(
+                        "same-path architecture %s is a reopen candidate"
+                        % row.get("id")
+                    )
+        write_text(
+            self.work / "seq" / str(item.get("id") or "") / "disposition.md",
+            "disposition: %s\nreopen_id: %s\n"
+            % (disposition, reopen_id if disposition == "reopen" else ""),
+        )
 
     def _seq_copy_artifacts(self, seq_dir: Path) -> None:
         for name in (

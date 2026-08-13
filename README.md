@@ -95,7 +95,7 @@ Every command accepts `-h` / `--help` (`team review --help`, `team apply --help`
 
 `team apply <slug>` processes a review. Each finding needs `kind` (`architecture` | `implementation` | `test` | `note`). If the review is unstructured, apply re-runs the reviewer first. Then: architecture → design delta; test → contract + tests; implementation → production; host suite; closing review. Audit slugs are read-only and cannot be applied.
 
-`team apply <slug> --seq` closes **one class at a time** in the same order as `feature` (architecture → test → implementation, severity inside each kind) and loops until the queue is empty or a class fails. Each hop sees only that class (not `review.md` / the rest of the backlog). A class review is written to `seq/<id>/review.md`; the original `review.md` is not overwritten. On failure the worktree is left as that class left it (no rollback). Retry the same class with `team apply <slug> --seq`; skip it with `--skip-failed`. Re-review a finished class with `team review <slug> --seq` (or `--seq <id>`).
+`team apply <slug> --seq` closes **one class at a time** in the same order as `feature` (architecture → test → implementation, severity inside each kind) and loops until the queue is empty or a class fails. Each hop sees only that class (not `review.md` / the rest of the backlog). A class review is written to `seq/<id>/review.md`; the original `review.md` is not overwritten. Each class writes `seq/<id>/checkpoint.json` and `delta.patch`. On failure the worktree is left as that class left it (no rollback). Retry the same class with `team apply <slug> --seq`; skip it with `--skip-failed`. If a later class shows an earlier decision was wrong, `team apply <slug> --seq --reopen <id>` opens that class again and marks later ids **stale** (not skipped); the next `--seq` retries it. `team list` prints each class id and status. Re-review a finished class with `team review <slug> --seq` (or `--seq <id>`).
 
 ## Artifacts (the protocol)
 
@@ -126,6 +126,9 @@ Each run lives in the **target** repo, not in this engine:
   apply-summary.md        # hops + suite after apply
   apply-seq.md            # apply --seq log (one class per step)
   seq/<id>/review.md      # class review; does not replace review.md
+  seq/<id>/checkpoint.json
+  seq/<id>/delta.patch
+  seq/<id>/reopen.md
   design-replan.md        # only after team replan / apply architecture
   scout.md / scout.json   # audit only
   status.md               # audit only
