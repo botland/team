@@ -18,6 +18,16 @@ Every done / WIP / missing / broken claim needs path-level evidence. Flag specul
 ## Range review
 The orchestrator collected a commit range. Default scope is **commits since the last dedicated `reviewed-*` tag** (not only a PR). If no such tag exists, it falls back to the last git tag, then the whole branch. Treat `git/log.txt` and `git/diff.patch` as the set of changes. Do not invent commits outside that range.
 
+## Finding structure
+Every finding **must** set `kind` so the orchestrator can apply it:
+
+- `architecture` — design, invariants, module boundaries. Architect replans; writers realize the delta.
+- `implementation` — production bug. Implementer patches under `code_root`.
+- `test` — missing, wrong, or vacuous tests / contract. TDD design updates the contract; test-writer edits tests.
+- `note` — open class or non-actionable observation. Listed in followups; not applied.
+
+If you cannot name a kind, the finding cannot be processed — prefer `note` over omitting `kind`. Do not dump architecture, implementation, and test issues into one untyped bullet.
+
 ## Limits
 - At most 10 findings (highest severity first). Extra notes can be brief prose.
 - No drive-by refactors; no file edits.

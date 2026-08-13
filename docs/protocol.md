@@ -6,7 +6,7 @@ Every phase reads files and may write files. Chat context is not the handoff.
 |------|-------------|----------|
 | `brief.md` | orchestrator from the CLI brief | yes |
 | `design.md` | architect (orchestrator writes from schema) | source of truth for structure + invariants |
-| `critic.md` | critic | claim about the design vs brief |
+| `critic.md` | critic | adversarial: tries to kill the design (not help it) |
 | `test-contract.md` | tdd-design | source of truth for intended tests |
 | tests under `test_root` | test-writer | authoritative tests |
 | `tdd-summary.md` | test-writer | untrusted claim |
@@ -20,11 +20,16 @@ Every phase reads files and may write files. Chat context is not the handoff.
 | `diagnosis.md` | debugger | root cause; owner |
 | `repair-summary.md` | implementer or test-writer | one repair hop |
 | `verify-test-report.md` | orchestrator | suite after repair |
-| `followups.md` | orchestrator | open classes from review + guardian |
-| `diagnosis.md` | debugger | claim about a failure |
+| `followups.md` | orchestrator | open classes from review + guardian (includes `kind`) |
+| `findings.json` | orchestrator (apply) | classified findings used to route apply hops |
+| `apply-plan.md` | orchestrator (apply) | what will be applied, by kind |
+| `apply-summary.md` | orchestrator (apply) | hops taken + suite result |
+| `apply-tdd-summary.md` | test-writer (apply) | untrusted claim |
+| `apply-impl-summary.md` | implementer (apply) | untrusted claim |
+| `apply-test-report.md` | orchestrator (apply) | suite after apply |
 | `review-*.md` | each reviewer | independent; they must not read each other |
 | `review.md` | orchestrator merge | human-facing |
-| `guardian.md` | guardian | invariant risks after review |
+| `guardian.md` | guardian | R→A→T→I and **I→R** (implementation vs original brief) |
 | `design-replan.md` | architect replan | delta only |
 | `state.json` | orchestrator | machine state |
 | `consult/*.json` | orchestrator | questions + answers |

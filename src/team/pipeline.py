@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from team import findings as findings_mod
 from team import gitutil, testhost
 from team.config import (
     AUDIT_PHASE_ORDER,
@@ -17,13 +19,24 @@ from team.config import (
     schema_path,
 )
 from team.merge import merge_reviews
-from team.runners import Result, Runtime, runtime_for
+from team.runners import (
+    Result,
+    Runtime,
+    describe_runtime_failure,
+    resolve_session,
+    runtime_for,
+)
+from team.schemas import validate as validate_schema
 from team.state import State, work_dir
-from team.util import as_bool, as_list, as_str, engine_root, load_json, write_text
+from team.util import as_bool, as_list, as_str, engine_root, explicit_roots, load_json, write_text
 
 
 class PipelineError(RuntimeError):
     pass
+
+
+class OptionalPhaseError(PipelineError):
+    """Optional role (guardian, critic, …) could not run. Skip, do not abort."""
 
 
 class Pipeline:
@@ -37,6 +50,19 @@ class Pipeline:
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
         print(msg, flush=True)
+
+    def _log_items(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        sort: bool = False,
+        more_hint: str = "",
+    ) -> None:
+        """After a role exits: at most 10 important items. No-op if none."""
+        for line in findings_mod.format_console_lines(
+            items, sort=sort, more_hint=more_hint
+        ):
+            self.log(line)
 
     def save(self) -> None:
         self.state.code_root = self.cfg.code_root
@@ -89,9 +115,12 @@ class Pipeline:
         if runtime_name == "both":
             raise PipelineError("reviewer=both must pick a concrete runtime")
         cap = capability or ROLES[role]["capability"]
+        self._require_write_scope(role, cap)
         rt: Runtime = runtime_for(runtime_name)
         session_key = "%s:%s" % (role, runtime_name)
-        sid = self.state.sessions.get(session_key, "")
+        # Replan consults tdd-design, then apply invokes it again. Passing the
+        # stored id as a *new* --session-id fails: "Session ID is already in use."
+        sid, do_resume = resolve_session(self.state.sessions.get(session_key, ""))
         extra = dict(extra or {})
         extra.setdefault("code_root", self.cfg.code_root)
         extra.setdefault("test_root", self.cfg.test_root)
@@ -104,7 +133,7 @@ class Pipeline:
             schema=self.schema(schema_name),
             capability=cap,
             session_id=sid,
-            resume=resume and bool(sid),
+            resume=do_resume,
             work=self.work,
             repo=self.repo,
             timeout=self.cfg.phase_timeout,
@@ -112,13 +141,90 @@ class Pipeline:
         )
         if result.session_id:
             self.state.sessions[session_key] = result.session_id
-        write_text(
+        output = dict(result.output) if isinstance(result.output, dict) else {"value": result.output}
+        output["_meta"] = {
+            "slug": self.state.slug,
+            "attempt": (self.state.last_review or {}).get("attempt") or 0,
+            "phase": phase,
+            "role": role,
+            "runtime": runtime_name,
+            "head": gitutil.head(self.repo) if gitutil.is_git_repo(self.repo) else "",
+            "range_base": self.state.range_base,
+        }
+        result_path = write_text(
             self.work / "prompts" / ("%s.result.json" % phase),
-            json.dumps(result.output, indent=2)[:200000],
+            json.dumps(output, indent=2)[:200000],
         )
+        if str(phase).startswith("reviewer"):
+            self._record_review_result(result_path)
         if not result.success:
-            raise PipelineError("%s/%s failed: %s" % (role, phase, result.error or "unknown"))
+            err = describe_runtime_failure(result)
+            if ROLES.get(role, {}).get("optional"):
+                raise OptionalPhaseError("%s: %s" % (phase, err))
+            raise PipelineError("%s/%s failed: %s" % (role, phase, err))
+        errors = validate_schema(result.output, self.schema(schema_name), enums=False)
+        if errors:
+            msg = "%s/%s failed: schema %s" % (role, phase, "; ".join(errors))
+            if ROLES.get(role, {}).get("optional"):
+                raise OptionalPhaseError(msg)
+            raise PipelineError(msg)
         return result
+
+    def _require_write_scope(self, role: str, capability: str) -> None:
+        if capability == "write-code" and not explicit_roots(self.cfg.code_root):
+            raise PipelineError(
+                "%s: write capability requires an explicit code_root; "
+                "set paths.code_root or use '.'" % role
+            )
+        if capability == "write-tests" and not explicit_roots(self.cfg.test_root):
+            raise PipelineError(
+                "%s: write capability requires an explicit test_root; "
+                "set paths.test_root or use '.'" % role
+            )
+
+    def _begin_review_attempt(self) -> None:
+        prev = self.state.last_review if isinstance(self.state.last_review, dict) else {}
+        attempt = int(prev.get("attempt") or 0) + 1
+        self.state.last_review = {"attempt": attempt, "results": []}
+        self.save()
+
+    def _record_review_result(self, path: Path) -> None:
+        rec = self.state.last_review if isinstance(self.state.last_review, dict) else {}
+        results = [row for row in as_list(rec.get("results")) if isinstance(row, dict)]
+        results = [row for row in results if row.get("name") != path.name]
+        results.append(
+            {
+                "name": path.name,
+                "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+        rec = dict(rec)
+        rec["results"] = results
+        rec.setdefault("attempt", 1)
+        self.state.last_review = rec
+        self.save()
+
+    def _refresh_recorded_review_digests(self) -> None:
+        rec = self.state.last_review if isinstance(self.state.last_review, dict) else {}
+        rows = [row for row in as_list(rec.get("results")) if isinstance(row, dict)]
+        prompts = self.work / "prompts"
+        updated = []
+        for row in rows:
+            name = as_str(row.get("name"))
+            path = prompts / name
+            if not name or not path.is_file():
+                continue
+            updated.append(
+                {
+                    "name": name,
+                    "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            )
+        rec = dict(rec)
+        rec["results"] = updated
+        rec.setdefault("attempt", 1)
+        self.state.last_review = rec
+        self.save()
 
     def consult(self, target: str, questions: List[str], from_role: str) -> str:
         target = {
@@ -206,26 +312,63 @@ class Pipeline:
         ]
         return "\n".join(parts)
 
-    def _verify_write(self, phase: str, allowed: List[str], before: List[str]) -> None:
-        after = gitutil.porcelain_paths(self.repo)
-        delta = gitutil.delta_paths(before, after)
+    def _snapshot(self) -> dict:
+        if not gitutil.is_git_repo(self.repo):
+            return {"head": "", "paths": [], "entries": {}}
+        return gitutil.snapshot(self.repo)
+
+    def _verify_write(self, phase: str, allowed: List[str], before: Any) -> None:
+        if isinstance(before, dict):
+            before_snap = before
+        else:
+            before_snap = {"head": "", "paths": list(before or []), "entries": {}}
+        after = self._snapshot()
+        delta = gitutil.changed_paths(self.repo, before_snap, after)
         work_root = ".team/work/%s" % self.state.slug
+        roots = explicit_roots(allowed)
         ok, bad = gitutil.verify_delta(
             delta,
-            allowed,
+            roots,
             always_allowed=[work_root, ".team/work"],
         )
+        b_entries = dict(before_snap.get("entries") or {})
+        a_entries = dict(after.get("entries") or {})
+        for path in delta:
+            if path in b_entries and b_entries.get(path) != a_entries.get(path):
+                if any(gitutil.under_root(path, root) for root in (work_root, ".team/work")):
+                    continue
+                if path not in bad:
+                    bad.append(path)
+                    if path in ok:
+                        ok.remove(path)
         gitutil.write_path_list(self.work / "git" / ("after-%s.txt" % phase), delta)
-        report = gitutil.describe_verify(phase, delta, bad, allowed)
+        report = gitutil.describe_verify(
+            phase,
+            delta,
+            bad,
+            roots,
+            head_before=str(before_snap.get("head") or ""),
+            head_after=str(after.get("head") or ""),
+        )
         write_text(self.work / "git" / ("verify-%s.md" % phase), report)
-        if not allowed:
+        head_changed = bool(
+            before_snap.get("head")
+            and after.get("head")
+            and before_snap.get("head") != after.get("head")
+        )
+        if not roots:
             self.log("git verify %s: no root set, advisory only (%d paths)" % (phase, len(delta)))
             return
         if bad:
             raise PipelineError(
-                "%s wrote outside allowed roots %s: %s" % (phase, allowed, ", ".join(bad))
+                "%s wrote outside allowed roots %s: %s" % (phase, roots, ", ".join(bad))
             )
-        if not ok:
+        if head_changed:
+            self.log(
+                "git verify %s: HEAD changed %s -> %s"
+                % (phase, before_snap.get("head"), after.get("head"))
+            )
+        elif not ok:
             self.log("git verify %s: no new paths (continuing)" % phase)
         else:
             self.log("git verify %s: %d path(s) ok" % (phase, len(ok)))
@@ -239,7 +382,7 @@ class Pipeline:
                 self.log("all phases already done")
                 return self.state
         started = False
-        order = AUDIT_PHASE_ORDER if self.state.mode == "audit" else PHASE_ORDER
+        order = _phase_order(self.state)
         for phase in order:
             if not started:
                 if phase == start_at:
@@ -271,7 +414,11 @@ class Pipeline:
                 "assess": self.phase_assess,
             }[phase]
             self.log("== %s (%s)" % (phase, self.cfg.assignment(role_for_phase(phase, self.state))))
-            handler()
+            try:
+                handler()
+            except OptionalPhaseError as exc:
+                self._skip(phase, str(exc))
+                continue
             self.state.mark(phase)
             self.save()
             if self.cfg.dry_run and phase == "tdd-design":
@@ -361,23 +508,32 @@ class Pipeline:
             "critic",
             [
                 self._listed_artifacts(["brief.md", "design.md"]),
-                "Does design.md satisfy brief.md?",
-                "Set accepts=true only if the brief is covered by testable criteria.",
+                "Try to KILL the design. Do not help the architect.",
+                "Run every attack in the persona. accepts=true only if none land",
+                "and the brief is covered by testable criteria.",
+                "If you reject, issues[] are the hits (max 10).",
             ],
         )
         result = self.invoke("critic", "critic", prompt, "critic.json")
         out = result.output
         self.write_artifact("critic.md", as_str(out.get("critic_markdown")) or json.dumps(out, indent=2))
+        attacks = as_list(out.get("attacks"))
+        landed = [
+            as_str(a.get("hit") or a.get("question"))
+            for a in attacks
+            if isinstance(a, dict) and a.get("lands")
+        ]
         if as_bool(out.get("accepts"), False):
-            self.log("critic accepted")
+            self.log("critic accepted (design survived)")
             return
         self.log("critic rejected; one architect revision")
-        issues = as_list(out.get("issues"))
+        issues = as_list(out.get("issues")) or landed
+        self._log_items(findings_mod.items_from_strings(issues, severity="issue"))
         prompt = self._prompt(
             "architect",
             [
                 self._listed_artifacts(["brief.md", "design.md", "critic.md"]),
-                "The requirements critic rejected the design.",
+                "The critic tried to kill the design. Address the hits. Do not inflate scope.",
                 "Issues: " + json.dumps(issues),
                 "Revise design_markdown. Stay structure-level. No function bodies.",
             ],
@@ -422,7 +578,7 @@ class Pipeline:
         self.log("test contract written")
 
     def phase_test_writer(self) -> None:
-        before = gitutil.porcelain_paths(self.repo)
+        before = self._snapshot()
         prompt = self._prompt(
             "test-writer",
             [
@@ -480,7 +636,7 @@ class Pipeline:
         self.log("baseline %s (exit=%s)" % (run["status"], run["exit"]))
 
     def phase_implementer(self) -> None:
-        before = gitutil.porcelain_paths(self.repo)
+        before = self._snapshot()
         prompt = self._prompt(
             "implementer",
             [
@@ -600,10 +756,24 @@ class Pipeline:
         owner = as_str(result.output.get("owner")) or "unknown"
         self.state.diagnosis_owner = owner
         self.log("debugger owner=%s" % owner)
+        cause = as_str(result.output.get("root_cause")) or as_str(
+            result.output.get("diagnosis_markdown")
+        )
+        self._log_items(
+            [
+                {
+                    "severity": "high",
+                    "title": "owner=%s" % owner,
+                    "evidence": cause,
+                    "path": "",
+                    "kind": "implementation" if owner == "implementer" else "test",
+                }
+            ]
+        )
 
     def phase_repair(self) -> None:
         owner = self.state.diagnosis_owner or "implementer"
-        before = gitutil.porcelain_paths(self.repo)
+        before = self._snapshot()
         if owner == "test-writer":
             prompt = self._prompt(
                 "test-writer",
@@ -671,7 +841,7 @@ class Pipeline:
         self.log("verify %s verdict=%s" % (run["status"], comparison["verdict"]))
 
     def phase_adversarial(self) -> None:
-        before = gitutil.porcelain_paths(self.repo)
+        before = self._snapshot()
         prompt = self._prompt(
             "adversarial",
             [
@@ -703,7 +873,21 @@ class Pipeline:
         )
         self.write_artifact("adversarial.md", md)
         self._verify_write("adversarial", [self.cfg.test_root], before)
-        self.log("adversarial %d vector(s)" % len(as_list(result.output.get("vectors"))))
+        vectors = as_list(result.output.get("vectors"))
+        self.log("adversarial %d vector(s)" % len(vectors))
+        self._log_items(
+            [
+                {
+                    "severity": "high",
+                    "title": as_str(v.get("title")) or "(untitled)",
+                    "evidence": as_str(v.get("threat")),
+                    "path": as_str(v.get("path")),
+                    "kind": "test",
+                }
+                for v in vectors
+                if isinstance(v, dict)
+            ]
+        )
 
     def phase_adversarial_test(self) -> None:
         cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
@@ -724,6 +908,7 @@ class Pipeline:
         if self.state.mode == "range":
             self.phase_range_reviewer()
             return
+        self._begin_review_attempt()
         assignment = self.cfg.assignment("reviewer")
         if assignment == "both":
             runtimes = ["claude", "grok"]
@@ -749,7 +934,7 @@ class Pipeline:
                     self._listed_artifacts(artifacts),
                     "READ-ONLY. Inspect the actual files and git status.",
                     "Summaries are claims, not evidence.",
-                    "At most 10 findings (severity, title, evidence, path).",
+                    self._reviewer_finding_rules(),
                     "You are the %s reviewer. Do not assume another reviewer exists."
                     % runtime,
                 ],
@@ -778,8 +963,9 @@ class Pipeline:
         merged = merge_reviews(parts)
         self.write_artifact("review.md", merged)
         self.log("review written (%s)" % ", ".join(runtimes))
+        self._log_items(findings_mod.collect_review_findings(self.work))
 
-    def _verify_readonly(self, phase: str, before: List[str]) -> None:
+    def _verify_readonly(self, phase: str, before: Any) -> None:
         if not gitutil.is_git_repo(self.repo):
             self.log("git verify %s: skipped (not a git repo)" % phase)
             return
@@ -792,7 +978,7 @@ class Pipeline:
         self.write_artifact("report.md", combined)
 
     def phase_scout(self) -> None:
-        before = gitutil.porcelain_paths(self.repo) if gitutil.is_git_repo(self.repo) else []
+        before = self._snapshot()
         prompt = self._prompt(
             "scout",
             [
@@ -834,7 +1020,7 @@ class Pipeline:
         self.log("scout %d component(s)" % len(components))
 
     def phase_assess(self) -> None:
-        before = gitutil.porcelain_paths(self.repo) if gitutil.is_git_repo(self.repo) else []
+        before = self._snapshot()
         scout_blob = self.read_artifact("scout.json") or self.read_artifact("scout.md")
         prompt = self._prompt(
             "architect",
@@ -859,6 +1045,7 @@ class Pipeline:
         self.log("status written")
 
     def phase_status_reviewer(self) -> None:
+        self._begin_review_attempt()
         assignment = self.cfg.assignment("reviewer")
         if assignment == "both":
             runtimes = ["claude", "grok"]
@@ -877,7 +1064,7 @@ class Pipeline:
                     "Repo: %s" % json.dumps(str(self.repo)),
                     "Inspect the actual tree. Confirm or refute done/WIP/missing/broken",
                     "claims with path-level evidence. Flag speculation.",
-                    "At most 10 findings (severity, title, evidence, path).",
+                    self._reviewer_finding_rules(),
                     "You are the %s reviewer. Do not assume another reviewer exists."
                     % runtime,
                 ],
@@ -890,7 +1077,7 @@ class Pipeline:
                 runtime_name=runtime,
             )
 
-        before = gitutil.porcelain_paths(self.repo) if gitutil.is_git_repo(self.repo) else []
+        before = self._snapshot()
         parts = []
         if len(runtimes) == 1:
             ordered = runtimes
@@ -909,8 +1096,10 @@ class Pipeline:
         self._write_audit_report()
         self._verify_readonly("reviewer", before)
         self.log("audit review written (%s)" % ", ".join(runtimes))
+        self._log_items(findings_mod.collect_review_findings(self.work))
 
     def phase_range_reviewer(self) -> None:
+        self._begin_review_attempt()
         assignment = self.cfg.assignment("reviewer")
         if assignment == "both":
             runtimes = ["claude", "grok"]
@@ -927,7 +1116,7 @@ class Pipeline:
                     "git/log.txt and git/diff.patch are authoritative. Do not invent commits.",
                     "This is not a PR-only review: the range may be 'since the last reviewed-* tag'.",
                     "READ-ONLY. Inspect the actual files those commits touched.",
-                    "At most 10 findings (severity, title, evidence, path).",
+                    self._reviewer_finding_rules(),
                     "You are the %s reviewer. Do not assume another reviewer exists."
                     % runtime,
                 ],
@@ -940,7 +1129,7 @@ class Pipeline:
                 runtime_name=runtime,
             )
 
-        before = gitutil.porcelain_paths(self.repo) if gitutil.is_git_repo(self.repo) else []
+        before = self._snapshot()
         parts = []
         if len(runtimes) == 1:
             ordered = runtimes
@@ -958,6 +1147,7 @@ class Pipeline:
         self.write_artifact("review.md", merged)
         self._verify_readonly("reviewer", before)
         self.log("range review written (%s)" % ", ".join(runtimes))
+        self._log_items(findings_mod.collect_review_findings(self.work))
 
     def phase_guardian(self) -> None:
         prompt = self._prompt(
@@ -967,19 +1157,33 @@ class Pipeline:
                     [
                         "brief.md",
                         "design.md",
+                        "critic.md",
                         "test-contract.md",
+                        "tdd-summary.md",
+                        "impl-summary.md",
+                        "baseline-report.md",
                         "test-report.md",
+                        "adversarial-test-report.md",
+                        "apply-test-report.md",
                         "review.md",
+                        "range.md",
                     ]
                 ),
-                "What invariant could be violated despite tests passing?",
-                "Do not edit files.",
+                "R = brief.md + target AGENTS.md. A = design.md. T = test-contract.md.",
+                "I = the tree. V = test/apply reports.",
+                "Evaluate R→A, A→T, T→I, and I→R. The last arrow is required.",
+                "A green suite does not prove I→R. Do not edit files.",
             ],
         )
         result = self.invoke("guardian", "guardian", prompt, "guardian.json")
         md = as_str(result.output.get("guardian_markdown")) or json.dumps(result.output, indent=2)
         self.write_artifact("guardian.md", md)
-        self.log("guardian %d risk(s)" % len(as_list(result.output.get("risks"))))
+        risks = as_list(result.output.get("risks"))
+        self.log(
+            "guardian %d risk(s)  %s"
+            % (len(risks), findings_mod.format_chain(result.output.get("chain")))
+        )
+        self._log_items(findings_mod.collect_guardian_findings(self.work))
 
     def replan(self) -> None:
         review = self.read_artifact("review.md")
@@ -1018,6 +1222,10 @@ class Pipeline:
         result = self.invoke("architect", "replan", prompt, "design.json", resume=True)
         md = as_str(result.output.get("design_markdown")) or "(empty replan)"
         self.write_artifact("design-replan.md", md)
+        if not self.cfg.code_root:
+            self.cfg.code_root = as_str(result.output.get("code_root"))
+        if not self.cfg.test_root:
+            self.cfg.test_root = as_str(result.output.get("test_root"))
         self.state.mark("replan")
         self.state.stop_reason = "replan"
         self.save()
@@ -1035,34 +1243,277 @@ class Pipeline:
         self.log("applied design-replan.md → design.md; resuming at tdd-design")
         self.run(start="tdd-design")
 
+    def _reviewer_finding_rules(self) -> str:
+        return (
+            "Each finding MUST set kind to one of: architecture, implementation, test, note.\n"
+            "- architecture: design, invariants, boundaries — architect will replan\n"
+            "- implementation: production bug — implementer will patch\n"
+            "- test: missing/wrong tests or contract — tdd-design + test-writer\n"
+            "- note: open class or non-actionable; listed only\n"
+            "At most 10 findings (severity, title, evidence, path, kind)."
+        )
+
     def _write_followups(self) -> None:
-        lines = ["# Open classes", ""]
-        found = False
-        for path in sorted((self.work / "prompts").glob("reviewer-*.result.json")):
+        items = findings_mod.collect_all(self.work)
+        self.write_artifact("followups.md", findings_mod.render_followups(items))
+
+    def apply_review(self, *, dry_run: bool = False, rereview: bool = True) -> None:
+        if self.state.mode == "audit":
+            raise PipelineError("audit is read-only; apply needs a feature or range work slug")
+        if not self.read_artifact("review.md"):
+            raise PipelineError("apply needs review.md (run team review first)")
+
+        reclassified = False
+        try:
+            findings = findings_mod.collect_review_findings(self.work)
+        except findings_mod.FindingsError as exc:
+            self.log("review results unusable (%s); refreshing recorded digests" % exc)
+            self._refresh_recorded_review_digests()
+            findings = findings_mod.collect_review_findings(self.work)
+        if findings_mod.needs_classify(findings, work=self.work):
+            self.log("review findings lack kind=; re-running reviewer")
+            self.phase_reviewer()
+            self.state.mark("reviewer")
+            if self.state.mode != "audit" and "guardian" not in self.cfg.skip:
+                try:
+                    self.phase_guardian()
+                    self.state.mark("guardian")
+                except OptionalPhaseError as exc:
+                    self._skip("guardian", str(exc))
+            findings = findings_mod.collect_review_findings(self.work)
+            reclassified = True
+            self.save()
+
+        findings = findings_mod.fill_missing_kinds(findings)
+        items = findings + findings_mod.collect_guardian_findings(self.work)
+        findings_mod.write_findings(self.work, items)
+        self._write_followups()
+        groups = findings_mod.group_by_kind(items)
+        self.write_artifact(
+            "apply-plan.md",
+            findings_mod.render_plan(groups, reclassified=reclassified),
+        )
+        if groups.get("unclassified"):
+            self.state.stop_reason = "needs-classification"
+            self.save()
+            self.log("apply: unclassified findings remain; needs-classification")
+            return
+        self.log(
+            "apply plan: arch=%d impl=%d test=%d note=%d"
+            % (
+                len(groups["architecture"]),
+                len(groups["implementation"]),
+                len(groups["test"]),
+                len(groups["note"]),
+            )
+        )
+        self._log_items(items, sort=True, more_hint="apply-plan.md")
+
+        actionable = findings_mod.actionable(items)
+        if dry_run:
+            self.state.stop_reason = "dry_run"
+            self.save()
+            self.log("stop: apply dry-run")
+            return
+        hops: List[str] = []
+        if not actionable:
+            self.write_artifact(
+                "apply-summary.md",
+                findings_mod.render_summary(
+                    groups,
+                    reclassified=reclassified,
+                    suite_status="",
+                    hops=[],
+                    rereviewed=False,
+                ),
+            )
+            self.state.stop_reason = "applied"
+            self.save()
+            self.log("apply: nothing actionable")
+            return
+
+        if groups["architecture"]:
+            self.replan()
+            delta = self.read_artifact("design-replan.md")
+            if delta:
+                self.write_artifact("design.md", delta)
+                hops.append("architect replan → design.md")
+                self.log("applied design-replan.md → design.md")
+
+        if groups["architecture"] or groups["test"]:
+            self._apply_tdd_design(items)
+            hops.append("tdd-design contract")
+            self._apply_test_writer(items)
+            hops.append("test-writer")
+
+        if groups["architecture"] or groups["implementation"]:
+            self._apply_implementer(items)
+            hops.append("implementer")
+
+        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+        self.cfg.test_command = cmd
+        run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
+        comparison = testhost.compare(self.state.final or self.state.baseline, run)
+        run = dict(run)
+        run["comparison"] = comparison
+        self.state.final = run
+        self.write_artifact(
+            "apply-test-report.md",
+            testhost.render_report("Apply test run", run, comparison),
+        )
+        hops.append("suite %s" % run.get("status"))
+        self.log("apply-test %s" % run.get("status"))
+
+        if run.get("status") != "PASS" and not self.should_skip("debugger"):
             try:
-                data = load_json(path)
-            except Exception:
-                continue
-            for item in as_list(data.get("findings")):
-                found = True
-                title = item.get("title") or "(untitled)"
-                sev = item.get("severity") or "?"
-                loc = item.get("path") or ""
-                lines.append("- **%s** %s%s" % (sev, title, (" (`%s`)" % loc) if loc else ""))
-        gpath = self.work / "prompts" / "guardian.result.json"
-        if gpath.is_file():
-            try:
-                data = load_json(gpath)
-            except Exception:
-                data = {}
-            for item in as_list(data.get("risks")):
-                found = True
-                title = item.get("title") or "(untitled)"
-                loc = item.get("path") or ""
-                lines.append("- **invariant** %s%s" % (title, (" (`%s`)" % loc) if loc else ""))
-        if not found:
-            lines.append("- (none recorded in reviewer/guardian structured output)")
-        self.write_artifact("followups.md", "\n".join(lines) + "\n")
+                self.phase_debugger()
+                hops.append("debugger owner=%s" % (self.state.diagnosis_owner or "?"))
+                if self.state.diagnosis_owner in ("implementer", "test-writer"):
+                    self.phase_repair()
+                    self.phase_verify_test()
+                    hops.append("repair + verify")
+            except OptionalPhaseError as exc:
+                self._skip("debugger", str(exc))
+                hops.append("debugger skipped (%s)" % exc)
+
+        if rereview:
+            self.phase_reviewer()
+            if self.state.mode != "audit" and "guardian" not in self.cfg.skip:
+                try:
+                    self.phase_guardian()
+                except OptionalPhaseError as exc:
+                    self._skip("guardian", str(exc))
+            self._write_followups()
+            hops.append("closing review")
+
+        self.write_artifact(
+            "apply-summary.md",
+            findings_mod.render_summary(
+                groups,
+                reclassified=reclassified,
+                suite_status=str(run.get("status") or ""),
+                hops=hops,
+                rereviewed=rereview,
+            ),
+        )
+        self.state.stop_reason = "applied"
+        self.save()
+        self.log("apply complete")
+        self._log_items(
+            findings_mod.collect_all(self.work), sort=True, more_hint="followups.md"
+        )
+
+    def _apply_tdd_design(self, items: List[Dict[str, Any]]) -> None:
+        prompt = self._prompt(
+            "tdd-design",
+            [
+                self._listed_artifacts(
+                    ["brief.md", "design.md", "test-contract.md", "review.md", "apply-plan.md"]
+                ),
+                "APPLY REVIEW. Update the test contract so kind=test findings and any",
+                "applied design delta are encoded. Do not write test or production files.",
+                "Findings:\n" + json.dumps(items, indent=2),
+                "If a contract exists, write a revised full contract, not a fragment.",
+                "ready must be true unless you have at most 10 questions for the architect.",
+            ],
+        )
+        result = self.invoke(
+            "tdd-design", "tdd-design-apply", prompt, "tdd_design.json", resume=True
+        )
+        out = result.output
+        if not as_bool(out.get("ready"), False) and as_list(out.get("questions")):
+            answers = self.consult("architect", as_list(out.get("questions")), "tdd-design")
+            prompt = self._prompt(
+                "tdd-design",
+                [
+                    self._listed_artifacts(["brief.md", "design.md", "test-contract.md"]),
+                    "Architect answers:\n" + answers,
+                    "Now produce the updated test contract. ready must be true.",
+                ],
+            )
+            result = self.invoke(
+                "tdd-design", "tdd-design-apply-write", prompt, "tdd_design.json", resume=True
+            )
+            out = result.output
+        contract = as_str(out.get("test_contract_markdown")) or self.read_artifact(
+            "test-contract.md"
+        )
+        if contract:
+            self.write_artifact("test-contract.md", contract)
+        self.log("apply: test contract updated")
+
+    def _apply_test_writer(self, items: List[Dict[str, Any]]) -> None:
+        before = self._snapshot()
+        prompt = self._prompt(
+            "test-writer",
+            [
+                self._listed_artifacts(
+                    [
+                        "brief.md",
+                        "design.md",
+                        "test-contract.md",
+                        "review.md",
+                        "apply-plan.md",
+                    ]
+                ),
+                "APPLY REVIEW. Encode kind=test findings (and the current contract).",
+                "Edit ONLY under test_root=%r. NEVER edit production (code_root=%r)."
+                % (self.cfg.test_root, self.cfg.code_root),
+                "Findings:\n" + json.dumps(items, indent=2),
+                "Return summary and paths_touched (test paths only).",
+            ],
+        )
+        result = self.invoke(
+            "test-writer",
+            "test-writer-apply",
+            prompt,
+            "write_summary.json",
+            capability="write-tests",
+            resume=True,
+        )
+        self.write_artifact(
+            "apply-tdd-summary.md",
+            as_str(result.output.get("summary")) or "(no apply test summary)",
+        )
+        self._verify_write("apply-test-writer", [self.cfg.test_root], before)
+        self.log("apply: tests")
+
+    def _apply_implementer(self, items: List[Dict[str, Any]]) -> None:
+        before = self._snapshot()
+        prompt = self._prompt(
+            "implementer",
+            [
+                self._listed_artifacts(
+                    [
+                        "brief.md",
+                        "design.md",
+                        "test-contract.md",
+                        "review.md",
+                        "apply-plan.md",
+                    ]
+                ),
+                "APPLY REVIEW. Patch kind=implementation findings and realize any",
+                "applied design delta. Edit ONLY under code_root=%r." % self.cfg.code_root,
+                "NEVER edit tests (test_root=%r). Never weaken/skip/delete tests."
+                % self.cfg.test_root,
+                "Findings:\n" + json.dumps(items, indent=2),
+                "Return summary and paths_touched.",
+            ],
+        )
+        result = self.invoke(
+            "implementer",
+            "implementer-apply",
+            prompt,
+            "write_summary.json",
+            capability="write-code",
+            resume=True,
+        )
+        self.write_artifact(
+            "apply-impl-summary.md",
+            as_str(result.output.get("summary")) or "(no apply impl summary)",
+        )
+        self._verify_write("apply-implementer", [self.cfg.code_root], before)
+        self.log("apply: implementation")
 
 
 def role_for_phase(phase: str, state: Optional[State] = None) -> str:
@@ -1197,11 +1648,12 @@ def start_range_review(
         diff = gitutil.range_diff(repo, base)
         count = gitutil.commit_count(repo, base)
         desc = gitutil.describe_range(base, kind, count)
+        how = kind
     write_text(work / "brief.md", desc + "\n")
     write_text(work / "range.md", "# Range\n\n%s\n\n- base: `%s`\n- kind: %s\n- commits: %d\n" % (desc, base or "(root)", kind, count))
     write_text(work / "git" / "log.txt", log or "(empty range)\n")
     write_text(work / "git" / "diff.patch", diff or "(empty diff)\n")
-    names = gitutil.range_name_only(repo, base) if kind != "pr" else []
+    names = gitutil.paths_from_diff(diff)
     gitutil.write_path_list(work / "git" / "names.txt", names)
     snap = gitutil.snapshot(repo)
     gitutil.write_path_list(work / "git" / "start.txt", snap["paths"])
@@ -1211,12 +1663,13 @@ def start_range_review(
         repo=str(repo),
         engine_root=str(engine_root()),
         assignment=dict(cfg.roles),
-        git={"start": snap, "range_base": base, "range_kind": kind},
+        git={"start": snap, "range_base": base, "range_kind": kind, "range_how": how},
         mode="range",
         phase="reviewer",
         range_base=base,
         range_kind=kind,
         range_pr=pr,
+        range_source=how,
     )
     state.save(work)
     return Pipeline(cfg, state, work)

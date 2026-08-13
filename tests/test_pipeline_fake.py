@@ -74,6 +74,7 @@ class FakePipelineTests(unittest.TestCase):
         self.assertIn("implementer", state.phases_done)
         self.assertIn("reviewer", state.phases_done)
         self.assertIn("adversarial", state.phases_done)
+        self.assertEqual(state.assignment["reviewer"], "both")
         self.assertIn("debugger", state.skipped)
         self.assertIn("repair", state.skipped)
         review = (work / "review.md").read_text(encoding="utf-8")

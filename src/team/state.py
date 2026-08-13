@@ -32,6 +32,8 @@ class State:
     range_base: str = ""
     range_kind: str = ""
     range_pr: str = ""
+    range_source: str = ""
+    last_review: Dict[str, Any] = field(default_factory=dict)
     stamp_tag: str = ""
 
     def mark(self, phase: str) -> None:

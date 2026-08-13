@@ -23,6 +23,10 @@ reviewer = "both"
 guardian = "claude"
 scout = "grok"
 
+[review]
+# Past-commits (unscoped / --since) uses one runtime. PR and feature use roles.reviewer.
+range_reviewer = "grok"
+
 [run]
 # Skip optional phases: critic, adversarial, guardian
 skip = []

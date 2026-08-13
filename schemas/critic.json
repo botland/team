@@ -1,12 +1,25 @@
 {
   "type": "object",
-  "required": ["accepts", "critic_markdown"],
+  "required": ["accepts", "issues", "critic_markdown"],
   "properties": {
     "accepts": { "type": "boolean" },
     "issues": {
       "type": "array",
       "maxItems": 10,
       "items": { "type": "string" }
+    },
+    "attacks": {
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "required": ["question", "lands"],
+        "properties": {
+          "question": { "type": "string" },
+          "lands": { "type": "boolean" },
+          "hit": { "type": "string" }
+        }
+      }
     },
     "critic_markdown": { "type": "string" }
   }

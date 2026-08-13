@@ -1,11 +1,29 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 import subprocess
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 from team.util import posix, under_root, write_text
+
+# git hash-object -t tree /dev/null — the empty tree, stable across git versions.
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
+_DIFF_GIT = re.compile(r"^diff --git a/(.+) b/(.+)$", re.M)
+
+
+@dataclass
+class RangeSpec:
+    base_sha: str
+    head_sha: str
+    kind: str
+    source: str
+    base_label: str
 
 
 class GitError(RuntimeError):
@@ -60,16 +78,53 @@ def porcelain_paths(repo: Path) -> List[str]:
     return sorted(set(paths))
 
 
+def _content_id(repo: Path, rel: str) -> str:
+    path = repo / rel
+    if not path.exists():
+        return "missing"
+    if path.is_dir():
+        return "dir"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return "unreadable"
+    return "sha256:" + hashlib.sha256(data).hexdigest()
+
+
 def snapshot(repo: Path) -> dict:
+    paths = porcelain_paths(repo)
+    entries = {p: _content_id(repo, p) for p in paths}
     return {
         "head": head(repo),
-        "paths": porcelain_paths(repo),
+        "paths": paths,
+        "entries": entries,
     }
 
 
 def delta_paths(before: Sequence[str], after: Sequence[str]) -> List[str]:
     prior = set(before)
     return sorted(p for p in after if p not in prior)
+
+
+def changed_paths(repo: Path, before: dict, after: dict) -> List[str]:
+    """Every path whose content, existence, or committed state differs."""
+    before = before or {}
+    after = after or {}
+    b_entries = dict(before.get("entries") or {})
+    a_entries = dict(after.get("entries") or {})
+    found = set()
+    for path in set(b_entries) | set(a_entries):
+        if b_entries.get(path) != a_entries.get(path):
+            found.add(path)
+    before_head = before.get("head") or ""
+    after_head = after.get("head") or ""
+    if before_head and after_head and before_head != after_head:
+        out = git(repo, "diff", "--name-only", before_head, after_head, check=False)
+        for line in out.splitlines():
+            rel = posix(line.strip())
+            if rel:
+                found.add(rel)
+    return sorted(found)
 
 
 def verify_delta(
@@ -106,6 +161,8 @@ def describe_verify(
     delta: Sequence[str],
     bad: Sequence[str],
     allowed: Sequence[str],
+    head_before: str = "",
+    head_after: str = "",
 ) -> str:
     lines = [
         "phase: %s" % phase,
@@ -113,6 +170,10 @@ def describe_verify(
         "delta (%d):" % len(delta),
     ]
     lines.extend("  %s" % p for p in delta)
+    if head_before or head_after:
+        lines.append("head: %s -> %s" % (head_before or "?", head_after or "?"))
+        if head_before and head_after and head_before != head_after:
+            lines.append("commit: HEAD changed during phase")
     if bad:
         lines.append("violations:")
         lines.extend("  %s" % p for p in bad)
@@ -169,19 +230,24 @@ def range_log(repo: Path, base: str) -> str:
 
 def range_diff(repo: Path, base: str) -> str:
     if base:
-        return git(repo, "diff", "%s..HEAD" % base, check=False)
-    root = git(repo, "rev-list", "--max-parents=0", "HEAD", check=False).strip().splitlines()
-    if root:
-        return git(repo, "diff", root[0], "HEAD", check=False)
-    return git(repo, "diff", check=False)
+        return git(repo, "diff", "-M", "%s..HEAD" % base, check=False)
+    # Combined empty-tree diff hides rename old paths. log -p --root keeps
+    # ordinary diff --git headers for every commit, including the root and renames.
+    return git(repo, "log", "-p", "-M", "--root", check=False)
+
+
+def paths_from_diff(patch: str) -> List[str]:
+    found = set()
+    for a, b in _DIFF_GIT.findall(patch or ""):
+        for side in (a, b):
+            rel = posix(side.strip())
+            if rel and rel != "/dev/null":
+                found.add(rel)
+    return sorted(found)
 
 
 def range_name_only(repo: Path, base: str) -> List[str]:
-    if base:
-        out = git(repo, "diff", "--name-only", "%s..HEAD" % base, check=False)
-    else:
-        out = git(repo, "diff", "--name-only", check=False)
-    return [posix(p) for p in out.splitlines() if p.strip()]
+    return paths_from_diff(range_diff(repo, base))
 
 
 def commit_count(repo: Path, base: str) -> int:
@@ -209,24 +275,28 @@ def describe_range(base: str, kind: str, count: int) -> str:
 
 def pr_bundle(repo: Path, pr: str) -> Tuple[str, str, str]:
     """Return (log, diff, how). Prefer gh; else merge-base with main/master."""
-    gh = subprocess.run(
-        ["gh", "pr", "diff", str(pr)],
-        cwd=str(repo),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
     log = ""
-    view = subprocess.run(
-        ["gh", "pr", "view", str(pr), "--json", "title,commits"],
-        cwd=str(repo),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if view.returncode == 0:
+    try:
+        gh = subprocess.run(
+            ["gh", "pr", "diff", str(pr)],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        view = subprocess.run(
+            ["gh", "pr", "view", str(pr), "--json", "title,commits"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        gh = None
+        view = None
+    if view is not None and view.returncode == 0:
         log = view.stdout
-    if gh.returncode == 0 and (gh.stdout or "").strip():
+    if gh is not None and gh.returncode == 0 and (gh.stdout or "").strip():
         return log, gh.stdout, "gh"
     for branch in ("main", "master", "origin/main", "origin/master"):
         mb = git(repo, "merge-base", branch, "HEAD", check=False).strip()
@@ -239,8 +309,26 @@ def pr_bundle(repo: Path, pr: str) -> Tuple[str, str, str]:
     return range_log(repo, ""), range_diff(repo, ""), "branch-fallback"
 
 
-def stamp_reviewed(repo: Path) -> str:
-    """Create reviewed-YYYYMMDD-HHMM like vibe.rc gittag."""
+def resolve_commit(repo: Path, ref: str) -> str:
+    out = git(repo, "rev-parse", "--verify", "%s^{commit}" % ref, check=False).strip()
+    if not out or "fatal" in out.lower():
+        raise GitError("cannot resolve %s" % ref)
+    return out
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str = "HEAD") -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "merge-base", "--is-ancestor", ancestor, descendant],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def stamp_reviewed(repo: Path, ref: str = "HEAD", message: str = "") -> str:
+    """Create an annotated reviewed-YYYYMMDD-HHMM tag pointing at ref."""
+    commit = resolve_commit(repo, ref)
     base = REVIEWED_PREFIX + time.strftime("%Y%m%d-%H%M")
     name = base
     n = 2
@@ -250,5 +338,70 @@ def stamp_reviewed(repo: Path) -> str:
             break
         name = "%s-%d" % (base, n)
         n += 1
-    git(repo, "tag", name)
+    body = message or ("reviewed %s" % commit)
+    git(repo, "tag", "-a", name, "-m", body, commit)
     return name
+
+
+def pr_head_oid(repo: Path, pr: str) -> Tuple[str, str]:
+    """Return (headRefOid, how). how is gh or a failure token."""
+    try:
+        view = subprocess.run(
+            ["gh", "pr", "view", str(pr), "--json", "headRefOid"],
+            cwd=str(repo),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return "", "gh-missing"
+    if view.returncode != 0:
+        return "", "gh-error"
+    try:
+        data = json.loads(view.stdout or "{}")
+    except json.JSONDecodeError:
+        return "", "gh-error"
+    oid = str((data or {}).get("headRefOid") or "").strip()
+    if not oid:
+        return "", "gh-error"
+    return oid, "gh"
+
+
+def delete_reviewed_tag(repo: Path, name: str) -> str:
+    tag = (name or "").strip()
+    if not tag.startswith(REVIEWED_PREFIX):
+        raise GitError("refusing to delete non-reviewed tag %s" % (name or "(empty)"))
+    git(repo, "tag", "-d", tag)
+    return tag
+
+
+def list_reviewed_tags(repo: Path) -> List[Dict[str, object]]:
+    """All reviewed-* tags (not only those merged to HEAD)."""
+    out = git(
+        repo,
+        "for-each-ref",
+        "--sort=-creatordate",
+        "--format=%(refname:short)\t%(objectname:short)\t%(creatordate:short)",
+        "refs/tags/%s*" % REVIEWED_PREFIX,
+        check=False,
+    )
+    current, _kind = resolve_review_base(repo)
+    rows: List[Dict[str, object]] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        tag = (parts[0] if parts else "").strip()
+        if not tag:
+            continue
+        commit = parts[1].strip() if len(parts) > 1 else ""
+        date = parts[2].strip() if len(parts) > 2 else ""
+        rows.append(
+            {
+                "tag": tag,
+                "commit": commit,
+                "date": date,
+                "commits_ahead": commit_count(repo, tag),
+                "current": tag == current,
+                "ancestor": is_ancestor(repo, tag),
+            }
+        )
+    return rows

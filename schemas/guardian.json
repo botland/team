@@ -1,18 +1,60 @@
 {
   "type": "object",
-  "required": ["risks", "guardian_markdown"],
+  "required": ["risks", "guardian_markdown", "chain"],
   "properties": {
     "guardian_markdown": { "type": "string" },
+    "chain": {
+      "type": "object",
+      "required": ["r_to_a", "a_to_t", "t_to_i", "i_to_r"],
+      "properties": {
+        "r_to_a": {
+          "type": "object",
+          "required": ["ok", "note"],
+          "properties": {
+            "ok": { "type": "boolean" },
+            "note": { "type": "string" }
+          }
+        },
+        "a_to_t": {
+          "type": "object",
+          "required": ["ok", "note"],
+          "properties": {
+            "ok": { "type": "boolean" },
+            "note": { "type": "string" }
+          }
+        },
+        "t_to_i": {
+          "type": "object",
+          "required": ["ok", "note"],
+          "properties": {
+            "ok": { "type": "boolean" },
+            "note": { "type": "string" }
+          }
+        },
+        "i_to_r": {
+          "type": "object",
+          "required": ["ok", "note"],
+          "properties": {
+            "ok": { "type": "boolean" },
+            "note": { "type": "string" }
+          }
+        }
+      }
+    },
     "risks": {
       "type": "array",
       "maxItems": 10,
       "items": {
         "type": "object",
-        "required": ["title", "evidence"],
+        "required": ["title", "evidence", "link"],
         "properties": {
           "title": { "type": "string" },
           "evidence": { "type": "string" },
-          "path": { "type": "string" }
+          "path": { "type": "string" },
+          "link": {
+            "type": "string",
+            "description": "r_to_a | a_to_t | t_to_i | i_to_r | invariant"
+          }
         }
       }
     }

@@ -6,9 +6,9 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-from team.util import as_str, extract_json, write_text
+from team.util import as_str, explicit_roots, extract_json, write_text
 
 
 @dataclass
@@ -55,6 +55,47 @@ def headless_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return env
 
 
+def describe_runtime_failure(result: Result) -> str:
+    """Short human line. Do not dump the Claude/Grok wrapper JSON."""
+    blob: Any = result.output if isinstance(result.output, dict) else {}
+    text = "\n".join(p for p in (result.error, result.raw) if p) or "unknown"
+    if not blob:
+        raw = text.strip()
+        brace = raw.find("{")
+        if brace >= 0:
+            try:
+                parsed = json.loads(raw[brace:])
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                blob = parsed
+    if isinstance(blob, dict):
+        status = blob.get("api_error_status")
+        msg = as_str(blob.get("result") or blob.get("error") or "")
+        if status == 429 or "session limit" in msg.lower():
+            return msg or "provider session limit (429)"
+        if blob.get("is_error") and msg:
+            return msg
+        if status and msg:
+            return "provider error %s: %s" % (status, msg)
+    line = " ".join(str(text).split())
+    if len(line) > 240:
+        line = line[:237] + "..."
+    return line or "unknown"
+
+
+def resolve_session(stored: str) -> Tuple[str, bool]:
+    """Return (session_id, resume).
+
+    Both CLIs reject ``--session-id`` for an ID that already exists.
+    If this role already has a thread, resume it. Never create with a used ID.
+    """
+    sid = stored or ""
+    if sid:
+        return sid, True
+    return "", False
+
+
 def claude_cmd(
     *,
     prompt: str,
@@ -89,6 +130,21 @@ def claude_cmd(
         )
     elif capability in ("write-tests", "write-code"):
         cmd.extend(["--permission-mode", "acceptEdits"])
+        extra = extra or {}
+        code_roots = explicit_roots(extra.get("code_root"))
+        test_roots = explicit_roots(extra.get("test_root"))
+        if capability == "write-tests":
+            for root in test_roots:
+                cmd.extend(["--allowedTools", "Edit(%s/**)" % root])
+            for root in code_roots:
+                if root not in test_roots:
+                    cmd.extend(["--disallowedTools", "Edit(%s/**)" % root])
+        else:
+            for root in code_roots:
+                cmd.extend(["--allowedTools", "Edit(%s/**)" % root])
+            for root in test_roots:
+                if root not in code_roots:
+                    cmd.extend(["--disallowedTools", "Edit(%s/**)" % root])
     elif capability == "execute":
         cmd.extend(
             [
@@ -156,22 +212,24 @@ def grok_cmd(
         )
     elif capability in ("write-tests", "write-code"):
         cmd.append("--always-approve")
-        code_root = extra.get("code_root") or ""
-        test_root = extra.get("test_root") or ""
+        code_roots = explicit_roots(extra.get("code_root"))
+        test_roots = explicit_roots(extra.get("test_root"))
         if capability == "write-tests":
-            if test_root:
-                cmd.extend(["--allow", "Edit(%s/**)" % test_root])
-                cmd.extend(["--allow", "Write(%s/**)" % test_root])
-            if code_root and code_root != test_root:
-                cmd.extend(["--deny", "Edit(%s/**)" % code_root])
-                cmd.extend(["--deny", "Write(%s/**)" % code_root])
+            for root in test_roots:
+                cmd.extend(["--allow", "Edit(%s/**)" % root])
+                cmd.extend(["--allow", "Write(%s/**)" % root])
+            for root in code_roots:
+                if root not in test_roots:
+                    cmd.extend(["--deny", "Edit(%s/**)" % root])
+                    cmd.extend(["--deny", "Write(%s/**)" % root])
         if capability == "write-code":
-            if code_root:
-                cmd.extend(["--allow", "Edit(%s/**)" % code_root])
-                cmd.extend(["--allow", "Write(%s/**)" % code_root])
-            if test_root and test_root != code_root:
-                cmd.extend(["--deny", "Edit(%s/**)" % test_root])
-                cmd.extend(["--deny", "Write(%s/**)" % test_root])
+            for root in code_roots:
+                cmd.extend(["--allow", "Edit(%s/**)" % root])
+                cmd.extend(["--allow", "Write(%s/**)" % root])
+            for root in test_roots:
+                if root not in code_roots:
+                    cmd.extend(["--deny", "Edit(%s/**)" % root])
+                    cmd.extend(["--deny", "Write(%s/**)" % root])
     return cmd
 
 
@@ -268,14 +326,29 @@ class FakeRuntime(Runtime):
         return Result(success=True, output=output, session_id=sid, raw=json.dumps(output))
 
 
+_REGISTRY = {
+    "claude": ClaudeRuntime,
+    "grok": GrokRuntime,
+    "fake": FakeRuntime,
+}
+
+
+def register(name: str, factory: Any) -> None:
+    _REGISTRY[name] = factory
+
+
 def runtime_for(name: str) -> Runtime:
-    if name in ("claude",):
-        return ClaudeRuntime()
-    if name in ("grok",):
-        return GrokRuntime()
-    if name in ("fake",):
-        return FakeRuntime()
-    raise RuntimeError_("Unknown runtime: %s" % name)
+    factory = _REGISTRY.get(name)
+    if factory is None:
+        raise RuntimeError_("Unknown runtime: %s" % name)
+    if isinstance(factory, type):
+        return factory()
+    if callable(factory):
+        built = factory()
+        if isinstance(built, Runtime):
+            return built
+        return built
+    return factory
 
 
 def _run(
@@ -314,25 +387,44 @@ def _run(
         )
     raw = proc.stdout or ""
     parsed = extract_json(raw) if raw.strip() else {}
-    if not isinstance(parsed, dict):
-        parsed = {"value": parsed}
-    if proc.returncode != 0 and not parsed:
+    if raw.strip() and parsed is None:
         return Result(
             success=False,
             output={},
             session_id=session_id,
             raw=raw + "\n" + (proc.stderr or ""),
+            error="parse failure: unparseable stdout",
+        )
+    if parsed is None:
+        parsed = {}
+    if not isinstance(parsed, dict):
+        parsed = {"value": parsed}
+    if proc.returncode != 0:
+        return Result(
+            success=False,
+            output=parsed if isinstance(parsed, dict) else {},
+            session_id=session_id,
+            raw=raw + "\n" + (proc.stderr or ""),
             error="exit %s: %s" % (proc.returncode, (proc.stderr or raw)[-2000:]),
         )
+    if parsed.get("is_error") or parsed.get("api_error_status"):
+        failed = Result(
+            success=False,
+            output=parsed,
+            session_id=as_str(parsed.get("session_id") or parsed.get("sessionId") or session_id),
+            raw=raw,
+            error=as_str(parsed.get("result") or parsed.get("error") or "provider error"),
+        )
+        failed.error = describe_runtime_failure(failed)
+        return failed
     sid = as_str(parsed.get("session_id") or parsed.get("sessionId") or session_id)
-    # Strip wrapper keys if the model also echoed them.
     output = parsed
     return Result(
         success=True,
         output=output,
         session_id=sid,
         raw=raw,
-        error=(proc.stderr or "") if proc.returncode != 0 else "",
+        error="",
     )
 
 
@@ -356,7 +448,8 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
         "critic": {
             "accepts": True,
             "issues": [],
-            "critic_markdown": "Design matches the brief.",
+            "attacks": [],
+            "critic_markdown": "Design survived the attacks; brief is covered.",
         },
         "tdd-design": {
             "ready": True,
@@ -423,7 +516,13 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
         },
         "guardian": {
             "risks": [],
-            "guardian_markdown": "No invariant risks detected in fake mode.",
+            "chain": {
+                "r_to_a": {"ok": True, "note": "fake: brief matches design"},
+                "a_to_t": {"ok": True, "note": "fake: contract covers criteria"},
+                "t_to_i": {"ok": True, "note": "fake: impl satisfies contract"},
+                "i_to_r": {"ok": True, "note": "fake: impl satisfies brief"},
+            },
+            "guardian_markdown": "Chain R→A→T→I→R holds in fake mode.",
         },
         "replan-questions": {
             "questions_for_tdd": [],
@@ -470,6 +569,10 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     }
     if phase in canned:
         return dict(canned[phase])
+    if phase.startswith("repair-test"):
+        return dict(canned["test-writer"])
+    if phase.startswith("repair-implementer"):
+        return dict(canned["implementer"])
     if phase.startswith("consult"):
         return dict(canned["answers"])
     for key in sorted(canned, key=len, reverse=True):
@@ -482,7 +585,11 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
 def _maybe_write_fake_files(phase: str, repo: Path, extra: Dict[str, Any]) -> None:
     code_root = extra.get("code_root") or "src"
     test_root = extra.get("test_root") or "tests"
-    if phase == "test-writer":
+    if (
+        phase == "test-writer"
+        or phase.startswith("test-writer-")
+        or phase.startswith("repair-test")
+    ):
         path = repo / test_root / "test_greet.py"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
@@ -490,7 +597,11 @@ def _maybe_write_fake_files(phase: str, repo: Path, extra: Dict[str, Any]) -> No
                 "def test_greet_returns_hello():\n    assert True\n",
                 encoding="utf-8",
             )
-    if phase == "implementer" or phase.startswith("repair-implementer"):
+    if (
+        phase == "implementer"
+        or phase.startswith("implementer-")
+        or phase.startswith("repair-implementer")
+    ):
         path = repo / code_root / "greet.py"
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():

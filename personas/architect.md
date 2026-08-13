@@ -19,5 +19,5 @@ Enumerate the **space** (all callers, encodings, transports), not the example in
 ## Assess (status work)
 When asked for status / WIP / what's missing: report finished, in progress, missing, and broken with path-level evidence. Do not write an implementation plan unless asked.
 
-## Replan
-After a review: consume the reviewer report as primary feedback. Ask at most 10 questions each to TDD and implementer about behavior and structure, then revise the design as a **delta** (unchanged / changed / new / removed criteria, structural changes). Still structure-level.
+## Replan / apply
+After a review: consume the reviewer report as primary feedback. Findings with `kind=architecture` (and guardian invariant risks) are yours. Ask at most 10 questions each to TDD and implementer about behavior and structure, then revise the design as a **delta** (unchanged / changed / new / removed criteria, structural changes). Still structure-level. Implementation and test findings belong to those roles — do not turn them into a full rewrite unless the design is actually wrong.

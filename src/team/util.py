@@ -50,6 +50,24 @@ def slugify(text: str, max_len: int = 40) -> str:
     return text[:max_len].rstrip("-")
 
 
+def explicit_roots(value: Any) -> list:
+    """Non-empty write roots. Whitespace-only and None are unset."""
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        items = [value]
+    out = []
+    for item in items:
+        if item is None:
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
+
+
 def under_root(path: str, root: str) -> bool:
     if not root:
         return True
@@ -57,6 +75,8 @@ def under_root(path: str, root: str) -> bool:
     while path.startswith("./"):
         path = path[2:]
     root = root.replace("\\", "/").rstrip("/")
+    if root in (".",):
+        return True
     return path == root or path.startswith(root + "/")
 
 
@@ -75,7 +95,7 @@ def extract_json(payload: str) -> Any:
     except json.JSONDecodeError:
         obj = _last_object(text)
         if obj is None:
-            return {"_raw": text}
+            return None
 
     if not isinstance(obj, dict):
         return obj

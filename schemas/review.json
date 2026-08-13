@@ -8,12 +8,17 @@
       "maxItems": 10,
       "items": {
         "type": "object",
-        "required": ["severity", "title", "evidence"],
+        "required": ["severity", "title", "evidence", "kind"],
         "properties": {
           "severity": { "type": "string" },
           "title": { "type": "string" },
           "evidence": { "type": "string" },
-          "path": { "type": "string" }
+          "path": { "type": "string" },
+          "kind": {
+            "type": "string",
+            "enum": ["architecture", "implementation", "test", "note"],
+            "description": "Hint to a cooperative runtime. Orchestrator normalize_kind is the authority."
+          }
         }
       }
     },

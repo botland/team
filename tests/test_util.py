@@ -45,14 +45,31 @@ class MergeTests(unittest.TestCase):
     def test_overlap(self):
         a = {
             "summary": "A",
-            "findings": [{"severity": "high", "title": "leak", "evidence": "x", "path": "src/a.py"}],
+            "findings": [
+                {
+                    "severity": "high",
+                    "title": "leak",
+                    "evidence": "x",
+                    "path": "src/a.py",
+                    "kind": "implementation",
+                }
+            ],
         }
         b = {
             "summary": "B",
-            "findings": [{"severity": "high", "title": "leak", "evidence": "y", "path": "src/a.py"}],
+            "findings": [
+                {
+                    "severity": "high",
+                    "title": "leak",
+                    "evidence": "y",
+                    "path": "src/a.py",
+                    "kind": "implementation",
+                }
+            ],
         }
         md = merge_reviews([("claude", a, "body a"), ("grok", b, "body b")])
         self.assertIn("src/a.py", md)
+        self.assertIn("[implementation]", md)
         self.assertIn("## claude", md)
         self.assertIn("## grok", md)
 

@@ -155,6 +155,8 @@ class Config:
         self.stop_after: Optional[str] = None
         self.depth = "medium"
         self.role_overrides: set = set()
+        # Past-commits (unscoped / --since) reviewer. One runtime. PR/feature use roles["reviewer"].
+        self.range_reviewer = "grok"
 
     def assignment(self, role: str) -> str:
         if self.fake:
@@ -214,8 +216,7 @@ def load_config(
     if assign:
         for item in assign:
             role, runtime = _parse_assign(item)
-            _set_role(cfg, role, runtime)
-            cfg.role_overrides.add(role)
+            _apply_assign(cfg, role, runtime)
     if skip:
         for item in skip:
             for part in str(item).split(","):
@@ -234,9 +235,39 @@ def load_config(
     return cfg
 
 
+def _apply_assign(cfg: Config, role: str, runtime: str) -> None:
+    """``all=grok`` / ``*=claude`` sets every role that allows that runtime.
+
+    Later ``--assign reviewer=claude`` still wins for that one role.
+    """
+    key = (role or "").strip().lower()
+    if key in ("all", "*", "every"):
+        if not runtime:
+            raise SystemExit("Assignment must be all=runtime, got empty runtime")
+        matched = False
+        for name, spec in ROLES.items():
+            allowed = spec["runtimes"]
+            if runtime in allowed or runtime == "fake":
+                cfg.roles[name] = runtime
+                cfg.role_overrides.add(name)
+                matched = True
+        if runtime in ("claude", "grok"):
+            cfg.range_reviewer = runtime
+        if not matched:
+            raise SystemExit(
+                "No role accepts runtime %s (try claude, grok, both, host)" % runtime
+            )
+        return
+    _set_role(cfg, role, runtime)
+    cfg.role_overrides.add(role)
+
+
 def _set_role(cfg: Config, role: str, runtime: str) -> None:
     if role not in ROLES:
-        raise SystemExit("Unknown role: %s (choose %s)" % (role, ", ".join(ROLES)))
+        raise SystemExit(
+            "Unknown role: %s (choose %s, or all=<runtime>)"
+            % (role, ", ".join(ROLES))
+        )
     allowed = ROLES[role]["runtimes"]
     if runtime not in allowed and runtime != "fake":
         raise SystemExit(
@@ -309,6 +340,12 @@ def _apply_toml(cfg: Config, data: Dict[str, Dict[str, Any]]) -> None:
         cfg.skip.extend(resolve_phase(str(x)) for x in run["skip"])
     if run.get("phase_timeout") is not None:
         cfg.phase_timeout = int(run["phase_timeout"])
+    review = data.get("review") or {}
+    if review.get("range_reviewer"):
+        runtime = str(review["range_reviewer"]).strip()
+        if runtime not in ("claude", "grok"):
+            raise SystemExit("review.range_reviewer must be claude or grok (one reviewer)")
+        cfg.range_reviewer = runtime
 
 
 def persona_path(role: str) -> Path:
@@ -325,3 +362,30 @@ def schema_path(name: str) -> Path:
 
 def deepcopy_roles(roles: Dict[str, str]) -> Dict[str, str]:
     return deepcopy(roles)
+
+
+def apply_range_reviewer(cfg: Config, *, pr: bool, reviewer: str = "") -> None:
+    """PR uses both unless overridden. Past-commits uses one runtime (default grok).
+
+    ``reviewer`` is ``team review --reviewer claude|grok``. Same effect as
+    ``--assign reviewer=…`` but sits on the review command.
+    """
+    forced = (reviewer or "").strip()
+    if forced:
+        if forced not in ("claude", "grok"):
+            raise SystemExit("review --reviewer must be claude or grok (one reviewer)")
+        cfg.roles["reviewer"] = forced
+        cfg.role_overrides.add("reviewer")
+    if pr:
+        if "reviewer" not in cfg.role_overrides:
+            cfg.roles["reviewer"] = "both"
+        return
+    if "reviewer" in cfg.role_overrides:
+        runtime = cfg.roles.get("reviewer")
+        if runtime == "both":
+            raise SystemExit(
+                "past-commits review uses one reviewer; "
+                "use team review --reviewer claude (or grok)"
+            )
+        return
+    cfg.roles["reviewer"] = cfg.range_reviewer

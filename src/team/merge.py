@@ -6,14 +6,15 @@ from typing import Any, Dict, List, Sequence, Tuple
 def merge_reviews(parts: Sequence[Tuple[str, Dict[str, Any], str]]) -> str:
     """parts: (label, schema_output, markdown)."""
     lines = ["# Review", ""]
-    overlap = _overlap(parts)
-    lines.append("## Overlap")
-    lines.append("")
-    if overlap:
-        lines.extend("- %s" % item for item in overlap)
-    else:
-        lines.append("- (no shared path+title hits)")
-    lines.append("")
+    if len(parts) >= 2:
+        overlap = _overlap(parts)
+        lines.append("## Overlap")
+        lines.append("")
+        if overlap:
+            lines.extend("- %s" % item for item in overlap)
+        else:
+            lines.append("- (no shared path+title hits)")
+        lines.append("")
     for label, data, markdown in parts:
         lines.append("## %s" % label)
         lines.append("")
@@ -28,9 +29,11 @@ def merge_reviews(parts: Sequence[Tuple[str, Dict[str, Any], str]]) -> str:
             for finding in findings:
                 title = finding.get("title") or "(untitled)"
                 sev = finding.get("severity") or "?"
+                kind = finding.get("kind") or ""
+                kind_s = " [%s]" % kind if kind else ""
                 path = finding.get("path") or ""
                 loc = " (`%s`)" % path if path else ""
-                lines.append("- **%s** %s%s" % (sev, title, loc))
+                lines.append("- **%s**%s %s%s" % (sev, kind_s, title, loc))
                 ev = finding.get("evidence") or ""
                 if ev:
                     lines.append("  - %s" % ev)
