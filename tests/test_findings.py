@@ -8,11 +8,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from team.findings import (
     collect_guardian_findings,
     collect_review_findings,
+    finding_id,
     format_chain,
     format_console_lines,
     group_by_kind,
+    mark_seq_step,
     needs_classify,
     normalize_kind,
+    pick_next_seq,
+    related_guardian,
     render_followups,
     take_important,
 )
@@ -135,6 +139,94 @@ class FindingsTests(unittest.TestCase):
             self.assertIn("architecture", kinds)
             self.assertIn("test", kinds)
             self.assertTrue(any("i_to_r" in r["title"] for r in rows))
+
+    def test_seq_picks_arch_before_impl_even_if_impl_is_higher_severity(self):
+        impl = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "credential missing",
+            "path": "src/a.py",
+            "source": "reviewer-grok",
+        }
+        arch = {
+            "kind": "architecture",
+            "severity": "low",
+            "title": "one egress",
+            "path": "src/a.py",
+            "source": "reviewer-grok",
+        }
+        nxt = pick_next_seq([arch, impl], {"applied": [], "skipped": [], "failed": "", "steps": []})
+        self.assertEqual(nxt["title"], "one egress")
+        self.assertEqual(nxt["id"], finding_id(arch))
+
+    def test_seq_severity_breaks_ties_inside_a_kind(self):
+        high = {
+            "kind": "architecture",
+            "severity": "high",
+            "title": "cache key",
+            "path": "src/a.py",
+            "source": "reviewer-grok",
+        }
+        medium = {
+            "kind": "architecture",
+            "severity": "medium",
+            "title": "one egress",
+            "path": "src/b.py",
+            "source": "reviewer-grok",
+        }
+        nxt = pick_next_seq([medium, high], {"applied": [], "skipped": [], "failed": "", "steps": []})
+        self.assertEqual(nxt["title"], "cache key")
+
+    def test_seq_retries_failed_before_next(self):
+        impl = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "a",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        test = {
+            "kind": "test",
+            "severity": "high",
+            "title": "b",
+            "path": "tests/t.py",
+            "source": "reviewer-fake",
+        }
+        seq = mark_seq_step(
+            {"applied": [], "skipped": [], "failed": "", "steps": []},
+            dict(impl, id=finding_id(impl)),
+            status="failed",
+            suite="FAIL",
+        )
+        nxt = pick_next_seq([impl, test], seq)
+        self.assertEqual(nxt["title"], "a")
+
+    def test_related_guardian_same_path_only(self):
+        item = {"path": "src/a.py", "title": "x"}
+        related = related_guardian(
+            item,
+            [
+                {"path": "src/a.py", "title": "same"},
+                {"path": "src/b.py", "title": "other"},
+            ],
+        )
+        self.assertEqual([r["title"] for r in related], ["same"])
+
+    def test_followups_marks_applied(self):
+        item = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "bug",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        seq = mark_seq_step(
+            {"applied": [], "skipped": [], "failed": "", "steps": []},
+            dict(item, id=finding_id(item)),
+            status="applied",
+        )
+        md = render_followups([item], seq=seq)
+        self.assertIn("**applied**", md)
 
 
 if __name__ == "__main__":

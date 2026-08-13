@@ -569,6 +569,10 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     }
     if phase in canned:
         return dict(canned[phase])
+    if phase.startswith("seq-reviewer"):
+        return dict(canned["reviewer"])
+    if phase.startswith("seq-guardian"):
+        return dict(canned["guardian"])
     if phase.startswith("repair-test"):
         return dict(canned["test-writer"])
     if phase.startswith("repair-implementer"):

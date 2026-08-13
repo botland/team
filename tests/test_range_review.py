@@ -269,6 +269,7 @@ class RangeReviewTests(unittest.TestCase):
             ["status"],
             ["roles"],
             ["init"],
+            ["config"],
             ["audit"],
         ]
         for argv in commands:

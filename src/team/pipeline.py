@@ -155,7 +155,7 @@ class Pipeline:
             self.work / "prompts" / ("%s.result.json" % phase),
             json.dumps(output, indent=2)[:200000],
         )
-        if str(phase).startswith("reviewer"):
+        if str(phase) in ("reviewer-claude", "reviewer-grok", "reviewer-fake"):
             self._record_review_result(result_path)
         if not result.success:
             err = describe_runtime_failure(result)
@@ -1253,11 +1253,21 @@ class Pipeline:
             "At most 10 findings (severity, title, evidence, path, kind)."
         )
 
-    def _write_followups(self) -> None:
+    def _write_followups(self, *, seq: Optional[Dict[str, Any]] = None) -> None:
         items = findings_mod.collect_all(self.work)
-        self.write_artifact("followups.md", findings_mod.render_followups(items))
+        self.write_artifact(
+            "followups.md",
+            findings_mod.render_followups(items, seq=seq),
+        )
 
-    def apply_review(self, *, dry_run: bool = False, rereview: bool = True) -> None:
+    def apply_review(
+        self,
+        *,
+        dry_run: bool = False,
+        rereview: bool = True,
+        seq: bool = False,
+        skip_failed: bool = False,
+    ) -> None:
         if self.state.mode == "audit":
             raise PipelineError("audit is read-only; apply needs a feature or range work slug")
         if not self.read_artifact("review.md"):
@@ -1285,9 +1295,11 @@ class Pipeline:
             self.save()
 
         findings = findings_mod.fill_missing_kinds(findings)
-        items = findings + findings_mod.collect_guardian_findings(self.work)
-        findings_mod.write_findings(self.work, items)
-        self._write_followups()
+        guardian = findings_mod.collect_guardian_findings(self.work)
+        items = findings + guardian
+        seq_state = findings_mod.load_seq_state(self.work)
+        findings_mod.write_findings(self.work, items, seq=seq_state)
+        self._write_followups(seq=seq_state)
         groups = findings_mod.group_by_kind(items)
         self.write_artifact(
             "apply-plan.md",
@@ -1297,6 +1309,16 @@ class Pipeline:
             self.state.stop_reason = "needs-classification"
             self.save()
             self.log("apply: unclassified findings remain; needs-classification")
+            return
+        if seq:
+            self._apply_seq(
+                review_findings=findings,
+                guardian=guardian,
+                reclassified=reclassified,
+                dry_run=dry_run,
+                rereview=rereview,
+                skip_failed=skip_failed,
+            )
             return
         self.log(
             "apply plan: arch=%d impl=%d test=%d note=%d"
@@ -1403,13 +1425,360 @@ class Pipeline:
             findings_mod.collect_all(self.work), sort=True, more_hint="followups.md"
         )
 
-    def _apply_tdd_design(self, items: List[Dict[str, Any]]) -> None:
+    def _apply_seq(
+        self,
+        *,
+        review_findings: List[Dict[str, Any]],
+        guardian: List[Dict[str, Any]],
+        reclassified: bool,
+        dry_run: bool,
+        rereview: bool,
+        skip_failed: bool,
+    ) -> None:
+        seq = findings_mod.load_seq_state(self.work)
+        if skip_failed and seq.get("failed"):
+            failed_id = str(seq.get("failed") or "")
+            dummy = {"id": failed_id, "title": "(skipped)", "kind": "", "path": ""}
+            for item in review_findings:
+                if findings_mod.finding_id(item) == failed_id:
+                    dummy = dict(item)
+                    dummy["id"] = failed_id
+                    break
+            seq = findings_mod.mark_seq_step(seq, dummy, status="skipped")
+            findings_mod.write_findings(
+                self.work, review_findings + guardian, seq=seq
+            )
+            self.log("seq: skipped failed class %s" % failed_id)
+
+        ranked = []
+        nxt = findings_mod.pick_next_seq(review_findings, seq)
+        seen = set()
+        probe = dict(seq)
+        while nxt and nxt.get("id") not in seen:
+            ranked.append(nxt)
+            seen.add(nxt["id"])
+            probe = findings_mod.mark_seq_step(probe, nxt, status="applied")
+            nxt = findings_mod.pick_next_seq(review_findings, probe)
+        self.write_artifact(
+            "apply-plan.md",
+            findings_mod.render_seq_plan(
+                ranked, reclassified=reclassified, failed=seq.get("failed") or ""
+            ),
+        )
+        self.log("seq plan: %d class(es) remaining" % len(ranked))
+        self._log_items(ranked, more_hint="apply-plan.md")
+        if dry_run:
+            self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
+            self.state.stop_reason = "dry_run"
+            self.save()
+            self.log("stop: apply --seq dry-run")
+            return
+        if not ranked:
+            self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
+            self.state.stop_reason = "applied"
+            self.save()
+            self.log("apply --seq: nothing remaining")
+            return
+
+        while True:
+            item = findings_mod.pick_next_seq(review_findings, seq)
+            if item is None:
+                break
+            related = findings_mod.related_guardian(item, guardian)
+            ok = self._apply_one_seq(item, related, seq, rereview=rereview)
+            seq = findings_mod.load_seq_state(self.work)
+            if not ok:
+                self._write_followups(seq=seq)
+                self.write_artifact(
+                    "apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug)
+                )
+                self.state.stop_reason = "seq-failed"
+                self.save()
+                self.log("apply --seq stopped: class %s failed" % item.get("id"))
+                return
+        seq = findings_mod.load_seq_state(self.work)
+        self._write_followups(seq=seq)
+        self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
+        self.state.stop_reason = "applied"
+        self.save()
+        self.log("apply --seq complete")
+
+    def _apply_one_seq(
+        self,
+        item: Dict[str, Any],
+        related: List[Dict[str, Any]],
+        seq: Dict[str, Any],
+        *,
+        rereview: bool,
+    ) -> bool:
+        fid = item.get("id") or findings_mod.finding_id(item)
+        item = dict(item)
+        item["id"] = fid
+        seq_dir = self.work / "seq" / fid
+        (seq_dir / "prompts").mkdir(parents=True, exist_ok=True)
+        bundle = [item] + list(related)
+        dump = json.dumps(bundle, indent=2)
+        write_text(seq_dir / "finding.json", dump)
+        self.write_artifact(
+            "apply-plan.md",
+            findings_mod.render_seq_plan([item], failed=""),
+        )
+        shutil.copyfile(self.work / "apply-plan.md", seq_dir / "plan.md")
+        self.log("seq class %s [%s] %s" % (fid, item.get("kind"), item.get("title")))
+        hops: List[str] = []
+        kind = item.get("kind")
+        try:
+            if kind == "architecture":
+                self._apply_replan_seq(bundle)
+                hops.append("architect replan → design.md")
+                self._apply_tdd_design(bundle, thin=True)
+                hops.append("tdd-design contract")
+                self._apply_test_writer(bundle, thin=True)
+                hops.append("test-writer")
+                self._apply_implementer(bundle, thin=True)
+                hops.append("implementer")
+            elif kind == "test":
+                self._apply_tdd_design(bundle, thin=True)
+                hops.append("tdd-design contract")
+                self._apply_test_writer(bundle, thin=True)
+                hops.append("test-writer")
+            else:
+                self._apply_implementer(bundle, thin=True)
+                hops.append("implementer")
+
+            cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+            self.cfg.test_command = cmd
+            run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
+            comparison = testhost.compare(self.state.final or self.state.baseline, run)
+            run = dict(run)
+            run["comparison"] = comparison
+            self.state.final = run
+            self.write_artifact(
+                "apply-test-report.md",
+                testhost.render_report("Apply test run", run, comparison),
+            )
+            hops.append("suite %s" % run.get("status"))
+            self.log("seq-test %s" % run.get("status"))
+
+            if run.get("status") != "PASS" and not self.should_skip("debugger"):
+                try:
+                    self.phase_debugger()
+                    hops.append("debugger owner=%s" % (self.state.diagnosis_owner or "?"))
+                    if self.state.diagnosis_owner in ("implementer", "test-writer"):
+                        self.phase_repair()
+                        self.phase_verify_test()
+                        hops.append("repair + verify")
+                        run = dict(self.state.final or run)
+                except OptionalPhaseError as exc:
+                    self._skip("debugger", str(exc))
+                    hops.append("debugger skipped (%s)" % exc)
+
+            suite = str((self.state.final or run).get("status") or run.get("status") or "")
+            self._seq_copy_artifacts(seq_dir)
+            if suite != "PASS":
+                seq = findings_mod.mark_seq_step(
+                    seq, item, status="failed", hops=hops, suite=suite
+                )
+                findings_mod.write_findings(
+                    self.work,
+                    findings_mod.collect_all(self.work),
+                    seq=seq,
+                )
+                write_text(
+                    seq_dir / "summary.md",
+                    findings_mod.render_seq_log(seq, slug=self.state.slug),
+                )
+                return False
+
+            if rereview:
+                self.phase_seq_review(seq_dir, bundle)
+                hops.append("class review")
+
+            seq = findings_mod.mark_seq_step(
+                seq, item, status="applied", hops=hops, suite=suite
+            )
+            findings_mod.write_findings(
+                self.work,
+                findings_mod.collect_all(self.work),
+                seq=seq,
+            )
+            self._seq_copy_artifacts(seq_dir)
+            write_text(
+                seq_dir / "summary.md",
+                "# Class `%s` applied\n\n- kind: %s\n- suite: %s\n"
+                % (fid, kind, suite),
+            )
+            return True
+        except PipelineError as exc:
+            seq = findings_mod.mark_seq_step(
+                seq, item, status="failed", hops=hops, suite="ERROR"
+            )
+            findings_mod.write_findings(
+                self.work,
+                findings_mod.collect_all(self.work),
+                seq=seq,
+            )
+            write_text(seq_dir / "summary.md", "failed: %s\n" % exc)
+            self.log("seq class %s error: %s" % (fid, exc))
+            return False
+
+    def _seq_copy_artifacts(self, seq_dir: Path) -> None:
+        for name in (
+            "apply-impl-summary.md",
+            "apply-tdd-summary.md",
+            "apply-test-report.md",
+            "design-replan.md",
+            "diagnosis.md",
+            "repair-summary.md",
+        ):
+            src = self.work / name
+            if src.is_file():
+                shutil.copyfile(src, seq_dir / name)
+
+    def _apply_replan_seq(self, items: List[Dict[str, Any]]) -> None:
+        prompt = self._prompt(
+            "architect",
+            [
+                self._listed_artifacts(["brief.md", "design.md", "apply-plan.md"]),
+                "SEQ APPLY. Replan only this class. Do not read review.md.",
+                "Findings:\n" + json.dumps(items, indent=2),
+                "Produce questions_for_tdd and questions_for_implementer",
+                "(each max 10, empty if none). Do not rewrite the design yet.",
+            ],
+        )
+        rq = self.invoke("architect", "replan-questions", prompt, "replan_questions.json")
+        blob = []
+        q_tdd = as_list(rq.output.get("questions_for_tdd"))
+        q_impl = as_list(rq.output.get("questions_for_implementer"))
+        if q_tdd:
+            blob.append(self.consult("tdd-design", q_tdd, "architect"))
+        if q_impl:
+            blob.append(self.consult("implementer", q_impl, "architect"))
+        prompt = self._prompt(
+            "architect",
+            [
+                self._listed_artifacts(["brief.md", "design.md", "apply-plan.md"]),
+                "Consult answers:\n" + ("\n\n".join(blob) or "(no consults)"),
+                "SEQ APPLY. Write a DELTA design for this class only. Required headings:",
+                "- Unchanged assumptions",
+                "- Changed assumptions",
+                "- New acceptance criteria",
+                "- Removed acceptance criteria",
+                "- Structural changes",
+                "Still structure-level. No function bodies.",
+            ],
+        )
+        result = self.invoke("architect", "replan", prompt, "design.json", resume=True)
+        md = as_str(result.output.get("design_markdown")) or "(empty replan)"
+        self.write_artifact("design-replan.md", md)
+        self.write_artifact("design.md", md)
+        if not self.cfg.code_root:
+            self.cfg.code_root = as_str(result.output.get("code_root"))
+        if not self.cfg.test_root:
+            self.cfg.test_root = as_str(result.output.get("test_root"))
+        self.log("seq: applied design-replan.md → design.md")
+
+    def phase_seq_review(self, seq_dir: Path, items: List[Dict[str, Any]]) -> None:
+        assignment = self.cfg.assignment("reviewer")
+        if assignment == "both":
+            runtimes = ["claude", "grok"]
+        else:
+            runtimes = [assignment]
+        artifacts = [
+            "brief.md",
+            "design.md",
+            "test-contract.md",
+            "apply-plan.md",
+            "apply-impl-summary.md",
+            "apply-tdd-summary.md",
+            "apply-test-report.md",
+        ]
+
+        def one(runtime: str) -> Result:
+            prompt = self._prompt(
+                "reviewer",
+                [
+                    self._listed_artifacts(artifacts),
+                    "CLASS REVIEW. Review only the class that apply --seq just closed.",
+                    "The original review.md is out of scope. Do not rewrite it.",
+                    "READ-ONLY. Inspect the actual files and git status.",
+                    self._reviewer_finding_rules(),
+                    "Class:\n" + json.dumps(items, indent=2),
+                    "You are the %s reviewer. Do not assume another reviewer exists."
+                    % runtime,
+                ],
+            )
+            return self.invoke(
+                "reviewer",
+                "seq-reviewer-%s" % runtime,
+                prompt,
+                "review.json",
+                runtime_name=runtime,
+            )
+
+        parts = []
+        if len(runtimes) == 1:
+            ordered = runtimes
+            results = [one(runtimes[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futs = [(rt, pool.submit(one, rt)) for rt in runtimes]
+                ordered = [rt for rt, _ in futs]
+                results = [fut.result() for _, fut in futs]
+        for rt, result in zip(ordered, results):
+            md = as_str(result.output.get("review_markdown")) or as_str(
+                result.output.get("summary")
+            )
+            write_text(seq_dir / ("review-%s.md" % rt), md)
+            src = self.work / "prompts" / ("seq-reviewer-%s.result.json" % rt)
+            if src.is_file():
+                shutil.copyfile(src, seq_dir / "prompts" / src.name)
+            parts.append((rt, result.output, md))
+        merged = merge_reviews(parts)
+        write_text(seq_dir / "review.md", merged)
+        self.log("class review written (%s) → %s" % (", ".join(runtimes), seq_dir / "review.md"))
+        if self.state.mode != "audit" and "guardian" not in self.cfg.skip:
+            try:
+                self._phase_seq_guardian(seq_dir, items)
+            except OptionalPhaseError as exc:
+                self.log("class guardian skipped (%s)" % exc)
+
+    def _phase_seq_guardian(self, seq_dir: Path, items: List[Dict[str, Any]]) -> None:
+        prompt = self._prompt(
+            "guardian",
+            [
+                self._listed_artifacts(
+                    [
+                        "brief.md",
+                        "design.md",
+                        "test-contract.md",
+                        "apply-plan.md",
+                        "apply-test-report.md",
+                    ]
+                ),
+                "CLASS GUARDIAN. Evaluate only this applied class.",
+                "Do not edit files. Do not write guardian.md at the slug root.",
+                "Class:\n" + json.dumps(items, indent=2),
+                "Evaluate R→A, A→T, T→I, and I→R.",
+            ],
+        )
+        result = self.invoke("guardian", "seq-guardian", prompt, "guardian.json")
+        md = as_str(result.output.get("guardian_markdown")) or json.dumps(
+            result.output, indent=2
+        )
+        write_text(seq_dir / "guardian.md", md)
+        src = self.work / "prompts" / "seq-guardian.result.json"
+        if src.is_file():
+            shutil.copyfile(src, seq_dir / "prompts" / src.name)
+
+    def _apply_tdd_design(self, items: List[Dict[str, Any]], *, thin: bool = False) -> None:
+        listed = ["brief.md", "design.md", "test-contract.md", "apply-plan.md"]
+        if not thin:
+            listed.insert(3, "review.md")
         prompt = self._prompt(
             "tdd-design",
             [
-                self._listed_artifacts(
-                    ["brief.md", "design.md", "test-contract.md", "review.md", "apply-plan.md"]
-                ),
+                self._listed_artifacts(listed),
                 "APPLY REVIEW. Update the test contract so kind=test findings and any",
                 "applied design delta are encoded. Do not write test or production files.",
                 "Findings:\n" + json.dumps(items, indent=2),
@@ -1442,20 +1811,15 @@ class Pipeline:
             self.write_artifact("test-contract.md", contract)
         self.log("apply: test contract updated")
 
-    def _apply_test_writer(self, items: List[Dict[str, Any]]) -> None:
+    def _apply_test_writer(self, items: List[Dict[str, Any]], *, thin: bool = False) -> None:
         before = self._snapshot()
+        listed = ["brief.md", "design.md", "test-contract.md", "apply-plan.md"]
+        if not thin:
+            listed.insert(3, "review.md")
         prompt = self._prompt(
             "test-writer",
             [
-                self._listed_artifacts(
-                    [
-                        "brief.md",
-                        "design.md",
-                        "test-contract.md",
-                        "review.md",
-                        "apply-plan.md",
-                    ]
-                ),
+                self._listed_artifacts(listed),
                 "APPLY REVIEW. Encode kind=test findings (and the current contract).",
                 "Edit ONLY under test_root=%r. NEVER edit production (code_root=%r)."
                 % (self.cfg.test_root, self.cfg.code_root),
@@ -1478,20 +1842,15 @@ class Pipeline:
         self._verify_write("apply-test-writer", [self.cfg.test_root], before)
         self.log("apply: tests")
 
-    def _apply_implementer(self, items: List[Dict[str, Any]]) -> None:
+    def _apply_implementer(self, items: List[Dict[str, Any]], *, thin: bool = False) -> None:
         before = self._snapshot()
+        listed = ["brief.md", "design.md", "test-contract.md", "apply-plan.md"]
+        if not thin:
+            listed.insert(3, "review.md")
         prompt = self._prompt(
             "implementer",
             [
-                self._listed_artifacts(
-                    [
-                        "brief.md",
-                        "design.md",
-                        "test-contract.md",
-                        "review.md",
-                        "apply-plan.md",
-                    ]
-                ),
+                self._listed_artifacts(listed),
                 "APPLY REVIEW. Patch kind=implementation findings and realize any",
                 "applied design delta. Edit ONLY under code_root=%r." % self.cfg.code_root,
                 "NEVER edit tests (test_root=%r). Never weaken/skip/delete tests."

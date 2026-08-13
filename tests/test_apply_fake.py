@@ -271,6 +271,8 @@ class FakeApplyTests(unittest.TestCase):
                 "--repo",
                 str(self.repo),
                 "--fake",
+                "--code-root",
+                ".",
                 "--test-command",
                 "true",
                 "apply",
@@ -281,6 +283,195 @@ class FakeApplyTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue((work / "apply-impl-summary.md").is_file())
         self.assertEqual(State.load(work).stop_reason, "applied")
+
+    def _inject_mixed(self, work):
+        _inject_findings(
+            work,
+            [
+                {
+                    "severity": "high",
+                    "title": "greet ignores empty name",
+                    "evidence": "no guard",
+                    "path": "src/greet.py",
+                    "kind": "implementation",
+                },
+                {
+                    "severity": "high",
+                    "title": "wrong module boundary",
+                    "evidence": "greet in the wrong package",
+                    "path": "src/greet.py",
+                    "kind": "architecture",
+                },
+            ],
+        )
+
+    def test_seq_arch_before_impl_and_preserves_review(self):
+        work = self._feature()
+        review_before = (work / "review.md").read_text(encoding="utf-8")
+        self._inject_mixed(work)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "--seq",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual((work / "review.md").read_text(encoding="utf-8"), review_before)
+        log = (work / "apply-seq.md").read_text(encoding="utf-8")
+        impl_at = log.find("greet ignores empty name")
+        arch_at = log.find("wrong module boundary")
+        self.assertGreater(arch_at, 0)
+        self.assertGreater(impl_at, arch_at)
+        self.assertIn("architect replan", log)
+        self.assertTrue((work / "design-replan.md").is_file())
+        seq_dirs = list((work / "seq").iterdir())
+        self.assertEqual(len(seq_dirs), 2)
+        reviews = list((work / "seq").glob("*/review.md"))
+        self.assertEqual(len(reviews), 2)
+        self.assertEqual(State.load(work).stop_reason, "applied")
+
+    def test_seq_dry_run_does_not_implement(self):
+        work = self._feature()
+        self._inject_mixed(work)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "apply",
+                "--seq",
+                "--dry-run",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        plan = (work / "apply-plan.md").read_text(encoding="utf-8")
+        self.assertIn("greet ignores empty name", plan)
+        self.assertIn("wrong module boundary", plan)
+        self.assertFalse((work / "apply-impl-summary.md").is_file())
+        self.assertFalse((work / "seq").exists())
+        self.assertEqual(State.load(work).stop_reason, "dry_run")
+
+    def test_seq_stops_on_suite_failure_and_retries_same_class(self):
+        work = self._feature()
+        review_before = (work / "review.md").read_text(encoding="utf-8")
+        self._inject_mixed(work)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "false",
+                "apply",
+                "--seq",
+                "--no-review",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 1)
+        self.assertEqual(State.load(work).stop_reason, "seq-failed")
+        self.assertEqual((work / "review.md").read_text(encoding="utf-8"), review_before)
+        log = (work / "apply-seq.md").read_text(encoding="utf-8")
+        self.assertIn("wrong module boundary", log)
+        self.assertNotIn("greet ignores empty name", log)
+        self.assertIn("Stopped", log)
+        data = json.loads((work / "findings.json").read_text(encoding="utf-8"))
+        failed = data["seq"]["failed"]
+        self.assertTrue(failed)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "false",
+                "apply",
+                "--seq",
+                "--no-review",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 1)
+        data2 = json.loads((work / "findings.json").read_text(encoding="utf-8"))
+        self.assertEqual(data2["seq"]["failed"], failed)
+        self.assertEqual(data2["seq"]["steps"][-1]["id"], failed)
+
+    def test_seq_skip_failed_continues(self):
+        work = self._feature()
+        self._inject_mixed(work)
+        self.assertEqual(
+            main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "--test-command",
+                    "false",
+                    "apply",
+                    "--seq",
+                    "--no-review",
+                    "add-greet-helper",
+                ]
+            ),
+            1,
+        )
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "--seq",
+                "--skip-failed",
+                "--no-review",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        log = (work / "apply-seq.md").read_text(encoding="utf-8")
+        self.assertIn("skipped", log)
+        self.assertIn("greet ignores empty name", log)
+        self.assertEqual(State.load(work).stop_reason, "applied")
+
+    def test_review_seq_does_not_touch_review_md(self):
+        work = self._feature()
+        self._inject_mixed(work)
+        self.assertEqual(
+            main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "--test-command",
+                    "true",
+                    "apply",
+                    "--seq",
+                    "--no-review",
+                    "add-greet-helper",
+                ]
+            ),
+            0,
+        )
+        review_before = (work / "review.md").read_text(encoding="utf-8")
+        steps = list((work / "seq").iterdir())
+        self.assertTrue(steps)
+        rc = main(
+            ["--repo", str(self.repo), "--fake", "review", "add-greet-helper", "--seq"]
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual((work / "review.md").read_text(encoding="utf-8"), review_before)
+        self.assertTrue((work / "seq" / steps[0].name / "review.md").is_file() or any(
+            (p / "review.md").is_file() for p in (work / "seq").iterdir()
+        ))
 
 
 if __name__ == "__main__":

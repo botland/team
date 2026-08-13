@@ -13,9 +13,13 @@ from team.config import (
     RANGE_PHASE_ORDER,
     ROLES,
     apply_range_reviewer,
+    collect_config_edits,
+    config_path,
     default_roles,
+    format_toml_value,
     load_config,
     resolve_phase,
+    write_config_file,
 )
 from team.pipeline import (
     OptionalPhaseError,
@@ -54,7 +58,10 @@ def _parser() -> argparse.ArgumentParser:
             "  team --assign reviewer=claude review\n"
             "  team --assign all=grok resume review-since-tag\n"
             "Past-commits reviewer can also be set on the command:\n"
-            "  team review --reviewer claude"
+            "  team review --reviewer claude\n"
+            "Persist project paths and other file-backed options:\n"
+            "  team config --code-root inferedge-phase1/controller "
+            "--test-root inferedge-phase1/tests"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -168,6 +175,17 @@ def _parser() -> argparse.ArgumentParser:
         metavar="TAG",
         help="Delete a reviewed-* tag (does not review)",
     )
+    v.add_argument(
+        "--seq",
+        nargs="?",
+        const="last",
+        default="",
+        metavar="ID",
+        help=(
+            "Re-review one apply --seq class into seq/<id>/review.md "
+            "(does not touch review.md). Omit ID for the last class."
+        ),
+    )
     v.set_defaults(func=cmd_review)
 
     p_ap = sub.add_parser(
@@ -175,8 +193,11 @@ def _parser() -> argparse.ArgumentParser:
         help="Apply classified review findings (re-review if kind= is missing)",
         description=(
             "Route review findings by kind: architecture → replan, test → contract+tests, "
-            "implementation → production. Unstructured findings trigger a re-review first."
+            "implementation → production. Unstructured findings trigger a re-review first.\n"
+            "  team apply <slug> --seq   one class at a time, highest first, until failure\n"
+            "Class reviews land in seq/<id>/review.md; review.md is left alone."
         ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p_ap.add_argument("slug")
     p_ap.add_argument(
@@ -188,6 +209,20 @@ def _parser() -> argparse.ArgumentParser:
         "--no-review",
         action="store_true",
         help="Do not run a closing review after applying",
+    )
+    p_ap.add_argument(
+        "--seq",
+        action="store_true",
+        help=(
+            "Apply one class at a time (architecture → test → implementation, "
+            "then severity) until a class fails or the queue is empty. "
+            "Does not overwrite review.md."
+        ),
+    )
+    p_ap.add_argument(
+        "--skip-failed",
+        action="store_true",
+        help="With --seq: mark the last failed class skipped and continue",
     )
     p_ap.set_defaults(func=cmd_apply)
 
@@ -233,6 +268,85 @@ def _parser() -> argparse.ArgumentParser:
         description="Copy config.example.toml to <repo>/.team/config.toml and ignore work/.",
     )
     init.set_defaults(func=cmd_init)
+
+    cfg_cmd = sub.add_parser(
+        "config",
+        help="Show or set <repo>/.team/config.toml",
+        description=(
+            "Read or write the project config at <repo>/.team/config.toml.\n"
+            "No arguments prints the effective config. Flags and KEY=VALUE "
+            "pairs write only those keys (creates the file from the example "
+            "if needed).\n"
+            "  team config\n"
+            "  team config --code-root inferedge-phase1/controller "
+            "--test-root inferedge-phase1/tests\n"
+            "  team config --assign implementer=grok --skip critic\n"
+            "  team config test_command=\"make test\" phase_timeout=1800\n"
+            "  team config --unset code_root"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    cfg_cmd.add_argument(
+        "--code-root",
+        dest="set_code_root",
+        default=None,
+        help="Write paths.code_root",
+    )
+    cfg_cmd.add_argument(
+        "--test-root",
+        dest="set_test_root",
+        default=None,
+        help="Write paths.test_root",
+    )
+    cfg_cmd.add_argument(
+        "--test-command",
+        dest="set_test_command",
+        default=None,
+        help="Write paths.test_command",
+    )
+    cfg_cmd.add_argument(
+        "--assign",
+        dest="set_assign",
+        action="append",
+        default=[],
+        metavar="ROLE=RUNTIME",
+        help="Write roles.<role> (repeatable; all=grok is allowed)",
+    )
+    cfg_cmd.add_argument(
+        "--skip",
+        dest="set_skip",
+        action="append",
+        default=[],
+        help="Replace run.skip (repeatable or comma-separated)",
+    )
+    cfg_cmd.add_argument(
+        "--range-reviewer",
+        dest="set_range_reviewer",
+        default=None,
+        choices=("claude", "grok"),
+        help="Write review.range_reviewer",
+    )
+    cfg_cmd.add_argument(
+        "--phase-timeout",
+        dest="set_phase_timeout",
+        default=None,
+        type=int,
+        help="Write run.phase_timeout (seconds; 0 = no limit)",
+    )
+    cfg_cmd.add_argument(
+        "--unset",
+        dest="unset_keys",
+        action="append",
+        default=[],
+        metavar="KEY",
+        help="Clear a key (repeatable). Roles are removed; paths become empty.",
+    )
+    cfg_cmd.add_argument(
+        "pairs",
+        nargs="*",
+        help="KEY=VALUE entries (code_root=…, skip=critic, architect=claude)",
+    )
+    cfg_cmd.set_defaults(func=cmd_config)
 
     audit = sub.add_parser(
         "audit",
@@ -331,6 +445,8 @@ def cmd_review(args) -> int:
             cfg.roles["reviewer"] = args.reviewer
             cfg.role_overrides.add("reviewer")
         pipe = load_pipeline(cfg, slug)
+        if args.seq:
+            return _cmd_review_seq(pipe, args.seq)
         print("== team review %s" % slug)
         pipe.phase_reviewer()
         pipe.state.mark("reviewer")
@@ -574,8 +690,47 @@ def cmd_apply(args) -> int:
     pipe = load_pipeline(cfg, args.slug)
     print("== team apply %s" % args.slug)
     print("work: %s" % pipe.work)
-    pipe.apply_review(dry_run=args.dry_run, rereview=not args.no_review)
+    if args.skip_failed and not args.seq:
+        print("error: --skip-failed requires --seq", file=sys.stderr)
+        return 2
+    pipe.apply_review(
+        dry_run=args.dry_run,
+        rereview=not args.no_review,
+        seq=args.seq,
+        skip_failed=args.skip_failed,
+    )
     _print_done(pipe)
+    if pipe.state.stop_reason == "seq-failed":
+        return 1
+    return 0
+
+
+def _cmd_review_seq(pipe, seq_arg: str) -> int:
+    seq = findings_mod.load_seq_state(pipe.work)
+    steps = [row for row in (seq.get("steps") or []) if isinstance(row, dict)]
+    fid = seq_arg
+    if fid == "last":
+        if not steps:
+            print("error: no apply --seq class to review", file=sys.stderr)
+            return 1
+        fid = str(steps[-1].get("id") or "")
+    seq_dir = pipe.work / "seq" / fid
+    finding_path = seq_dir / "finding.json"
+    if not finding_path.is_file():
+        print("error: no seq class at %s" % seq_dir, file=sys.stderr)
+        return 1
+    try:
+        items = load_json(finding_path)
+    except Exception:
+        items = []
+    if isinstance(items, dict):
+        items = [items]
+    print("== team review %s --seq %s" % (pipe.state.slug, fid))
+    pipe.phase_seq_review(seq_dir, items)
+    pipe.save()
+    review = seq_dir / "review.md"
+    print("class-review: %s" % review)
+    print("review.md not modified")
     return 0
 
 
@@ -678,9 +833,84 @@ def cmd_init(args) -> int:
     src = engine_root() / "config.example.toml"
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dest)
-    write_text(repo / ".team" / ".gitignore", "work/\n")
+    _ensure_team_gitignore(repo)
     print("wrote %s" % dest)
     return 0
+
+
+def cmd_config(args) -> int:
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+    dest = config_path(repo)
+    try:
+        updates, deletes = collect_config_edits(
+            pairs=args.pairs,
+            unsets=args.unset_keys,
+            code_root=_config_flag(args.set_code_root, args.code_root),
+            test_root=_config_flag(args.set_test_root, args.test_root),
+            test_command=_config_flag(args.set_test_command, args.test_command),
+            assign=args.set_assign or args.assign,
+            skip=_config_skip(args.set_skip, args.skip),
+            range_reviewer=args.set_range_reviewer,
+            phase_timeout=args.set_phase_timeout,
+        )
+    except SystemExit as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 2
+    if not updates and not deletes:
+        _print_effective_config(dest, _cfg(args))
+        return 0
+    existed = dest.is_file()
+    write_config_file(dest, updates=updates, deletes=deletes)
+    _ensure_team_gitignore(repo)
+    print("wrote %s%s" % (dest, "" if existed else " (created)"))
+    for section, key, value in updates:
+        print("set %s.%s = %s" % (section, key, format_toml_value(value)))
+    for section, key in deletes:
+        print("unset %s.%s" % (section, key))
+    return 0
+
+
+def _config_flag(specific: Optional[str], inherited: str) -> Optional[str]:
+    if specific is not None:
+        return specific
+    if inherited:
+        return inherited
+    return None
+
+
+def _config_skip(specific: list, inherited: list) -> Optional[list]:
+    if specific:
+        return specific
+    if inherited:
+        return inherited
+    return None
+
+
+def _ensure_team_gitignore(repo: Path) -> None:
+    path = repo / ".team" / ".gitignore"
+    if not path.exists():
+        write_text(path, "work/\n")
+
+
+def _print_effective_config(dest: Path, cfg) -> None:
+    print("file: %s" % dest)
+    print("exists: %s" % ("yes" if dest.is_file() else "no"))
+    print("")
+    print("[paths]")
+    print("  code_root      %s" % (cfg.code_root or "(unset)"))
+    print("  test_root      %s" % (cfg.test_root or "(unset)"))
+    print("  test_command   %s" % (cfg.test_command or "(unset)"))
+    print("")
+    print("[run]")
+    print("  skip           %s" % (", ".join(cfg.skip) if cfg.skip else "(none)"))
+    print("  phase_timeout  %s" % cfg.phase_timeout)
+    print("")
+    print("[review]")
+    print("  range_reviewer %s" % cfg.range_reviewer)
+    print("")
+    print("[roles]")
+    for role in ROLES:
+        print("  %-14s %s" % (role, cfg.assignment(role)))
 
 
 def cmd_audit(args) -> int:
@@ -725,6 +955,15 @@ def _print_done(pipe) -> None:
     review = pipe.work / "review.md"
     if review.is_file():
         print("review: %s" % review)
+    seq_log = pipe.work / "apply-seq.md"
+    if seq_log.is_file():
+        print("seq: %s" % seq_log)
+    steps = findings_mod.load_seq_state(pipe.work).get("steps") or []
+    if steps:
+        last = steps[-1] if isinstance(steps[-1], dict) else {}
+        class_review = pipe.work / "seq" / str(last.get("id") or "") / "review.md"
+        if class_review.is_file():
+            print("class-review: %s" % class_review)
     report = pipe.work / "report.md"
     if report.is_file():
         print("report: %s" % report)

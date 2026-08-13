@@ -56,6 +56,8 @@ team review --mark
 team review --mark HEAD~3
 team review --delete-tag reviewed-20260801-1200
 team apply oauth-login
+team apply review-since-tag --seq
+team review review-since-tag --seq
 team replan oauth-login
 team status oauth-login
 team audit
@@ -65,6 +67,8 @@ team list
 team replan add-x --continue
 team roles
 team init
+team config
+team config --code-root inferedge-phase1/controller --test-root inferedge-phase1/tests
 ```
 
 Global flags go **before** the subcommand:
@@ -90,6 +94,8 @@ Every command accepts `-h` / `--help` (`team review --help`, `team apply --help`
 `--stamp` (default on for `--pr`) writes `reviewed-YYYYMMDD-HHMM` at HEAD so the next unscoped review starts there. Manage the watermark without reviewing: `--list-tags`, `--show-range`, `--mark [ref]`, `--delete-tag TAG`, `--since REF`.
 
 `team apply <slug>` processes a review. Each finding needs `kind` (`architecture` | `implementation` | `test` | `note`). If the review is unstructured, apply re-runs the reviewer first. Then: architecture → design delta; test → contract + tests; implementation → production; host suite; closing review. Audit slugs are read-only and cannot be applied.
+
+`team apply <slug> --seq` closes **one class at a time** in the same order as `feature` (architecture → test → implementation, severity inside each kind) and loops until the queue is empty or a class fails. Each hop sees only that class (not `review.md` / the rest of the backlog). A class review is written to `seq/<id>/review.md`; the original `review.md` is not overwritten. On failure the worktree is left as that class left it (no rollback). Retry the same class with `team apply <slug> --seq`; skip it with `--skip-failed`. Re-review a finished class with `team review <slug> --seq` (or `--seq <id>`).
 
 ## Artifacts (the protocol)
 
@@ -118,6 +124,8 @@ Each run lives in the **target** repo, not in this engine:
   findings.json           # classified findings (after apply)
   apply-plan.md           # apply routing by kind
   apply-summary.md        # hops + suite after apply
+  apply-seq.md            # apply --seq log (one class per step)
+  seq/<id>/review.md      # class review; does not replace review.md
   design-replan.md        # only after team replan / apply architecture
   scout.md / scout.json   # audit only
   status.md               # audit only
@@ -128,7 +136,7 @@ Each run lives in the **target** repo, not in this engine:
   prompts/architect.prompt.md
 ```
 
-`team init` writes `<repo>/.team/config.toml` and ignores `work/`.
+`team init` writes `<repo>/.team/config.toml` and ignores `work/`. `team config` shows the effective project config, or writes individual keys into that file (`--code-root`, `--test-root`, `--test-command`, `--assign`, `--skip`, `--range-reviewer`, `--phase-timeout`, or `KEY=VALUE`). It does not write the engine `config.toml`.
 
 ## What the orchestrator enforces
 
@@ -144,7 +152,14 @@ Each run lives in the **target** repo, not in this engine:
 
 ## Config
 
-Copy `config.example.toml` to `config.toml` in this repo (gitignored) for machine defaults, or to `<target>/.team/config.toml` for a project.
+Copy `config.example.toml` to `config.toml` in this repo (gitignored) for machine defaults, or to `<target>/.team/config.toml` for a project. Persist a project's roots and other file-backed options with `team config` (creates `.team/config.toml` from the example if needed):
+
+```text
+team --repo ~/ownedge config --code-root inferedge-phase1/controller --test-root inferedge-phase1/tests
+team config --assign reviewer=claude --skip critic
+team config test_command="make test"
+team config --unset code_root
+```
 
 ```toml
 [roles]

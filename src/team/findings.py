@@ -57,6 +57,14 @@ _KIND_RANK = {
     "note": 3,
 }
 
+# apply --seq follows the feature rail, not console urgency.
+_SEQ_KIND_RANK = {
+    "architecture": 0,
+    "test": 1,
+    "implementation": 2,
+    "note": 3,
+}
+
 
 def normalize_kind(value: Any) -> str:
     key = as_str(value).strip().lower()
@@ -286,20 +294,163 @@ def actionable(findings: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [item for item in findings if (item.get("kind") or "") in ACTIONABLE]
 
 
-def write_findings(work: Path, findings: List[Dict[str, Any]]) -> Path:
+def finding_id(item: Dict[str, Any]) -> str:
+    kind = normalize_kind(item.get("kind"))
+    path = as_str(item.get("path")).strip()
+    title = as_str(item.get("title")).strip().lower()
+    raw = "%s|%s|%s" % (kind, path, title)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def is_review_finding(item: Dict[str, Any]) -> bool:
+    return as_str(item.get("source")).startswith("reviewer")
+
+
+def empty_seq_state() -> Dict[str, Any]:
+    return {"applied": [], "skipped": [], "failed": "", "steps": []}
+
+
+def load_seq_state(work: Path) -> Dict[str, Any]:
+    path = work / "findings.json"
+    if not path.is_file():
+        return empty_seq_state()
+    try:
+        data = load_json(path)
+    except Exception:
+        return empty_seq_state()
+    if not isinstance(data, dict) or not isinstance(data.get("seq"), dict):
+        return empty_seq_state()
+    seq = data["seq"]
+    return {
+        "applied": [as_str(x) for x in as_list(seq.get("applied")) if as_str(x)],
+        "skipped": [as_str(x) for x in as_list(seq.get("skipped")) if as_str(x)],
+        "failed": as_str(seq.get("failed")),
+        "steps": [row for row in as_list(seq.get("steps")) if isinstance(row, dict)],
+    }
+
+
+def write_findings(
+    work: Path,
+    findings: List[Dict[str, Any]],
+    *,
+    seq: Optional[Dict[str, Any]] = None,
+) -> Path:
+    if seq is None:
+        seq = load_seq_state(work)
     return dump_json(
         work / "findings.json",
         {
             "findings": findings,
             "counts": {kind: len(rows) for kind, rows in group_by_kind(findings).items()},
+            "seq": seq,
         },
     )
+
+
+def seq_candidates(
+    findings: Iterable[Dict[str, Any]],
+    seq: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    done = set(seq.get("applied") or []) | set(seq.get("skipped") or [])
+    out: List[Dict[str, Any]] = []
+    for item in findings:
+        if not is_review_finding(item):
+            continue
+        if (item.get("kind") or "") not in ACTIONABLE:
+            continue
+        row = dict(item)
+        row["id"] = finding_id(row)
+        if row["id"] in done:
+            continue
+        out.append(row)
+    return out
+
+
+def pick_next_seq(
+    findings: Iterable[Dict[str, Any]],
+    seq: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    candidates = seq_candidates(findings, seq)
+    failed = as_str(seq.get("failed"))
+    if failed:
+        for item in candidates:
+            if item.get("id") == failed:
+                return item
+    ranked = sorted(candidates, key=seq_key)
+    return ranked[0] if ranked else None
+
+
+def related_guardian(
+    item: Dict[str, Any],
+    guardian: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    path = as_str(item.get("path")).strip()
+    if not path:
+        return []
+    return [row for row in guardian if as_str(row.get("path")).strip() == path]
+
+
+def mark_seq_step(
+    seq: Dict[str, Any],
+    item: Dict[str, Any],
+    *,
+    status: str,
+    hops: Optional[List[str]] = None,
+    suite: str = "",
+) -> Dict[str, Any]:
+    fid = as_str(item.get("id")) or finding_id(item)
+    applied = [x for x in as_list(seq.get("applied")) if as_str(x) and as_str(x) != fid]
+    skipped = [x for x in as_list(seq.get("skipped")) if as_str(x) and as_str(x) != fid]
+    failed = as_str(seq.get("failed"))
+    if failed == fid:
+        failed = ""
+    if status == "applied":
+        applied.append(fid)
+    elif status == "skipped":
+        skipped.append(fid)
+    elif status == "failed":
+        failed = fid
+    step = {
+        "id": fid,
+        "status": status,
+        "kind": as_str(item.get("kind")),
+        "title": as_str(item.get("title")) or "(untitled)",
+        "path": as_str(item.get("path")),
+        "hops": list(hops or []),
+        "suite": suite,
+    }
+    steps = [row for row in as_list(seq.get("steps")) if isinstance(row, dict)]
+    steps.append(step)
+    return {
+        "applied": applied,
+        "skipped": skipped,
+        "failed": failed,
+        "steps": steps,
+    }
+
+
+def seq_status_for(item: Dict[str, Any], seq: Dict[str, Any]) -> str:
+    fid = as_str(item.get("id")) or finding_id(item)
+    if fid in set(seq.get("applied") or []):
+        return "applied"
+    if fid in set(seq.get("skipped") or []):
+        return "skipped"
+    if fid and fid == as_str(seq.get("failed")):
+        return "failed"
+    return ""
 
 
 def importance_key(item: Dict[str, Any]) -> tuple:
     sev = (item.get("severity") or "?").strip().lower()
     kind = item.get("kind") or ""
     return (_SEVERITY_RANK.get(sev, 5), _KIND_RANK.get(kind, 4))
+
+
+def seq_key(item: Dict[str, Any]) -> tuple:
+    """Feature rail: architecture → test → implementation, then severity."""
+    sev = (item.get("severity") or "?").strip().lower()
+    kind = item.get("kind") or ""
+    return (_SEQ_KIND_RANK.get(kind, 4), _SEVERITY_RANK.get(sev, 5))
 
 
 def take_important(items: Iterable[Dict[str, Any]], limit: int = CONSOLE_LIMIT) -> List[Dict[str, Any]]:
@@ -361,7 +512,11 @@ def items_from_strings(values: Iterable[Any], *, severity: str = "", kind: str =
     return out
 
 
-def render_followups(findings: Iterable[Dict[str, Any]]) -> str:
+def render_followups(
+    findings: Iterable[Dict[str, Any]],
+    *,
+    seq: Optional[Dict[str, Any]] = None,
+) -> str:
     rows = list(findings)
     lines = ["# Open classes", ""]
     if not rows:
@@ -373,8 +528,92 @@ def render_followups(findings: Iterable[Dict[str, Any]]) -> str:
         title = item.get("title") or "(untitled)"
         loc = item.get("path") or ""
         loc_s = " (`%s`)" % loc if loc else ""
-        lines.append("- **%s** [%s] %s%s" % (sev, kind, title, loc_s))
+        status = seq_status_for(item, seq) if seq else ""
+        mark = " **%s**" % status if status else ""
+        lines.append("- **%s** [%s] %s%s%s" % (sev, kind, title, loc_s, mark))
     return "\n".join(lines) + "\n"
+
+
+def render_seq_plan(
+    queue: List[Dict[str, Any]],
+    *,
+    reclassified: bool = False,
+    failed: str = "",
+) -> str:
+    lines = [
+        "# Apply --seq plan",
+        "",
+        "Re-reviewed to classify: %s" % ("yes" if reclassified else "no"),
+        "",
+        "One class at a time: architecture → test → implementation, then severity.",
+        "Loop stops on the first class failure.",
+        "",
+    ]
+    if failed:
+        lines.append("Retry first (previous failure): `%s`" % failed)
+        lines.append("")
+    if not queue:
+        lines.append("- (none remaining)")
+        lines.append("")
+        return "\n".join(lines)
+    for i, item in enumerate(queue, 1):
+        loc = item.get("path") or ""
+        loc_s = " (`%s`)" % loc if loc else ""
+        lines.append(
+            "%d. `%s` **%s** [%s] %s%s"
+            % (
+                i,
+                item.get("id") or finding_id(item),
+                item.get("severity") or "?",
+                item.get("kind") or "?",
+                item.get("title") or "(untitled)",
+                loc_s,
+            )
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_seq_log(seq: Dict[str, Any], *, slug: str = "") -> str:
+    lines = ["# Apply --seq", ""]
+    steps = [row for row in as_list(seq.get("steps")) if isinstance(row, dict)]
+    if not steps:
+        lines.append("No classes applied yet.")
+        lines.append("")
+        return "\n".join(lines)
+    for i, step in enumerate(steps, 1):
+        fid = as_str(step.get("id")) or "?"
+        lines.append("## %d. `%s` %s" % (i, fid, as_str(step.get("status")) or "?"))
+        lines.append("")
+        lines.append("- kind: %s" % (step.get("kind") or "?"))
+        lines.append("- title: %s" % (step.get("title") or "(untitled)"))
+        if step.get("path"):
+            lines.append("- path: `%s`" % step["path"])
+        if step.get("suite"):
+            lines.append("- suite: %s" % step["suite"])
+        hops = as_list(step.get("hops"))
+        if hops:
+            lines.append("- hops: %s" % ", ".join(as_str(h) for h in hops))
+        lines.append("- artifacts: `seq/%s/`" % fid)
+        lines.append("")
+    failed = as_str(seq.get("failed"))
+    if failed:
+        cmd = "team apply %s --seq" % slug if slug else "team apply <slug> --seq"
+        lines.extend(
+            [
+                "## Stopped",
+                "",
+                "Class `%s` failed. The worktree is left as this class left it (no rollback)."
+                % failed,
+                "",
+                "- retry the same class: `%s`" % cmd,
+                "- skip it and continue: `%s --skip-failed`" % cmd,
+                "- review a finished class: `team review %s --seq %s`"
+                % (slug or "<slug>", failed),
+                "",
+            ]
+        )
+    return "\n".join(lines)
 
 
 def render_plan(
