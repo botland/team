@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -23,6 +24,7 @@ from team.runners import (
     Result,
     Runtime,
     describe_runtime_failure,
+    premature_inspect,
     resolve_session,
     runtime_for,
 )
@@ -59,6 +61,14 @@ class Pipeline:
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
         print(msg, flush=True)
+
+    def _begin_hop(self, role: str, label: str) -> None:
+        """One start line before a long hop. Completion stays on the existing log."""
+        if role in ROLES:
+            who = self.cfg.assignment(role)
+        else:
+            who = role
+        self.log("%s  %s (%s) …" % (datetime.now().strftime("%H:%M:%S"), label, who))
 
     def _log_items(
         self,
@@ -173,10 +183,45 @@ class Pipeline:
             raise PipelineError("%s/%s failed: %s" % (role, phase, err))
         errors = validate_schema(result.output, self.schema(schema_name), enums=False)
         if errors:
-            msg = "%s/%s failed: schema %s" % (role, phase, "; ".join(errors))
+            keys = ""
+            if isinstance(result.output, dict) and result.output:
+                keys = " (keys: %s)" % ", ".join(sorted(result.output))
+            msg = "%s/%s failed: schema %s%s" % (
+                role,
+                phase,
+                "; ".join(errors),
+                keys,
+            )
             if ROLES.get(role, {}).get("optional"):
                 raise OptionalPhaseError(msg)
             raise PipelineError(msg)
+        if premature_inspect(role=role, runtime=runtime_name, result=result):
+            if extra.get("_inspect_retry"):
+                msg = (
+                    "%s/%s failed: finished in %s model turn(s) without inspecting the tree"
+                    % (role, phase, result.num_turns)
+                )
+                if ROLES.get(role, {}).get("optional"):
+                    raise OptionalPhaseError(msg)
+                raise PipelineError(msg)
+            extra["_inspect_retry"] = True
+            self.log(
+                "%s emitted schema JSON in %s turn(s); retrying so it inspects first"
+                % (phase, result.num_turns)
+            )
+            return self.invoke(
+                role,
+                phase,
+                prompt
+                + "\n\nPREVIOUS OUTPUT REJECTED: it was emitted before any tool call. "
+                "That is not a review. Read the listed artifacts with tools, then "
+                "emit the final JSON only after you have inspected the tree.",
+                schema_name,
+                capability=capability,
+                resume=True,
+                extra=extra,
+                runtime_name=runtime_name,
+            )
         return result
 
     def _require_write_scope(self, role: str, capability: str) -> None:
@@ -246,6 +291,7 @@ class Pipeline:
         }.get(target, target)
         if target not in ROLES:
             target = "architect"
+        self._begin_hop(target, "apply: consult %s" % target)
         n = len(list(self.work.joinpath("consult").glob("*.json"))) + 1
         payload = {
             "from": from_role,
@@ -1210,6 +1256,7 @@ class Pipeline:
         review = self.read_artifact("review.md")
         if not review:
             raise PipelineError("replan needs review.md")
+        self._begin_hop("architect", "apply: architect questions")
         prompt = self._prompt(
             "architect",
             [
@@ -1240,6 +1287,7 @@ class Pipeline:
                 "Still structure-level. No function bodies.",
             ],
         )
+        self._begin_hop("architect", "apply: architect replan")
         result = self.invoke("architect", "replan", prompt, "design.json", resume=True)
         md = as_str(result.output.get("design_markdown")) or "(empty replan)"
         self.write_artifact("design-replan.md", md)
@@ -1271,7 +1319,9 @@ class Pipeline:
             "- implementation: production bug — implementer will patch\n"
             "- test: missing/wrong tests or contract — tdd-design + test-writer\n"
             "- note: open class or non-actionable; listed only\n"
-            "At most 10 findings (severity, title, evidence, path, kind)."
+            "At most 10 findings (severity, title, evidence, path, kind).\n"
+            "Do not emit the JSON object until tools have read the listed artifacts "
+            "and you have inspected the files in scope. A progress finding is not a review."
         )
 
     def _write_followups(self, *, seq: Optional[Dict[str, Any]] = None) -> None:
@@ -1399,6 +1449,7 @@ class Pipeline:
 
         cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
         self.cfg.test_command = cmd
+        self._begin_hop("tester", "apply: host suite")
         run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
         comparison = testhost.compare(self.state.final or self.state.baseline, run)
         run = dict(run)
@@ -1498,10 +1549,11 @@ class Pipeline:
         skip_failed: bool,
     ) -> None:
         seq = findings_mod.load_seq_state(self.work)
+        pool = list(review_findings) + list(guardian)
         if skip_failed and seq.get("failed"):
             failed_id = str(seq.get("failed") or "")
             dummy = {"id": failed_id, "title": "(skipped)", "kind": "", "path": ""}
-            for item in review_findings:
+            for item in pool:
                 if findings_mod.finding_id(item) == failed_id:
                     dummy = dict(item)
                     dummy["id"] = failed_id
@@ -1513,14 +1565,14 @@ class Pipeline:
             self.log("seq: skipped failed class %s" % failed_id)
 
         ranked = []
-        nxt = findings_mod.pick_next_seq(review_findings, seq)
+        nxt = findings_mod.pick_next_seq(pool, seq)
         seen = set()
         probe = dict(seq)
         while nxt and nxt.get("id") not in seen:
             ranked.append(nxt)
             seen.add(nxt["id"])
             probe = findings_mod.mark_seq_step(probe, nxt, status="applied")
-            nxt = findings_mod.pick_next_seq(review_findings, probe)
+            nxt = findings_mod.pick_next_seq(pool, probe)
         self.write_artifact(
             "apply-plan.md",
             findings_mod.render_seq_plan(
@@ -1543,12 +1595,28 @@ class Pipeline:
             return
 
         while True:
-            item = findings_mod.pick_next_seq(review_findings, seq)
+            item = findings_mod.pick_next_seq(pool, seq)
             if item is None:
                 break
             related = findings_mod.related_guardian(item, guardian)
+            if as_str(item.get("source")) == "guardian":
+                related = [
+                    row
+                    for row in related
+                    if findings_mod.finding_id(row) != findings_mod.finding_id(item)
+                ]
             ok = self._apply_one_seq(item, related, seq, rereview=rereview)
             seq = findings_mod.load_seq_state(self.work)
+            if ok and related:
+                for rel in related:
+                    row = dict(rel)
+                    row["id"] = findings_mod.finding_id(row)
+                    seq = findings_mod.mark_seq_step(
+                        seq, row, status="applied", hops=["related"]
+                    )
+                findings_mod.write_findings(
+                    self.work, review_findings + guardian, seq=seq
+                )
             if not ok:
                 self._write_followups(seq=seq)
                 self.write_artifact(
@@ -1611,6 +1679,7 @@ class Pipeline:
 
             cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
             self.cfg.test_command = cmd
+            self._begin_hop("tester", "apply: host suite")
             run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
             comparison = testhost.compare(self.state.final or self.state.baseline, run)
             run = dict(run)
@@ -1661,6 +1730,7 @@ class Pipeline:
                 return False
 
             if rereview:
+                self._begin_hop("reviewer", "seq: class review")
                 self.phase_seq_review(seq_dir, bundle)
                 hops.append("class review")
 
@@ -1792,6 +1862,7 @@ class Pipeline:
                 shutil.copyfile(src, seq_dir / name)
 
     def _apply_replan_seq(self, items: List[Dict[str, Any]]) -> None:
+        self._begin_hop("architect", "apply: architect questions")
         prompt = self._prompt(
             "architect",
             [
@@ -1824,6 +1895,7 @@ class Pipeline:
                 "Still structure-level. No function bodies.",
             ],
         )
+        self._begin_hop("architect", "apply: architect replan")
         result = self.invoke("architect", "replan", prompt, "design.json", resume=True)
         md = as_str(result.output.get("design_markdown")) or "(empty replan)"
         self.write_artifact("design-replan.md", md)
@@ -1900,6 +1972,7 @@ class Pipeline:
                 self.log("class guardian skipped (%s)" % exc)
 
     def _phase_seq_guardian(self, seq_dir: Path, items: List[Dict[str, Any]]) -> None:
+        self._begin_hop("guardian", "seq: class guardian")
         prompt = self._prompt(
             "guardian",
             [
@@ -1942,6 +2015,7 @@ class Pipeline:
                 "ready must be true unless you have at most 10 questions for the architect.",
             ],
         )
+        self._begin_hop("tdd-design", "apply: tdd-design")
         result = self.invoke(
             "tdd-design", "tdd-design-apply", prompt, "tdd_design.json", resume=True
         )
@@ -1983,6 +2057,7 @@ class Pipeline:
                 "Return summary and paths_touched (test paths only).",
             ],
         )
+        self._begin_hop("test-writer", "apply: test-writer")
         result = self.invoke(
             "test-writer",
             "test-writer-apply",
@@ -2015,6 +2090,7 @@ class Pipeline:
                 "Return summary and paths_touched.",
             ],
         )
+        self._begin_hop("implementer", "apply: implementer")
         result = self.invoke(
             "implementer",
             "implementer-apply",

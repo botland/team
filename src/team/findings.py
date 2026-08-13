@@ -367,8 +367,6 @@ def seq_candidates(
     )
     out: List[Dict[str, Any]] = []
     for item in findings:
-        if not is_review_finding(item):
-            continue
         if (item.get("kind") or "") not in ACTIONABLE:
             continue
         row = dict(item)

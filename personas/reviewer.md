@@ -32,3 +32,4 @@ If you cannot name a kind, the finding cannot be processed — prefer `note` ove
 - At most 10 findings (highest severity first). Extra notes can be brief prose.
 - No drive-by refactors; no file edits.
 - Judge boundaries against the real layout and any stated `code_root` / `test_root`.
+- Emit the JSON object only after tools have read the listed artifacts and you have inspected the files in scope. A progress finding is not a review.

@@ -18,6 +18,7 @@ class Result:
     session_id: str
     raw: str
     error: str = ""
+    num_turns: Optional[int] = None
 
 
 class RuntimeError_(RuntimeError):
@@ -263,7 +264,14 @@ class ClaudeRuntime(Runtime):
             extra=extra,
         )
         write_text(work / "prompts" / ("%s.cmd.txt" % phase), " ".join(cmd[:8]) + " …")
-        return _run(cmd, repo=repo, timeout=timeout, session_id=sid, prompt_path=prompt_path)
+        return _run(
+            cmd,
+            repo=repo,
+            timeout=timeout,
+            session_id=sid,
+            prompt_path=prompt_path,
+            schema=schema,
+        )
 
 
 class GrokRuntime(Runtime):
@@ -297,7 +305,14 @@ class GrokRuntime(Runtime):
             extra=extra,
         )
         write_text(work / "prompts" / ("%s.cmd.txt" % phase), " ".join(cmd))
-        return _run(cmd, repo=repo, timeout=timeout, session_id=sid, prompt_path=prompt_path)
+        return _run(
+            cmd,
+            repo=repo,
+            timeout=timeout,
+            session_id=sid,
+            prompt_path=prompt_path,
+            schema=schema,
+        )
 
 
 class FakeRuntime(Runtime):
@@ -358,6 +373,7 @@ def _run(
     timeout: int,
     session_id: str,
     prompt_path: Path,
+    schema: Optional[Dict[str, Any]] = None,
 ) -> Result:
     try:
         proc = subprocess.run(
@@ -386,7 +402,8 @@ def _run(
             error="timeout after %ss" % timeout,
         )
     raw = proc.stdout or ""
-    parsed = extract_json(raw) if raw.strip() else {}
+    wrapper = _envelope(raw)
+    parsed = extract_json(raw, schema=schema) if raw.strip() else {}
     if raw.strip() and parsed is None:
         return Result(
             success=False,
@@ -417,7 +434,13 @@ def _run(
         )
         failed.error = describe_runtime_failure(failed)
         return failed
-    sid = as_str(parsed.get("session_id") or parsed.get("sessionId") or session_id)
+    sid = as_str(
+        (wrapper or {}).get("session_id")
+        or (wrapper or {}).get("sessionId")
+        or parsed.get("session_id")
+        or parsed.get("sessionId")
+        or session_id
+    )
     output = parsed
     return Result(
         success=True,
@@ -425,7 +448,42 @@ def _run(
         session_id=sid,
         raw=raw,
         error="",
+        num_turns=_num_turns(wrapper),
     )
+
+
+def _envelope(raw: str) -> Optional[Dict[str, Any]]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _num_turns(wrapper: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not wrapper or wrapper.get("num_turns") is None:
+        return None
+    try:
+        return int(wrapper["num_turns"])
+    except (TypeError, ValueError):
+        return None
+
+
+def premature_inspect(*, role: str, runtime: str, result: Result) -> bool:
+    """True when a Grok inspect role emitted schema JSON without a tool loop.
+
+    ``--json-schema`` makes a first-turn ``{summary, findings: [...progress...]}``
+    a legal completion. One model turn means no tools ran.
+    """
+    if role not in ("reviewer", "guardian", "scout", "critic"):
+        return False
+    if runtime != "grok":
+        return False
+    turns = result.num_turns
+    return turns is not None and turns <= 1
 
 
 def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:

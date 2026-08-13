@@ -1,3 +1,4 @@
+import json
 import sys
 import unittest
 from pathlib import Path
@@ -28,6 +29,39 @@ class PathTests(unittest.TestCase):
         self.assertTrue(under_root("./tests/a.py", "tests"))
 
 
+_REVIEW_SCHEMA = {
+    "type": "object",
+    "required": ["findings", "summary"],
+    "properties": {
+        "summary": {"type": "string"},
+        "findings": {"type": "array"},
+    },
+}
+
+_FINDING = {
+    "severity": "low",
+    "title": "F82 residual",
+    "evidence": "READMEs outside this range still say P3 is unbuilt",
+    "kind": "note",
+    "path": "FOLLOWUPS.md",
+}
+
+_REVIEW = {
+    "summary": "P3 is in the tree. Highest leftover is a census that misses DELETE.",
+    "findings": [
+        {
+            "severity": "high",
+            "title": "Secret-store census does not see DELETE",
+            "evidence": "delete_secret is not an anchor",
+            "kind": "test",
+            "path": "inferedge-phase1/tests/unit/test_a_secret_value_has_one_reader.py",
+        },
+        _FINDING,
+    ],
+    "review_markdown": "# Review\nP3 is in the tree.\n",
+}
+
+
 class ExtractJsonTests(unittest.TestCase):
     def test_plain_schema(self):
         self.assertEqual(extract_json('{"ready": true}'), {"ready": True})
@@ -39,6 +73,50 @@ class ExtractJsonTests(unittest.TestCase):
     def test_grok_text_field(self):
         raw = '{"text":"{\\"accepts\\": true}","sessionId":"abc"}'
         self.assertTrue(extract_json(raw)["accepts"])
+
+    def test_trailing_eos_does_not_collapse_to_a_nested_finding(self):
+        raw = json.dumps(_REVIEW) + "<|eos|>"
+        out = extract_json(raw)
+        self.assertEqual(out["summary"], _REVIEW["summary"])
+        self.assertEqual(len(out["findings"]), 2)
+
+    def test_concatenated_reviews_keep_last_top_level_object(self):
+        placeholder = {"summary": "reading", "findings": []}
+        raw = json.dumps(placeholder) + json.dumps(_REVIEW)
+        out = extract_json(raw)
+        self.assertEqual(out["summary"], _REVIEW["summary"])
+        self.assertEqual(len(out["findings"]), 2)
+
+    def test_grok_text_concatenates_placeholder_then_final_review(self):
+        placeholder = {"summary": "Reading the secret-route census.", "findings": []}
+        envelope = {
+            "text": json.dumps(placeholder) + json.dumps(_REVIEW) + "<|eos|>",
+            "sessionId": "ebba3c9a-1b38-4490-883e-a3e9e7400901",
+            "stopReason": "end_turn",
+        }
+        out = extract_json(json.dumps(envelope), schema=_REVIEW_SCHEMA)
+        self.assertEqual(out["summary"], _REVIEW["summary"])
+        self.assertEqual(len(out["findings"]), 2)
+        self.assertEqual(out["findings"][-1]["title"], _FINDING["title"])
+
+    def test_structured_output_json_string(self):
+        envelope = {
+            "structuredOutput": json.dumps(_REVIEW),
+            "text": json.dumps({"summary": "investigating", "findings": []}),
+            "sessionId": "abc",
+        }
+        out = extract_json(json.dumps(envelope), schema=_REVIEW_SCHEMA)
+        self.assertEqual(out["summary"], _REVIEW["summary"])
+
+    def test_schema_skips_finding_shaped_structured_output(self):
+        envelope = {
+            "structuredOutput": _FINDING,
+            "text": json.dumps(_REVIEW) + "<|eos|>",
+            "sessionId": "abc",
+        }
+        out = extract_json(json.dumps(envelope), schema=_REVIEW_SCHEMA)
+        self.assertEqual(out["summary"], _REVIEW["summary"])
+        self.assertEqual(len(out["findings"]), 2)
 
 
 class MergeTests(unittest.TestCase):

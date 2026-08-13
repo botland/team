@@ -250,6 +250,60 @@ class FakeApplyTests(unittest.TestCase):
         rc = main(["--repo", str(self.repo), "--fake", "apply", "add-greet-helper"])
         self.assertEqual(rc, 1)
 
+    def test_seq_applies_guardian_when_review_is_notes_only(self):
+        rc = main(["--repo", str(self.repo), "--fake", "review", "--force"])
+        self.assertEqual(rc, 0)
+        work = self.repo / ".team" / "work" / "review-since-tag"
+        (work / "prompts" / "guardian.result.json").write_text(
+            json.dumps(
+                {
+                    "risks": [
+                        {
+                            "title": "slash still taught as legal",
+                            "evidence": "error names slash",
+                            "path": "README",
+                            "link": "t_to_i",
+                        }
+                    ],
+                    "guardian_markdown": "one risk",
+                    "chain": {
+                        "r_to_a": {"ok": True, "note": "n"},
+                        "a_to_t": {"ok": True, "note": "n"},
+                        "t_to_i": {"ok": False, "note": "n"},
+                        "i_to_r": {"ok": True, "note": "n"},
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        buf = StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "--code-root",
+                    ".",
+                    "--test-command",
+                    "true",
+                    "apply",
+                    "--seq",
+                    "--no-review",
+                    "review-since-tag",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("apply: implementer (fake) …", out)
+        self.assertIn("apply: host suite (host) …", out)
+        self.assertLess(out.find("apply: implementer"), out.find("apply: implementation"))
+        log = (work / "apply-seq.md").read_text(encoding="utf-8")
+        self.assertIn("slash still taught as legal", log)
+        self.assertIn("applied", log.lower())
+        self.assertEqual(State.load(work).stop_reason, "applied")
+        self.assertTrue(list((work / "seq").iterdir()))
+
     def test_apply_range_implementation(self):
         rc = main(["--repo", str(self.repo), "--fake", "review", "--force"])
         self.assertEqual(rc, 0)

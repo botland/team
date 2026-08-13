@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -17,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 
 from team.config import PHASE_ORDER, schema_path
 from team.pipeline import PipelineError, start_feature
-from team.runners import FakeRuntime, _run, claude_cmd, grok_cmd
+from team.runners import FakeRuntime, _run, claude_cmd, grok_cmd, premature_inspect
 from team.util import extract_json, load_json
 from tests.support.hostile import HostileRuntime, emit, register_runtime
 from tests.support.repo import init_repo
@@ -93,6 +94,72 @@ class RunExitContractTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.output.get("summary"), "ok")
 
+    def test_grok_envelope_with_nested_findings_unwraps_to_review_schema(self):
+        review = {
+            "summary": "ok",
+            "findings": [
+                {
+                    "severity": "low",
+                    "title": "F82 residual",
+                    "evidence": "x",
+                    "kind": "note",
+                }
+            ],
+        }
+        placeholder = {"summary": "reading", "findings": []}
+        envelope = {
+            "text": json.dumps(placeholder) + json.dumps(review) + "<|eos|>",
+            "sessionId": "sid-from-grok",
+            "stopReason": "end_turn",
+        }
+        payload = self.root / "stdout.json"
+        payload.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+        script = self._script("cat '%s'\nexit 0" % payload)
+        schema = load_json(schema_path("review.json"))
+        result = _run(
+            [str(script)],
+            repo=self.root,
+            timeout=5,
+            session_id="s",
+            prompt_path=self.prompt,
+            schema=schema,
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.output.get("summary"), "ok")
+        self.assertEqual(len(result.output.get("findings") or []), 1)
+        self.assertEqual(result.output["findings"][0]["title"], "F82 residual")
+        self.assertEqual(result.num_turns, None)
+
+    def test_grok_envelope_num_turns_is_preserved(self):
+        envelope = {
+            "text": json.dumps({"summary": "ok", "findings": []}),
+            "sessionId": "sid-from-grok",
+            "num_turns": 1,
+            "stopReason": "end_turn",
+        }
+        payload = self.root / "stdout.json"
+        payload.write_text(json.dumps(envelope) + "\n", encoding="utf-8")
+        script = self._script("cat '%s'\nexit 0" % payload)
+        result = _run(
+            [str(script)],
+            repo=self.root,
+            timeout=5,
+            session_id="s",
+            prompt_path=self.prompt,
+            schema=load_json(schema_path("review.json")),
+        )
+        self.assertTrue(result.success)
+        self.assertEqual(result.num_turns, 1)
+        self.assertTrue(
+            premature_inspect(role="reviewer", runtime="grok", result=result)
+        )
+        self.assertFalse(
+            premature_inspect(role="reviewer", runtime="claude", result=result)
+        )
+        self.assertFalse(
+            premature_inspect(role="implementer", runtime="grok", result=result)
+        )
+
 
 class InvokeSchemaContractTests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +192,43 @@ class InvokeSchemaContractTests(unittest.TestCase):
         self.assertTrue(result_path.is_file())
         body = result_path.read_text(encoding="utf-8")
         self.assertTrue(body.strip())
+
+    def test_one_turn_grok_review_is_rejected_after_retry(self):
+        from team.config import load_config
+
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "one-turn-rev")
+        hostile = HostileRuntime(
+            [
+                emit(
+                    {
+                        "summary": "Reviewing the collected range first.",
+                        "findings": [
+                            {
+                                "severity": "low",
+                                "title": "Review in progress",
+                                "evidence": "Starting with the orchestrator artifacts.",
+                                "kind": "note",
+                            }
+                        ],
+                    }
+                )
+            ],
+            phases=("reviewer-grok",),
+            num_turns=1,
+        )
+        with register_runtime("grok", hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.invoke(
+                    "reviewer",
+                    "reviewer-grok",
+                    "inspect the tree",
+                    "review.json",
+                    runtime_name="grok",
+                )
+        self.assertIn("without inspecting", str(ctx.exception).lower())
+        reviewer_calls = [c for c in hostile.calls if c["phase"] == "reviewer-grok"]
+        self.assertEqual(len(reviewer_calls), 2)
 
     def test_failed_reviewer_does_not_look_like_a_clean_review(self):
         from team.config import load_config

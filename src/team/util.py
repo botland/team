@@ -4,7 +4,7 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Dict, Iterable, Iterator, Optional
 
 
 def engine_root() -> Path:
@@ -84,65 +84,146 @@ def posix(path: str) -> str:
     return str(path).replace("\\", "/")
 
 
-def extract_json(payload: str) -> Any:
-    """Best-effort parse of Claude/Grok headless JSON wrappers."""
+_TRAILING_MODEL_TOKENS = ("<|eos|>", "<|endoftext|>")
+
+
+def extract_json(payload: str, schema: Optional[Dict[str, Any]] = None) -> Any:
+    """Best-effort parse of Claude/Grok headless JSON wrappers.
+
+    Grok ``--output-format json`` wraps the model text in ``{text, sessionId}``
+    and, with ``--json-schema``, may also set ``structuredOutput``. Multi-turn
+    ``text`` concatenates intermediate objects; the model may suffix ``<|eos|>``.
+    Take the last *top-level* value, not the last nested ``{``. When ``schema``
+    is given, prefer an object that has that schema's required keys.
+    """
     text = (payload or "").strip()
     if not text:
         return {}
     obj: Any
     try:
-        obj = json.loads(text)
+        obj = json.loads(_strip_trailing_tokens(text))
     except json.JSONDecodeError:
-        obj = _last_object(text)
+        obj = _last_object(text, schema)
         if obj is None:
             return None
 
     if not isinstance(obj, dict):
         return obj
 
+    def take(val: Any) -> Any:
+        if val is None:
+            return None
+        if schema is None or _has_required(val, schema):
+            return val
+        return None
+
     for key in ("structured_output", "structuredOutput"):
-        if isinstance(obj.get(key), dict):
-            return obj[key]
+        if key not in obj:
+            continue
+        inner = take(_coerce_json(obj.get(key), schema))
+        if inner is not None:
+            return inner
 
     result = obj.get("result")
     if isinstance(result, dict):
-        return result
+        inner = take(result)
+        if inner is not None:
+            return inner
     if isinstance(result, str):
-        inner = _try_json(result)
-        if isinstance(inner, dict):
+        inner = take(_try_json(result, schema))
+        if inner is not None:
             return inner
 
     text_field = obj.get("text")
     if isinstance(text_field, str):
-        inner = _try_json(text_field)
+        inner = take(_try_json(text_field, schema))
         if inner is not None:
             return inner
 
-    # Already looks like a schema object.
+    matched = take(obj)
+    if matched is not None:
+        return matched
+    if isinstance(text_field, str):
+        fallback = _try_json(text_field, schema)
+        if fallback is not None:
+            return fallback
     return obj
 
 
-def _try_json(text: str) -> Any:
-    text = text.strip()
+def _strip_trailing_tokens(text: str) -> str:
+    text = (text or "").strip()
+    changed = True
+    while changed:
+        changed = False
+        for token in _TRAILING_MODEL_TOKENS:
+            if text.endswith(token):
+                text = text[: -len(token)].rstrip()
+                changed = True
+    return text
+
+
+def _coerce_json(value: Any, schema: Optional[Dict[str, Any]] = None) -> Any:
+    """Grok sometimes emits structuredOutput as a JSON string."""
+    if isinstance(value, str):
+        parsed = _try_json(value, schema)
+        return parsed if parsed is not None else value
+    return value
+
+
+def _has_required(obj: Any, schema: Dict[str, Any]) -> bool:
+    if not isinstance(schema, dict):
+        return True
+    expected = schema.get("type")
+    if expected == "object":
+        if not isinstance(obj, dict):
+            return False
+        return all(key in obj for key in schema.get("required") or [])
+    if expected == "array":
+        return isinstance(obj, list)
+    return True
+
+
+def _try_json(text: str, schema: Optional[Dict[str, Any]] = None) -> Any:
+    text = _strip_trailing_tokens(text)
     if not text:
         return None
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return _last_object(text)
+        return _last_object(text, schema)
 
 
-def _last_object(text: str) -> Optional[Any]:
+def _iter_json_values(text: str) -> Iterator[Any]:
     decoder = json.JSONDecoder()
-    last = None
-    for i, ch in enumerate(text):
-        if ch != "{":
-            continue
+    index = 0
+    length = len(text)
+    while index < length:
+        while index < length and text[index] not in "{[":
+            index += 1
+        if index >= length:
+            return
         try:
-            val, _ = decoder.raw_decode(text[i:])
+            val, end = decoder.raw_decode(text, index)
         except json.JSONDecodeError:
+            index += 1
             continue
+        yield val
+        index = end
+
+
+def _last_object(text: str, schema: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+    """Last top-level JSON value. Nested braces are not candidates.
+
+    Optional ``schema``: last value that carries the schema's required keys.
+    """
+    last = None
+    last_match = None
+    for val in _iter_json_values(text):
         last = val
+        if schema is None or _has_required(val, schema):
+            last_match = val
+    if schema is not None and last_match is not None:
+        return last_match
     return last
 
 

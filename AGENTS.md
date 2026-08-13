@@ -13,7 +13,7 @@ This is the team orchestrator. It is not an application feature repo.
 - `feature` implements (including debugger repair, adversarial tests, and `replan --continue`). `audit` is scout → assess → review and must not write outside `.team/work/`.
 - `team review` without a slug is a **commit-range** review (since last `reviewed-*` tag, else last tag, else the branch). `--pr` is optional. Do not assume reviews are PR-only.
 - Past-commits review uses **one** reviewer (`review.range_reviewer`, default grok). PR and feature review use `roles.reviewer` (default both).
-- `team apply <slug>` processes classified review findings (architecture → replan, test → tdd/test-writer, implementation → implementer). Unstructured findings trigger a re-review first.
+- `team apply <slug>` processes classified findings from review **and** guardian (architecture → replan, test → tdd/test-writer, implementation → implementer). Unstructured findings trigger a re-review first. `--seq` uses that same queue, one class at a time.
 - `team apply <slug> --seq` applies one class at a time in feature order (architecture → test → implementation, severity inside each kind) until failure or the queue is empty. Class reviews go to `seq/<id>/`; they must not overwrite `review.md`. On failure, stop, leave the tree, retry the same class or `--skip-failed`. `--reopen <id>` opens an earlier applied/failed class and marks the suffix stale. `team list` shows class ids and status.
 - Manage the past-commits watermark with `team review --list-tags`, `--show-range`, `--mark [ref]`, `--delete-tag`, `--since`, and `--stamp`.
 - Both CLIs run **headless**. Claude needs `-p`; Grok needs `--prompt-file` and `--no-alt-screen`. Do not add `--fullscreen` or drop `-p`.

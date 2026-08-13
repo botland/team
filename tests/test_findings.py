@@ -258,6 +258,18 @@ class FindingsTests(unittest.TestCase):
 
         ids = [row["id"] for row in seq_candidates([arch, impl], seq)]
         self.assertEqual(ids, [finding_id(arch)])
+        guardian = {
+            "kind": "architecture",
+            "severity": "invariant",
+            "title": "[i_to_r] slash taught as legal",
+            "path": "src/b.py",
+            "source": "guardian",
+        }
+        empty = {"applied": [], "skipped": [], "stale": [], "failed": "", "resume": "", "steps": []}
+        self.assertEqual(
+            [row["source"] for row in seq_candidates([arch, guardian], empty)],
+            ["reviewer-fake", "guardian"],
+        )
         rows = latest_seq_rows(seq)
         by_id = {r["id"]: r["status"] for r in rows}
         self.assertEqual(by_id[finding_id(arch)], "reopened")

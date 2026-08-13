@@ -41,9 +41,11 @@ class HostileRuntime:
         actions: Sequence[tuple],
         *,
         phases: Optional[Iterable[str]] = None,
+        num_turns: Optional[int] = None,
     ) -> None:
         self.actions = list(actions)
         self.phases = set(phases) if phases is not None else None
+        self.num_turns = num_turns
         self.calls: List[Dict[str, str]] = []
 
     def _match(self, phase: str) -> bool:
@@ -67,6 +69,7 @@ class HostileRuntime:
                 output=_fake_output(phase, extra),
                 session_id=session_id,
                 raw="",
+                num_turns=self.num_turns,
             )
         output: Dict[str, Any] = {
             "summary": "hostile",
@@ -114,8 +117,15 @@ class HostileRuntime:
                     session_id=session_id,
                     raw=stdout,
                     error="exit %s" % code,
+                    num_turns=self.num_turns,
                 )
-        return Result(success=True, output=output, session_id=session_id, raw="")
+        return Result(
+            success=True,
+            output=output,
+            session_id=session_id,
+            raw="",
+            num_turns=self.num_turns,
+        )
 
 
 @contextmanager
