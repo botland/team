@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from team.gitutil import delta_paths, product_paths, verify_delta
+from team.gitutil import already_dirty_mutations, delta_paths, product_paths, verify_delta
 
 
 class DeltaTests(unittest.TestCase):
@@ -34,6 +34,48 @@ class DeltaTests(unittest.TestCase):
         self.assertEqual(
             product_paths(["src/a.py", ".team/work/s/review.md", "tests/t.py"]),
             ["src/a.py", "tests/t.py"],
+        )
+
+    def test_already_dirty_is_run_start_not_hop_start(self):
+        origin = {"NOTES": "h0"}
+        before = {"NOTES": "h0", "src/a.py": "h1"}
+        after = {"NOTES": "h0", "src/a.py": "h2"}
+        self.assertEqual(
+            already_dirty_mutations(
+                ["src/a.py"], origin, before, after
+            ),
+            [],
+        )
+        self.assertEqual(
+            already_dirty_mutations(
+                ["NOTES"],
+                origin,
+                {"NOTES": "h0"},
+                {"NOTES": "h1"},
+            ),
+            ["NOTES"],
+        )
+
+    def test_already_dirty_skips_work_root_and_cleaned_paths(self):
+        origin = {"src/a.py": "h0", ".team/work/s/x": "w0"}
+        self.assertEqual(
+            already_dirty_mutations(
+                [".team/work/s/x"],
+                origin,
+                {".team/work/s/x": "w0"},
+                {".team/work/s/x": "w1"},
+                exempt_roots=(".team/work",),
+            ),
+            [],
+        )
+        self.assertEqual(
+            already_dirty_mutations(
+                ["src/a.py"],
+                origin,
+                {},
+                {"src/a.py": "h2"},
+            ),
+            [],
         )
 
 

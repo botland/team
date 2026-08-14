@@ -184,6 +184,49 @@ class ApplyUnclassifiedTests(unittest.TestCase):
         state = State.load(work)
         self.assertEqual(state.stop_reason, "needs-classification")
 
+    def test_invoke_accepts_kind_security_as_unclassified_not_actionable(self):
+        from team.config import load_config
+        from team.pipeline import PipelineError, start_feature
+
+        cfg = load_config(
+            self.repo, fake=True, force=True, code_root="src", test_root="tests"
+        )
+        pipe = start_feature(cfg, "brief", "kind-security-invoke")
+        payload = {
+            "summary": "injected",
+            "findings": [_finding("something wrong", kind="security", path="src/greet.py")],
+            "review_markdown": "progress",
+        }
+        hostile = HostileRuntime([emit(payload)], phases=("reviewer-fake",))
+        with register_runtime("fake", hostile):
+            try:
+                pipe.phase_reviewer()
+            except PipelineError as exc:
+                self.fail(
+                    "invoke(enums=False) must accept kind=security then classify, got %s"
+                    % exc
+                )
+        found = collect_review_findings(pipe.work)
+        self.assertTrue(found)
+        self.assertTrue(all(item["kind"] == "unclassified" for item in found), found)
+        self.assertTrue(needs_classify(found))
+        with register_runtime("fake", hostile):
+            rc = main(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "--test-command",
+                    "true",
+                    "apply",
+                    "--no-review",
+                    "kind-security-invoke",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(State.load(pipe.work).stop_reason, "needs-classification")
+        self.assertFalse((pipe.work / "apply-impl-summary.md").is_file())
+
 
 class StaleResultTests(unittest.TestCase):
     def setUp(self):

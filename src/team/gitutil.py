@@ -188,6 +188,34 @@ def verify_delta(
     return ok, bad
 
 
+def already_dirty_mutations(
+    delta: Iterable[str],
+    origin_entries: Dict[str, str],
+    before_entries: Dict[str, str],
+    after_entries: Dict[str, str],
+    *,
+    exempt_roots: Sequence[str] = (),
+) -> List[str]:
+    """Paths this hop mutated that were already dirty when the run started.
+
+    Dirt from earlier hops of the same run is not a hide: repair and later
+    ``apply --seq`` classes must be able to edit those files under their root.
+    """
+    found: List[str] = []
+    exempt = [r for r in exempt_roots if r]
+    for path in delta:
+        if path not in origin_entries:
+            continue
+        if path not in before_entries:
+            continue
+        if before_entries.get(path) == after_entries.get(path):
+            continue
+        if any(under_root(path, root) for root in exempt):
+            continue
+        found.append(path)
+    return found
+
+
 def write_path_list(path: Path, paths: Sequence[str]) -> None:
     write_text(path, "\n".join(paths) + ("\n" if paths else ""))
 
@@ -199,6 +227,7 @@ def describe_verify(
     allowed: Sequence[str],
     head_before: str = "",
     head_after: str = "",
+    already_dirty: Sequence[str] = (),
 ) -> str:
     lines = [
         "phase: %s" % phase,
@@ -213,6 +242,9 @@ def describe_verify(
     if bad:
         lines.append("violations:")
         lines.extend("  %s" % p for p in bad)
+    if already_dirty:
+        lines.append("already_dirty (since run start):")
+        lines.extend("  %s" % p for p in already_dirty)
     return "\n".join(lines) + "\n"
 
 

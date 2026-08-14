@@ -233,6 +233,12 @@ class FakePipelineTests(unittest.TestCase):
         self.assertTrue((work / "diagnosis.md").is_file())
         self.assertTrue((work / "repair-summary.md").is_file())
         self.assertTrue((work / "verify-test-report.md").is_file())
+        dbg = "\n".join(
+            p.read_text(encoding="utf-8")
+            for p in (work / "prompts").glob("*debugger*")
+        )
+        self.assertIn("test-report.md", dbg)
+        self.assertIn("impl-summary.md", dbg)
 
     def test_replan_continue(self):
         self._run(

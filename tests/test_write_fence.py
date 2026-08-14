@@ -138,9 +138,12 @@ class WriteFenceTests(unittest.TestCase):
             with self.assertRaises(PipelineError) as ctx:
                 pipe.phase_implementer()
         self.assertIn("src/x.py", str(ctx.exception))
+        self.assertIn("already-dirty", str(ctx.exception))
+        self.assertNotIn("outside allowed roots", str(ctx.exception))
         verify = (pipe.work / "git" / "verify-implementer.md").read_text(encoding="utf-8")
         self.assertIn("violations:", verify)
         self.assertIn("src/x.py", verify)
+        self.assertIn("already_dirty", verify)
 
     def test_delete_under_other_root_clean_is_a_violation(self):
         pipe = self._pipe()
@@ -210,6 +213,86 @@ class WriteFenceTests(unittest.TestCase):
             % verify,
         )
         self.assertNotIn("no new paths (continuing)", "\n".join(pipe.log_lines))
+
+    def test_later_hop_may_edit_this_run_dirty_file(self):
+        pipe = self._pipe()
+        first = HostileRuntime(
+            [
+                write("src/x.py", "orig\n"),
+                self._write_summary(["src/x.py"]),
+            ],
+            phases=("implementer",),
+        )
+        with register_runtime("fake", first):
+            pipe.phase_implementer()
+        second = HostileRuntime(
+            [
+                write("src/x.py", "orig\nmore\n"),
+                self._write_summary(["src/x.py"]),
+            ],
+            phases=("implementer",),
+        )
+        with register_runtime("fake", second):
+            try:
+                pipe.phase_implementer()
+            except PipelineError as exc:
+                self.fail(
+                    "this-run dirty file under code_root must stay writable, got %s" % exc
+                )
+        verify = (pipe.work / "git" / "verify-implementer.md").read_text(encoding="utf-8")
+        self.assertNotIn("violations:", verify)
+        self.assertIn("src/x.py", verify)
+
+    def test_repair_may_edit_this_run_tests(self):
+        pipe = self._pipe()
+        writer = HostileRuntime(
+            [
+                write("tests/test_new.py", "def test_a():\n    assert True\n"),
+                self._write_summary(["tests/test_new.py"]),
+            ],
+            phases=("test-writer",),
+        )
+        with register_runtime("fake", writer):
+            pipe.phase_test_writer()
+        pipe.state.diagnosis_owner = "test-writer"
+        repairer = HostileRuntime(
+            [
+                write(
+                    "tests/test_new.py",
+                    "def test_a():\n    assert True\n    assert 1\n",
+                ),
+                self._write_summary(["tests/test_new.py"]),
+            ],
+            phases=("repair-test-writer",),
+        )
+        with register_runtime("fake", repairer):
+            try:
+                pipe.phase_repair()
+            except PipelineError as exc:
+                self.fail("repair must be allowed to patch this-run tests, got %s" % exc)
+        verify = (pipe.work / "git" / "verify-repair.md").read_text(encoding="utf-8")
+        self.assertNotIn("violations:", verify)
+        self.assertIn("tests/test_new.py", verify)
+
+    def test_repair_cannot_edit_user_dirty_test(self):
+        (self.repo / "tests" / "test_a.py").write_text("user\n", encoding="utf-8")
+        pipe = self._pipe()
+        pipe.state.diagnosis_owner = "test-writer"
+        repairer = HostileRuntime(
+            [
+                write("tests/test_a.py", "user\npatched\n"),
+                self._write_summary(["tests/test_a.py"]),
+            ],
+            phases=("repair-test-writer",),
+        )
+        with register_runtime("fake", repairer):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.phase_repair()
+        self.assertIn("tests/test_a.py", str(ctx.exception))
+        self.assertIn("already-dirty", str(ctx.exception))
+        verify = (pipe.work / "git" / "verify-repair.md").read_text(encoding="utf-8")
+        self.assertIn("already_dirty", verify)
+        self.assertIn("tests/test_a.py", verify)
 
     def test_unrelated_dirty_file_is_not_a_violation(self):
         (self.repo / "NOTES").write_text("scratch\n", encoding="utf-8")

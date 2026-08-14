@@ -6,10 +6,10 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from team import findings as findings_mod
-from team import gitutil, testhost
+from team import gitutil, style, testhost
 from team.config import (
     AUDIT_PHASE_ORDER,
     PHASE_ORDER,
@@ -372,6 +372,34 @@ class Pipeline:
             return {"head": "", "paths": [], "entries": {}}
         return gitutil.snapshot(self.repo)
 
+    def _run_start_entries(self, phase_before: dict) -> dict:
+        """Content ids dirty when this run began. Missing start falls back to hop start."""
+        start = (self.state.git or {}).get("start")
+        if isinstance(start, dict) and ("entries" in start or "paths" in start):
+            return dict(start.get("entries") or {})
+        return dict(phase_before.get("entries") or {})
+
+    def _fence_error(
+        self,
+        phase: str,
+        roots: List[str],
+        bad: Sequence[str],
+        dirty: Sequence[str],
+    ) -> str:
+        dirty_set = set(dirty)
+        outside = [p for p in bad if p not in dirty_set]
+        parts = []
+        if outside:
+            parts.append(
+                "%s wrote outside allowed roots %s: %s" % (phase, roots, ", ".join(outside))
+            )
+        if dirty:
+            parts.append(
+                "%s mutated already-dirty paths (dirty since run start): %s"
+                % (phase, ", ".join(dirty))
+            )
+        return "; ".join(parts) or ("%s write fence violation" % phase)
+
     def _verify_write(self, phase: str, allowed: List[str], before: Any) -> None:
         if isinstance(before, dict):
             before_snap = before
@@ -388,14 +416,18 @@ class Pipeline:
         )
         b_entries = dict(before_snap.get("entries") or {})
         a_entries = dict(after.get("entries") or {})
-        for path in delta:
-            if path in b_entries and b_entries.get(path) != a_entries.get(path):
-                if any(gitutil.under_root(path, root) for root in (work_root, ".team/work")):
-                    continue
-                if path not in bad:
-                    bad.append(path)
-                    if path in ok:
-                        ok.remove(path)
+        dirty = gitutil.already_dirty_mutations(
+            delta,
+            self._run_start_entries(before_snap),
+            b_entries,
+            a_entries,
+            exempt_roots=(work_root, ".team/work"),
+        )
+        for path in dirty:
+            if path not in bad:
+                bad.append(path)
+            if path in ok:
+                ok.remove(path)
         gitutil.write_path_list(self.work / "git" / ("after-%s.txt" % phase), delta)
         report = gitutil.describe_verify(
             phase,
@@ -404,6 +436,7 @@ class Pipeline:
             roots,
             head_before=str(before_snap.get("head") or ""),
             head_after=str(after.get("head") or ""),
+            already_dirty=dirty,
         )
         write_text(self.work / "git" / ("verify-%s.md" % phase), report)
         head_changed = bool(
@@ -415,9 +448,7 @@ class Pipeline:
             self.log("git verify %s: no root set, advisory only (%d paths)" % (phase, len(delta)))
             return
         if bad:
-            raise PipelineError(
-                "%s wrote outside allowed roots %s: %s" % (phase, roots, ", ".join(bad))
-            )
+            raise PipelineError(self._fence_error(phase, roots, bad, dirty))
         if head_changed:
             self.log(
                 "git verify %s: HEAD changed %s -> %s"
@@ -1248,7 +1279,12 @@ class Pipeline:
         risks = as_list(result.output.get("risks"))
         self.log(
             "guardian %d risk(s)  %s"
-            % (len(risks), findings_mod.format_chain(result.output.get("chain")))
+            % (
+                len(risks),
+                findings_mod.format_chain(
+                    result.output.get("chain"), color=style.color_enabled()
+                ),
+            )
         )
         self._log_items(findings_mod.collect_guardian_findings(self.work))
 
@@ -1589,9 +1625,12 @@ class Pipeline:
             return
         if not ranked:
             self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
-            self.state.stop_reason = "applied"
+            if findings_mod.seq_apply_complete(pool, seq):
+                self.state.stop_reason = "applied"
+                self.log("apply --seq: nothing remaining")
+            else:
+                self.log("apply --seq: nothing remaining but queue not exhausted")
             self.save()
-            self.log("apply --seq: nothing remaining")
             return
 
         while True:
@@ -1607,16 +1646,6 @@ class Pipeline:
                 ]
             ok = self._apply_one_seq(item, related, seq, rereview=rereview)
             seq = findings_mod.load_seq_state(self.work)
-            if ok and related:
-                for rel in related:
-                    row = dict(rel)
-                    row["id"] = findings_mod.finding_id(row)
-                    seq = findings_mod.mark_seq_step(
-                        seq, row, status="applied", hops=["related"]
-                    )
-                findings_mod.write_findings(
-                    self.work, review_findings + guardian, seq=seq
-                )
             if not ok:
                 self._write_followups(seq=seq)
                 self.write_artifact(
@@ -1629,9 +1658,12 @@ class Pipeline:
         seq = findings_mod.load_seq_state(self.work)
         self._write_followups(seq=seq)
         self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
-        self.state.stop_reason = "applied"
+        if findings_mod.seq_apply_complete(pool, seq):
+            self.state.stop_reason = "applied"
+            self.log("apply --seq complete")
+        else:
+            self.log("apply --seq: loop ended but queue not exhausted")
         self.save()
-        self.log("apply --seq complete")
 
     def _apply_one_seq(
         self,
@@ -1655,7 +1687,15 @@ class Pipeline:
         )
         shutil.copyfile(self.work / "apply-plan.md", seq_dir / "plan.md")
         start = self._snapshot()
-        self.log("seq class %s [%s] %s" % (fid, item.get("kind"), item.get("title")))
+        color = style.color_enabled()
+        self.log(
+            "seq class %s [%s] %s"
+            % (
+                fid,
+                style.kind(as_str(item.get("kind")), enabled=color),
+                style.link_tags(as_str(item.get("title")), enabled=color),
+            )
+        )
         hops: List[str] = []
         kind = item.get("kind")
         try:

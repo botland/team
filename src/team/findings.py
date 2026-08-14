@@ -5,6 +5,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import hashlib
 
+from team import style
 from team.util import as_list, as_str, dump_json, load_json
 
 
@@ -164,6 +165,8 @@ def _recorded_review_results(work: Path) -> Optional[List[Dict[str, Any]]]:
     return out or None
 
 
+# Closed link enum (same set as the guardian persona). Valid link is the only
+# kind authority; missing/empty/unknown is unclassified, never architecture.
 _GUARDIAN_LINK_KIND = {
     "r_to_a": "architecture",
     "a_to_t": "test",
@@ -179,24 +182,37 @@ _CHAIN_LABELS = (
     ("i_to_r", "I→R"),
 )
 
+_CHAIN_KEYS = tuple(key for key, _label in _CHAIN_LABELS)
 
-def format_chain(chain: Any) -> str:
+
+def _normalize_guardian_link(value: Any) -> str:
+    return as_str(value).strip().casefold()
+
+
+def _guardian_kind_for_link(link: str) -> str:
+    return _GUARDIAN_LINK_KIND.get(link, "unclassified")
+
+
+def format_chain(chain: Any, *, color: Optional[bool] = None) -> str:
     """One log fragment: R→A ok  A→T gap  T→I ok  I→R fail."""
     if not isinstance(chain, dict):
         return "chain=(none)"
+    if color is None:
+        color = False
     parts = []
     for key, label in _CHAIN_LABELS:
         cell = chain.get(key)
+        colored_label = style.link(label, key=key, enabled=color)
         if not isinstance(cell, dict):
-            parts.append("%s ?" % label)
+            parts.append("%s ?" % colored_label)
             continue
         if cell.get("ok") is True:
-            mark = "ok"
+            mark = style.paint("ok", style.GREEN, enabled=color)
         elif cell.get("ok") is False:
-            mark = "fail"
+            mark = style.paint("fail", style.BOLD, style.RED, enabled=color)
         else:
             mark = "?"
-        parts.append("%s %s" % (label, mark))
+        parts.append("%s %s" % (colored_label, mark))
     return "  ".join(parts)
 
 
@@ -211,17 +227,45 @@ def collect_guardian_findings(work: Path) -> List[Dict[str, Any]]:
     if not isinstance(data, dict):
         return []
     out: List[Dict[str, Any]] = []
+    covered: set = set()
+    has_invariant = False
     for item in as_list(data.get("risks")):
         if not isinstance(item, dict):
             continue
         row = normalize_finding(item, source="guardian")
-        link = as_str(item.get("link")).strip().lower()
-        row["kind"] = _GUARDIAN_LINK_KIND.get(link, "architecture")
+        link = _normalize_guardian_link(item.get("link"))
+        # Link is the only kind authority; explicit risk.kind is overwritten.
+        row["kind"] = _guardian_kind_for_link(link)
         if row["severity"] == "?":
             row["severity"] = "invariant"
         if link:
             row["title"] = "[%s] %s" % (link, row["title"])
+        if link == "invariant":
+            has_invariant = True
+        elif link in _GUARDIAN_LINK_KIND:
+            covered.add(link)
         out.append(row)
+    # Converse of "every risk has a link": every failed chain cell has a row.
+    # invariant covers all cells; a matching risk is the decision for that cell.
+    chain = data.get("chain")
+    if isinstance(chain, dict) and not has_invariant:
+        for key in _CHAIN_KEYS:
+            cell = chain.get(key)
+            if not isinstance(cell, dict) or cell.get("ok") is not False:
+                continue
+            if key in covered:
+                continue
+            note = as_str(cell.get("note"))
+            out.append(
+                {
+                    "severity": "invariant",
+                    "title": "[%s] failed chain cell" % key,
+                    "evidence": note,
+                    "path": "",
+                    "kind": _GUARDIAN_LINK_KIND[key],
+                    "source": "guardian",
+                }
+            )
     return out
 
 
@@ -377,6 +421,33 @@ def seq_candidates(
     return out
 
 
+def seq_apply_complete(
+    findings: Iterable[Dict[str, Any]],
+    seq: Dict[str, Any],
+) -> bool:
+    """Whether --seq may set stop_reason=applied.
+
+    Orthogonal to pick_next is None: stale is done only while resume or
+    failed marks an unresolved prefix. Leftover stale with both empty is
+    a dead-letter suffix, not a finished queue.
+    """
+    actionable = {
+        finding_id(item)
+        for item in findings
+        if (item.get("kind") or "") in ACTIONABLE
+    }
+    applied = {as_str(x) for x in as_list(seq.get("applied")) if as_str(x)}
+    skipped = {as_str(x) for x in as_list(seq.get("skipped")) if as_str(x)}
+    stale = {as_str(x) for x in as_list(seq.get("stale")) if as_str(x)}
+    leftover = actionable - applied - skipped
+    unresolved = bool(as_str(seq.get("resume")) or as_str(seq.get("failed")))
+    if unresolved:
+        return False
+    if stale:
+        return False
+    return not leftover
+
+
 def pick_next_seq(
     findings: Iterable[Dict[str, Any]],
     seq: Dict[str, Any],
@@ -422,8 +493,11 @@ def mark_seq_step(
         resume = ""
     if status == "applied":
         applied.append(fid)
+        # Prefix applied|skipped restores the suffix of that reopen.
+        stale = []
     elif status == "skipped":
         skipped.append(fid)
+        stale = []
     elif status == "failed":
         failed = fid
     elif status == "stale":
@@ -495,7 +569,7 @@ def seq_item_from_log(seq: Dict[str, Any], fid: str) -> Dict[str, Any]:
 
 
 def latest_seq_rows(seq: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """One row per class id, last log status, overlaying current sets."""
+    """One row per class id; status is current set membership (pending if none)."""
     rows: Dict[str, Dict[str, Any]] = {}
     order: List[str] = []
     for step in as_list(seq.get("steps")):
@@ -516,9 +590,8 @@ def latest_seq_rows(seq: Dict[str, Any]) -> List[Dict[str, Any]]:
     out = []
     for fid in order:
         row = dict(rows[fid])
-        overlay = seq_status_for(row, seq)
-        if overlay:
-            row["status"] = overlay
+        # Displayed status is set membership, not last log (stale log ≠ still stale).
+        row["status"] = seq_status_for(row, seq)
         out.append(row)
     return out
 
@@ -598,29 +671,38 @@ def format_console_lines(
     limit: int = CONSOLE_LIMIT,
     sort: bool = False,
     more_hint: str = "",
+    color: Optional[bool] = None,
 ) -> List[str]:
-    """Plain CLI lines for a finished role. Empty if there is nothing to show."""
+    """CLI lines for a finished role. Empty if there is nothing to show."""
     rows = [item for item in items if item]
     if not rows:
         return []
+    if color is None:
+        color = style.color_enabled()
     shown = take_important(rows, limit) if sort else rows[:limit]
     leftover = len(rows) - len(shown)
     lines: List[str] = []
     for i, item in enumerate(shown, 1):
-        title = as_str(item.get("title")) or "(untitled)"
+        title = style.link_tags(as_str(item.get("title")) or "(untitled)", enabled=color)
         sev = as_str(item.get("severity"))
-        kind = as_str(item.get("kind"))
+        kind_name = as_str(item.get("kind"))
         path = as_str(item.get("path"))
-        tags = "/".join(p for p in (sev, kind) if p and p != "?")
-        loc = "  %s" % path if path else ""
-        lines.append("  %d. [%s] %s%s" % (i, tags or "?", title, loc))
+        tags = style.tag_pair(sev, kind_name, enabled=color)
+        loc = "  %s" % style.path(path, enabled=color) if path else ""
+        lines.append("  %d. [%s] %s%s" % (i, tags, title, loc))
         ev = as_str(item.get("evidence")).strip().replace("\n", " ")
         if ev:
             if len(ev) > 140:
                 ev = ev[:137] + "..."
-            lines.append("      %s" % ev)
+            lines.append("      %s" % style.dim(ev, enabled=color))
     if leftover > 0:
-        lines.append("  +%d more in %s" % (leftover, more_hint or "followups.md"))
+        lines.append(
+            "  %s"
+            % style.dim(
+                "+%d more in %s" % (leftover, more_hint or "followups.md"),
+                enabled=color,
+            )
+        )
     return lines
 
 

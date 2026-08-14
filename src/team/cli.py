@@ -31,6 +31,7 @@ from team.pipeline import (
 )
 from team import findings as findings_mod
 from team import gitutil
+from team import style
 from team.state import State, require_work, work_dir
 from team.util import as_str, engine_root, load_json, slugify, write_text
 
@@ -232,7 +233,8 @@ def _parser() -> argparse.ArgumentParser:
         metavar="ID",
         help=(
             "With --seq: reopen an applied or failed class, mark later classes "
-            "stale, and stop. Next --seq retries that class."
+            "stale, and stop. Next --seq retries that class. The suffix returns "
+            "to the queue when that class is next applied or skipped."
         ),
     )
     p_ap.set_defaults(func=cmd_apply)
@@ -782,13 +784,28 @@ def cmd_list(args) -> int:
         state = State.load(child)
         print(
             "%-28s %-8s %-18s %s"
-            % (state.slug, state.mode, state.phase, state.stop_reason or "(in progress)")
+            % (
+                state.slug,
+                state.mode,
+                state.phase,
+                style.status(state.stop_reason or "(in progress)"),
+            )
         )
+        color = style.color_enabled()
         for row in findings_mod.latest_seq_rows(findings_mod.load_seq_state(child)):
-            title = (row.get("title") or "")[:40]
+            title = style.link_tags((row.get("title") or "")[:40], enabled=color)
             print(
-                "  %-12s %-10s %-16s %s"
-                % (row.get("id"), row.get("status"), row.get("kind") or "-", title)
+                "  %s %s %s %s"
+                % (
+                    style.ljust(str(row.get("id") or ""), 12, style.dim, enabled=color),
+                    style.ljust(
+                        str(row.get("status") or ""), 10, style.status, enabled=color
+                    ),
+                    style.ljust(
+                        str(row.get("kind") or "-"), 16, style.kind, enabled=color
+                    ),
+                    title,
+                )
             )
     if not found:
         print("no runs in %s" % root)
@@ -803,7 +820,7 @@ def cmd_status(args) -> int:
     print("repo: %s" % state.repo)
     print("work: %s" % work)
     print("phase: %s" % state.phase)
-    print("stop: %s" % (state.stop_reason or "(in progress)"))
+    print("stop: %s" % style.status(state.stop_reason or "(in progress)"))
     print("code_root: %s" % state.code_root)
     print("test_root: %s" % state.test_root)
     print("assign: %s" % _fmt_roles(state.assignment or default_roles()))
@@ -811,10 +828,20 @@ def cmd_status(args) -> int:
     if rows:
         print("")
         print("%-12s %-10s %-16s %s" % ("CLASS", "STATUS", "KIND", "TITLE"))
+        color = style.color_enabled()
         for row in rows:
             print(
-                "%-12s %-10s %-16s %s"
-                % (row.get("id"), row.get("status"), row.get("kind") or "-", row.get("title") or "")
+                "%s %s %s %s"
+                % (
+                    style.ljust(str(row.get("id") or ""), 12, style.dim, enabled=color),
+                    style.ljust(
+                        str(row.get("status") or ""), 10, style.status, enabled=color
+                    ),
+                    style.ljust(
+                        str(row.get("kind") or "-"), 16, style.kind, enabled=color
+                    ),
+                    style.link_tags(str(row.get("title") or ""), enabled=color),
+                )
             )
     print("")
     if state.mode == "audit":
@@ -987,7 +1014,7 @@ def _fmt_roles(roles: dict) -> str:
 
 def _print_done(pipe) -> None:
     print("work: %s" % pipe.work)
-    print("stop: %s" % (pipe.state.stop_reason or pipe.state.phase))
+    print("stop: %s" % style.status(pipe.state.stop_reason or pipe.state.phase))
     review = pipe.work / "review.md"
     if review.is_file():
         print("review: %s" % review)
