@@ -192,26 +192,35 @@ def claude_cmd(
     effort = resolve_effort(extra.get("effort"), CLAUDE_EFFORT_LADDER)
     if effort:
         cmd.extend(["--effort", effort])
+    cmd.extend(["--permission-mode", "acceptEdits"])
     if may_write(capability):
-        cmd.extend(["--permission-mode", "acceptEdits"])
         allow, deny = write_tool_path_filters(capability, extra)
-        for glob in _write_tool_globs(allow):
-            cmd.extend(["--allowedTools", glob])
-        for glob in _write_tool_globs(deny):
-            cmd.extend(["--disallowedTools", glob])
+        # Same shape as Grok's write hop: read tools kept, the writer scoped
+        # to the role roots, the terminal off. write-* is not execute.
+        cmd.extend(
+            [
+                "--allowedTools",
+                _claude_tool_list(list(_CLAUDE_READ_TOOLS) + _write_tool_globs(allow)),
+                "--disallowedTools",
+                _claude_tool_list(_CLAUDE_UNSCOPED_WRITE + _write_tool_globs(deny)),
+            ]
+        )
         return cmd
     # Fail closed: unknown capabilities are inspect, not writers.
-    allowed = "Read,Grep,Glob,LS"
+    allowed = list(_CLAUDE_READ_TOOLS)
+    denied = ["Edit", "Write", "NotebookEdit"]
     if capability == "execute":
-        allowed += ",Bash"
+        allowed.append("Bash")
+    else:
+        # Grok's --tools allowlist withholds run_terminal_cmd from an inspect
+        # hop; an unlisted tool on this side is not refused, so say it.
+        denied.append("Bash")
     cmd.extend(
         [
-            "--permission-mode",
-            "acceptEdits",
             "--allowedTools",
-            allowed,
+            _claude_tool_list(allowed),
             "--disallowedTools",
-            "Edit,Write,NotebookEdit",
+            _claude_tool_list(denied),
         ]
     )
     return cmd
@@ -329,6 +338,28 @@ def write_tool_path_filters(
             )
         )
     return allow, deny
+
+
+_CLAUDE_READ_TOOLS = ("Read", "Grep", "Glob", "LS")
+
+# Writers with no path filter, and the terminal. A write hop is not an execute
+# hop: Grok's --tools allowlist already withholds run_terminal_cmd, and an
+# unscoped writer would defeat the path globs beside it.
+_CLAUDE_UNSCOPED_WRITE = ["Bash", "NotebookEdit"]
+
+
+def _claude_tool_list(specs: List[str]) -> str:
+    """One comma-joined value per flag. Claude's tool filter syntax is
+    comma-separated, so a comma inside a root cannot be expressed in it --
+    fail loudly rather than emit a filter that silently means something else.
+    Repeating the flag instead would leave union-vs-last-wins undecided.
+    """
+    for spec in specs:
+        if "," in spec:
+            raise RuntimeError_(
+                "path is not expressible as a Claude tool filter (comma): %s" % spec
+            )
+    return ",".join(specs)
 
 
 _WRITE_TOOLS = ("Edit", "Write")

@@ -104,6 +104,20 @@ def grok_read_tools_enabled(argv: Sequence[object]) -> bool:
     return all(name in tools for name in _GROK_READ_TOOLS)
 
 
+def grok_write_denied(argv: Sequence[object], rel: str) -> bool:
+    """Whether a --deny glob (or a disallowed writer) refuses this path.
+
+    The counterpart of ``claude_write_denied``: the half of the two filter
+    languages that means the same thing on both.
+    """
+    assert_grok_write_language(argv)
+    tools = set(_split_tool_list(_flag_values(argv, "--tools")))
+    disallowed = set(_split_tool_list(_flag_values(argv, "--disallowed-tools")))
+    if "search_replace" in disallowed or (tools and "search_replace" not in tools):
+        return True
+    return any(path_glob_matches(glob, rel) for glob in _flag_values(argv, "--deny"))
+
+
 def grok_search_replace_permitted(argv: Sequence[object], rel: str) -> bool:
     """Whether this argv lets Grok ``search_replace`` the repo-relative path.
 

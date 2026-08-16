@@ -20,6 +20,7 @@ from team.config import PHASE_ORDER, ROLES, may_write, schema_path
 from team.pipeline import OptionalPhaseError, PipelineError, start_feature
 from team.runners import (
     FakeRuntime,
+    RuntimeError_,
     _run,
     _write_tool_globs,
     claude_cmd,
@@ -28,11 +29,20 @@ from team.runners import (
     write_tool_path_filters,
 )
 from team.util import extract_json, load_json
+from tests.support.claude_argv import (
+    claude_allowed_write_roots,
+    claude_flag_occurrences,
+    claude_read_tools_enabled,
+    claude_terminal_permitted,
+    claude_tool_permitted,
+    claude_write_denied,
+)
 from tests.support.grok_argv import (
     GrokArgvNotGrokLanguage,
     grok_flag_values,
     grok_read_tools_enabled,
     grok_search_replace_permitted,
+    grok_write_denied,
     path_glob_matches,
 )
 from tests.support.hostile import HostileRuntime, emit, register_runtime
@@ -888,6 +898,137 @@ class PathScopeTests(unittest.TestCase):
         )
         self.assertFalse(any("//" in g for g in globs), globs)
         self.assertEqual(_write_tool_globs(["."]), [])
+
+
+class AdapterCapabilityParityTests(unittest.TestCase):
+    """Two adapters, one capability model. The seam is claude_cmd ↔ grok_cmd.
+
+    "Map the same capabilities" was a sentence in AGENTS.md that nothing
+    checked, and the two argv builders drifted: Grok scoped both writers and
+    withheld the terminal from a write hop, Claude scoped neither. The git
+    fence still failed the hop afterwards, so this was never an escape --
+    but the Claude path failed *after* the writes had landed where the Grok
+    path prevented them.
+
+    Each question is asked of both adapters through their own semantic
+    double, and the answers must agree.
+    """
+
+    EXTRA = {
+        "test_root": "tests",
+        "code_root": "src/team",
+        "submodule_paths": ["vendor/console"],
+    }
+    DOT_EXTRA = {
+        "test_root": "tests",
+        "code_root": ".",
+        "submodule_paths": ["vendor/console"],
+    }
+    CAPABILITIES = ("read-only", "write-tests", "write-code", "execute", "future-thing")
+    PATHS = ("tests/a.py", "src/team/a.py", "README.md", "vendor/console/x.ts")
+
+    def _pair(self, capability, extra):
+        claude = claude_cmd(
+            prompt="hi",
+            schema=None,
+            capability=capability,
+            session_id="s",
+            resume=False,
+            extra=extra,
+        )
+        grok = grok_cmd(
+            prompt_path=Path("/tmp/p.md"),
+            schema=None,
+            capability=capability,
+            session_id="s",
+            resume=False,
+            repo=Path("/tmp/repo"),
+            extra=extra,
+        )
+        return claude, grok
+
+    def test_denied_write_roots_are_the_same_on_every_adapter(self):
+        """Refusal is the half of the two filter languages that must match."""
+        for extra in (self.EXTRA, self.DOT_EXTRA):
+            for capability in self.CAPABILITIES:
+                claude, grok = self._pair(capability, extra)
+                for rel in self.PATHS:
+                    with self.subTest(capability=capability, rel=rel, root=extra["code_root"]):
+                        self.assertEqual(
+                            claude_write_denied(claude, rel),
+                            grok_write_denied(grok, rel),
+                            "adapters disagree on refusing %s under %s\nclaude=%s\ngrok=%s"
+                            % (rel, capability, claude, grok),
+                        )
+
+    def test_claude_allow_is_pre_approval_and_the_fence_is_the_boundary(self):
+        """Recorded residual, not an approved design.
+
+        Grok's --allow is a real allowlist: write-tests cannot touch a path
+        outside test_root. Claude has no equivalent under acceptEdits -- an
+        Edit(tests/**) entry pre-approves, it does not refuse the rest -- so
+        a path in neither root set is reachable on one adapter and not the
+        other, and only the git write fence (_verify_write) catches it.
+
+        Premise, in the words that would make this test wrong: if the Claude
+        CLI ever gains an allowlist mode that fails closed for edits, this
+        asymmetry should be closed in argv and this test deleted.
+        """
+        claude, grok = self._pair("write-tests", self.EXTRA)
+        self.assertEqual(claude_allowed_write_roots(claude), ["tests/**"])
+        self.assertFalse(grok_search_replace_permitted(grok, "README.md"))
+        self.assertFalse(claude_write_denied(claude, "README.md"))
+
+    def test_no_capability_lets_one_adapter_run_a_terminal_and_not_the_other(self):
+        for capability in self.CAPABILITIES:
+            claude, grok = self._pair(capability, self.EXTRA)
+            tools = grok_flag_values(grok, "--tools")
+            grok_terminal = bool(tools) and "run_terminal_cmd" in tools[0].split(",")
+            with self.subTest(capability=capability):
+                self.assertEqual(
+                    claude_terminal_permitted(claude),
+                    grok_terminal,
+                    "terminal differs on %s: claude=%s grok=%s" % (capability, claude, grok),
+                )
+        # And it is only the execute capability that has one at all.
+        claude, _grok = self._pair("execute", self.EXTRA)
+        self.assertTrue(claude_terminal_permitted(claude))
+        claude, _grok = self._pair("write-code", self.EXTRA)
+        self.assertFalse(claude_terminal_permitted(claude))
+
+    def test_every_capability_keeps_read_tools_on_both_adapters(self):
+        for capability in self.CAPABILITIES:
+            claude, grok = self._pair(capability, self.EXTRA)
+            with self.subTest(capability=capability):
+                self.assertTrue(claude_read_tools_enabled(claude), claude)
+                self.assertTrue(grok_read_tools_enabled(grok), grok)
+
+    def test_claude_tool_filter_flags_appear_once(self):
+        """Repeated occurrences leave union-vs-last-wins to the CLI.
+
+        A last-wins CLI would silently narrow the scope to the final root.
+        """
+        for capability in self.CAPABILITIES:
+            for extra in (self.EXTRA, self.DOT_EXTRA):
+                claude, _grok = self._pair(capability, extra)
+                for flag in ("--allowedTools", "--disallowedTools"):
+                    with self.subTest(capability=capability, flag=flag):
+                        self.assertEqual(claude_flag_occurrences(claude, flag), 1, claude)
+
+    def test_a_path_that_cannot_be_a_claude_filter_fails_loudly(self):
+        with self.assertRaises(RuntimeError_):
+            claude_cmd(
+                prompt="hi",
+                schema=None,
+                capability="write-tests",
+                session_id="s",
+                resume=False,
+                extra={"test_root": "te,sts", "code_root": "src"},
+            )
+
+    def test_no_write_capability_lets_an_unscoped_writer_through(self):
+        claude, _grok = self._pair("write-tests", self.EXTRA)
+        self.assertFalse(claude_tool_permitted(claude, "NotebookEdit"), claude)
 
 
 class FakeOutputSchemaSeamTests(unittest.TestCase):
