@@ -22,8 +22,10 @@ sys.path.insert(0, str(ROOT))
 
 from team.cli import stamp_message
 from team.config import load_config
+from team.findings import collect_review_findings
 from team.pipeline import start_feature
 from team.testhost import compare, render_report
+from team.util import dump_json
 from tests.support.repo import init_repo
 
 
@@ -79,6 +81,57 @@ class ReportFallbackTests(unittest.TestCase):
         text = render_report("Apply test run", final, compare(base, final))
         self.assertIn("t_new", text)
         self.assertNotIn("- new failures: (none)", text)
+
+
+class CompareVerdictTests(unittest.TestCase):
+    """A green final run is a PASS whatever the baseline said."""
+
+    def test_pass_verdict_does_not_depend_on_the_baseline_status(self):
+        final = {"status": "PASS", "failing": [], "names_unparsed": False}
+        for base_status in ("PASS", "FAIL", "UNVERIFIED"):
+            with self.subTest(baseline=base_status):
+                base = {"status": base_status, "failing": ["t_a"]}
+                self.assertEqual(compare(base, final)["verdict"], "PASS")
+
+
+class DigestPinVacuityTests(unittest.TestCase):
+    """An attempt that recorded nothing must not mean "trust every file"."""
+
+    def _work(self, tmp: Path, last_review) -> Path:
+        work = tmp / "work"
+        (work / "prompts").mkdir(parents=True)
+        dump_json(
+            work / "prompts" / "reviewer-stale.result.json",
+            {
+                "summary": "left over from an earlier run",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "title": "stale",
+                        "evidence": "e",
+                        "path": "src/a.py",
+                        "kind": "implementation",
+                    }
+                ],
+            },
+        )
+        state = {"slug": "s", "brief": "b", "repo": str(tmp), "engine_root": str(tmp)}
+        if last_review is not None:
+            state["last_review"] = last_review
+        dump_json(work / "state.json", state)
+        return work
+
+    def test_recorded_attempt_with_no_results_collects_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self._work(Path(tmp), {"attempt": 2, "results": []})
+            self.assertEqual(collect_review_findings(work), [])
+
+    def test_no_attempt_recorded_still_reads_what_is_on_disk(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = self._work(Path(tmp), None)
+            self.assertEqual(
+                [row["title"] for row in collect_review_findings(work)], ["stale"]
+            )
 
 
 class UnverifiedSuiteSkipTests(unittest.TestCase):

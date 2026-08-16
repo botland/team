@@ -283,8 +283,6 @@ def compare(baseline: Dict, final: Dict) -> Dict:
         # Only a side that did not run is UNVERIFIED. A later product FAIL
         # is still a FAIL when the baseline never ran.
         verdict = "UNVERIFIED"
-    elif final_status == "PASS" and base_status == "FAIL":
-        verdict = "PASS"
     elif final_status == "PASS":
         verdict = "PASS"
     elif names_unparsed:

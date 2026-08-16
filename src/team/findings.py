@@ -98,11 +98,11 @@ def collect_review_findings(work: Path) -> List[Dict[str, Any]]:
     else:
         by_name = {spec["name"]: spec for spec in recorded}
         paths = []
-        extras = []
         for path in sorted(prompts.glob("reviewer-*.result.json")):
             spec = by_name.get(path.name)
             if spec is None:
-                extras.append(path.name)
+                # Not this attempt's output. unrecorded_reviewer_results() is
+                # where a caller asks which files were left behind.
                 continue
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             expected = as_str(spec.get("digest"))
@@ -155,16 +155,19 @@ def _recorded_review_results(work: Path) -> Optional[List[Dict[str, Any]]]:
     if not isinstance(data, dict):
         return None
     last = data.get("last_review")
-    if not isinstance(last, dict):
+    if not isinstance(last, dict) or not last:
+        # No review attempt was ever recorded (a feature run, or a state file
+        # from before the pin existed): there is nothing to pin against, so
+        # read what is on disk.
         return None
-    rows = as_list(last.get("results"))
-    if not rows:
-        return None
+    # An attempt that recorded zero results recorded zero results. Returning
+    # None there degraded the pin to "trust every reviewer-* file lying
+    # around", which is the failure it exists to prevent.
     out = []
-    for item in rows:
+    for item in as_list(last.get("results")):
         if isinstance(item, dict) and as_str(item.get("name")):
             out.append(item)
-    return out or None
+    return out
 
 
 def unrecorded_reviewer_results(work: Path, recorded: List[Dict[str, Any]]) -> List[str]:
