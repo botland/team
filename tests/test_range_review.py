@@ -10,7 +10,12 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from team.cli import main
-from team.gitutil import last_dedicated_tag, resolve_review_base, stamp_reviewed
+from team.gitutil import (
+    last_any_tag,
+    last_dedicated_tag,
+    resolve_review_base,
+    stamp_reviewed,
+)
 from team.state import State
 
 
@@ -47,6 +52,34 @@ class RangeReviewTests(unittest.TestCase):
         base, kind = resolve_review_base(self.repo)
         self.assertEqual(kind, "dedicated")
         self.assertEqual(base, "reviewed-20200101-0000")
+
+    def test_both_watermark_fallbacks_order_tags_the_same_way(self):
+        """One rule for "the last tag", whichever pattern asks for it.
+
+        --mark <ref> stamps an arbitrary ref, so a tag created today at an
+        old commit is a deliberate rewind. describe --tags picked the
+        topologically nearest tag instead and silently ignored it, so the
+        two fallbacks chose different bases for the same history.
+        """
+        for text in ("two", "three"):
+            (self.repo / "README").write_text(text + "\n", encoding="utf-8")
+            _git(self.repo, "add", "README")
+            _git(self.repo, "commit", "-m", text)
+        old = subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD~2"], text=True
+        ).strip()
+        # Newest tag by topology is at HEAD~1; the rewind is stamped later.
+        _git(self.repo, "tag", "v0.2", "HEAD~1")
+        _git(self.repo, "tag", "v0.1-rewind", old)
+        self.assertEqual(last_any_tag(self.repo), "v0.1-rewind")
+        base, kind = resolve_review_base(self.repo)
+        self.assertEqual((base, kind), ("v0.1-rewind", "tag"))
+        _git(self.repo, "tag", "reviewed-20200102-0000", "HEAD~1")
+        _git(self.repo, "tag", "reviewed-20200101-0000", old)
+        self.assertEqual(last_dedicated_tag(self.repo), "reviewed-20200101-0000")
+        self.assertEqual(
+            resolve_review_base(self.repo), ("reviewed-20200101-0000", "dedicated")
+        )
 
     def test_review_since_dedicated_tag(self):
         _git(self.repo, "tag", "reviewed-20200101-0000")

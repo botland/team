@@ -726,30 +726,36 @@ def describe_verify(
 REVIEWED_PREFIX = "reviewed-"
 
 
-def last_dedicated_tag(repo: Path) -> str:
-    """Newest `reviewed-*` tag reachable from HEAD (vibe.rc gittag)."""
-    out = git(
-        repo,
-        "tag",
-        "--list",
-        REVIEWED_PREFIX + "*",
-        "--merged",
-        "HEAD",
-        "--sort=-creatordate",
-        check=False,
-    )
-    for line in out.splitlines():
+def newest_reachable_tag(repo: Path, pattern: str = "") -> str:
+    """Newest tag reachable from HEAD, by creation date. One ordering rule.
+
+    "The last tag" had two implementations: `tag --list --sort=-creatordate`
+    for the `reviewed-*` watermark and `describe --tags --abbrev=0`, which is
+    nearest *by topology*, for the fallback. They disagree whenever a tag is
+    created out of order -- which is exactly what `--mark <ref>` invites,
+    since it stamps an arbitrary ref. Last stamped is the reading the
+    watermark needs: marking an older commit today is a deliberate rewind,
+    and a topological rule would silently ignore it.
+    """
+    args = ["tag", "--list"]
+    if pattern:
+        args.append(pattern)
+    args.extend(["--merged", "HEAD", "--sort=-creatordate"])
+    for line in git(repo, *args, check=False).splitlines():
         tag = line.strip()
         if tag:
             return tag
     return ""
 
 
+def last_dedicated_tag(repo: Path) -> str:
+    """Newest `reviewed-*` tag reachable from HEAD (vibe.rc gittag)."""
+    return newest_reachable_tag(repo, REVIEWED_PREFIX + "*")
+
+
 def last_any_tag(repo: Path) -> str:
-    out = git(repo, "describe", "--tags", "--abbrev=0", check=False).strip()
-    if not out or "fatal" in out.lower() or "error" in out.lower():
-        return ""
-    return out
+    """Newest tag of any name reachable from HEAD."""
+    return newest_reachable_tag(repo)
 
 
 def resolve_review_base(repo: Path, since: str = "") -> Tuple[str, str]:
