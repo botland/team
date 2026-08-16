@@ -49,6 +49,7 @@ from team.util import (
     engine_root,
     explicit_roots,
     load_json,
+    posix,
     normalize_root,
     write_text,
 )
@@ -166,6 +167,9 @@ class Pipeline:
         # Live warm chains, (role, runtime, capability) -> session + context.
         # In-process only: a resumed run has no live session and starts cold.
         self._warm_chains: Dict[tuple, Dict[str, Any]] = {}
+        # Paths this process wrote itself, path -> content id. The fence bills
+        # a hop for what the hop wrote, not for these.
+        self._orchestrator_writes: Dict[str, str] = {}
         self._seed_census()
 
     def log(self, msg: str) -> None:
@@ -844,6 +848,47 @@ class Pipeline:
     def _census_cache(self, key: str) -> Path:
         return self.repo / ".team" / "census" / ("%s.md" % key)
 
+    def _publish_census(self) -> None:
+        """Copy this slug's census into the repo-wide cache.
+
+        ``.team/census`` is deliberately **not** fence-exempt: it is durable
+        and repo-wide, so anything a hop could leave there would be an input
+        to every later run's prompts. The write is declared instead, so the
+        fence bills the hop for what the hop wrote and not for this.
+        """
+        key = self._census_key()
+        if not key:
+            return
+        text = self.read_artifact(CENSUS_ARTIFACT)
+        if not text.strip():
+            return
+        cached = self._census_cache(key)
+        if cached.is_file():
+            return
+        # Sidecar first: a reader that finds the map without it refuses to
+        # reuse, so the incomplete state is the safe one.
+        dump_json(
+            cached.with_suffix(".json"),
+            {
+                "head": key,
+                "slug": self.state.slug,
+                "entries": self._census_entries(),
+            },
+        )
+        write_text(cached, text)
+        self._note_orchestrator_write(cached)
+        self._note_orchestrator_write(cached.with_suffix(".json"))
+
+    def _census_entries(self) -> Dict[str, str]:
+        """Content ids of the dirty tree this census describes."""
+        snap = gitutil.snapshot(self.repo)
+        entries = dict(snap.get("entries") or {})
+        return {
+            rel: cid
+            for rel, cid in entries.items()
+            if rel in set(gitutil.product_paths(entries.keys()))
+        }
+
     def _seed_census(self) -> None:
         """Reuse this repo state's census instead of buying it again.
 
@@ -866,9 +911,18 @@ class Pipeline:
         if not cached.is_file() or not sidecar.is_file():
             return
         text = cached.read_text(encoding="utf-8")
-        stamped = set(as_list(load_json(sidecar).get("dirty")))
-        now = set(gitutil.product_paths(gitutil.porcelain_paths(self.repo)))
-        moved = sorted((now - stamped) | (stamped - now))
+        # Content ids, not a path list. A path dirty when the census was
+        # written and still dirty now, with entirely different bytes, is in
+        # both path sets and would never be named -- the map would assert a
+        # fact about a file it has never seen. gitutil.snapshot already
+        # derives these and the fence already trusts them.
+        stamped = dict(load_json(sidecar).get("entries") or {})
+        now = self._census_entries()
+        moved = sorted(
+            rel
+            for rel in set(now) | set(stamped)
+            if now.get(rel) != stamped.get(rel)
+        )
         if moved:
             text = text.rstrip() + "\n\n## Changed since this census\n\n" + "".join(
                 "- %s\n" % rel for rel in moved[:_CENSUS_MOVED_MAX]
@@ -896,18 +950,7 @@ class Pipeline:
             return
         self.write_artifact(CENSUS_ARTIFACT, text)
         self.log("census written")
-        key = self._census_key()
-        if not key:
-            return
-        write_text(self._census_cache(key), text)
-        dump_json(
-            self._census_cache(key).with_suffix(".json"),
-            {
-                "head": key,
-                "slug": self.state.slug,
-                "dirty": gitutil.product_paths(gitutil.porcelain_paths(self.repo)),
-            },
-        )
+        self._publish_census()
 
     def _engineering_rules(self) -> str:
         path = engine_root() / "docs" / "engineering.md"
@@ -958,6 +1001,40 @@ class Pipeline:
             return dict(start.get("entries") or {})
         return dict(phase_before.get("entries") or {})
 
+    def _note_orchestrator_write(self, path: Path) -> None:
+        """Record a path this process wrote, with the bytes it wrote.
+
+        The fence's question is "did the *hop* write outside its roots". A
+        sibling reviewer thread's window is open while orchestrator code
+        writes the census cache, so without this the orchestrator's own write
+        is billed to whichever hop happens to be running. The alternative --
+        exempting the path by name -- would make it hop-writable, and a
+        durable repo-wide path a hop can write is an input to every later run.
+
+        Content id, not just the path: a hop that later changes those bytes
+        no longer matches and is a violation again. Writing byte-identical
+        content is the only way to be forgiven, which changes nothing.
+        """
+        try:
+            rel = posix(str(path.resolve().relative_to(self.repo.resolve())))
+        except (OSError, ValueError):
+            return
+        with self._state_lock:
+            self._orchestrator_writes[rel] = gitutil.content_id(self.repo, rel)
+
+    def _drop_orchestrator_writes(self, delta: List[str], after: dict) -> List[str]:
+        """Remove paths this process wrote and the hop left alone."""
+        with self._state_lock:
+            mine = dict(self._orchestrator_writes)
+        if not mine:
+            return delta
+        entries = dict(after.get("entries") or {})
+        return [
+            rel
+            for rel in delta
+            if not (rel in mine and entries.get(rel) == mine[rel])
+        ]
+
     def _verify_write(
         self,
         phase: str,
@@ -972,6 +1049,7 @@ class Pipeline:
             before_snap = {"head": "", "paths": list(before or []), "entries": {}}
         after = self._snapshot()
         delta = gitutil.changed_paths(self.repo, before_snap, after)
+        delta = self._drop_orchestrator_writes(delta, after)
         work_root = ".team/work/%s" % self.state.slug
         roots = explicit_roots(allowed)
         denied_roots = explicit_roots(denied or [])

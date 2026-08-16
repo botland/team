@@ -159,10 +159,13 @@ def name_status_paths(records: Sequence[str]) -> List[str]:
     return out
 
 
-# Orchestrator-owned trees inside .team. Not all of .team: a hop rewriting
-# .team/config.toml is still a violation, because that is the project's
-# configuration and not the orchestrator's scratch.
-PROTOCOL_ROOTS = (".team/work", ".team/census")
+# The one orchestrator-owned tree the fence ignores. Deliberately just this
+# one: it is per-slug, ephemeral, and already holds model-authored artifacts
+# scoped to that run. A durable, repo-wide path (the census cache) is *not*
+# exempt -- an exemption that outlives the run makes anything a hop leaves
+# there an input to every later run. The orchestrator writes such caches
+# outside every hop's fence window instead, which needs no exemption.
+PROTOCOL_ROOTS = (".team/work",)
 
 
 def _is_team_work(rel: str) -> bool:
@@ -184,6 +187,11 @@ def porcelain_paths(repo: Path) -> List[str]:
         if not _is_team_work(rel):
             paths.add(rel)
     return sorted(paths)
+
+
+def content_id(repo: Path, rel: str) -> str:
+    """Public name for the fence's content identity of one path."""
+    return _content_id(repo, rel)
 
 
 def _content_id(repo: Path, rel: str) -> str:
