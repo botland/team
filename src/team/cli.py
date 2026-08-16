@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
@@ -24,6 +23,7 @@ from team.config import (
     format_toml_value,
     load_config,
     resolve_phase,
+    seed_config_text,
     write_config_file,
 )
 from team.pipeline import (
@@ -61,7 +61,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("suspended: %s" % exc, file=sys.stderr)
         _print_usage_on_error(args)
         return 3
-    except (PipelineError, findings_mod.FindingsError) as exc:
+    except (
+        PipelineError,
+        findings_mod.FindingsError,
+        gitutil.GitError,
+        runners.RuntimeError_,
+    ) as exc:
+        # Every error this program raises deliberately. A git failure or an
+        # unknown runtime name is a user-facing error, not a traceback.
         print("error: %s" % exc, file=sys.stderr)
         _print_usage_on_error(args)
         return 1
@@ -1109,9 +1116,15 @@ def cmd_init(args) -> int:
     if dest.exists():
         print("already exists: %s" % dest)
         return 0
-    src = engine_root() / "config.example.toml"
+    seed = seed_config_text()
+    if not seed:
+        print(
+            "error: no config.example.toml under %s" % engine_root(),
+            file=sys.stderr,
+        )
+        return 1
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(src, dest)
+    write_text(dest, seed)
     _ensure_team_gitignore(repo)
     print("wrote %s" % dest)
     return 0

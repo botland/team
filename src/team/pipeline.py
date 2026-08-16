@@ -14,6 +14,7 @@ from team import findings as findings_mod
 from team import gitutil, style, testhost
 from team.config import (
     AUDIT_PHASE_ORDER,
+    OPTIONAL_PHASES,
     PHASE_ORDER,
     RANGE_PHASE_ORDER,
     ROLES,
@@ -924,16 +925,9 @@ class Pipeline:
         return "suite %s (no failure observed)" % status
 
     def _skip_reason(self, phase: str) -> str:
-        user_skip = {
-            "critic",
-            "adversarial",
-            "guardian",
-            "debugger",
-            "repair",
-            "verify-test",
-            "adversarial-test",
-        }
-        if self.should_skip(phase) and phase in user_skip:
+        # config.OPTIONAL_PHASES is the one home; --skip is validated against
+        # it, so this is a membership test, not a second list.
+        if self.should_skip(phase) and phase in OPTIONAL_PHASES:
             return "requested"
         if phase == "debugger":
             if self._tests_passed():

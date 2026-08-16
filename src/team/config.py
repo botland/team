@@ -128,6 +128,21 @@ PHASE_ALIASES = {
     "attack": "adversarial",
 }
 
+# The phases a user may turn off. Every other phase name is either
+# structural (the rail collapses without it) or not a phase at all. This is
+# the one home: pipeline._skip_reason honours this set, and the CLI, the env
+# var and [run] skip are all validated against it, so `--skip reviewer` is an
+# error instead of a flag that prints nothing and runs the reviewer anyway.
+OPTIONAL_PHASES = (
+    "critic",
+    "adversarial",
+    "guardian",
+    "debugger",
+    "repair",
+    "verify-test",
+    "adversarial-test",
+)
+
 AUDIT_PHASE_ORDER = [
     "scout",
     "assess",
@@ -258,6 +273,17 @@ def resolve_phase(name: str) -> str:
     return PHASE_ALIASES.get(key, key)
 
 
+def resolve_skip(name: str) -> str:
+    """Phase name for --skip / TEAM_SKIP / [run] skip, or exit saying why not."""
+    phase = resolve_phase(name)
+    if phase not in OPTIONAL_PHASES:
+        raise SystemExit(
+            "cannot skip %r (optional phases: %s)"
+            % (name, ", ".join(OPTIONAL_PHASES))
+        )
+    return phase
+
+
 def load_config(
     repo: Path,
     *,
@@ -312,11 +338,11 @@ def load_config(
             for part in str(item).split(","):
                 part = part.strip()
                 if part:
-                    cfg.skip.append(resolve_phase(part))
+                    cfg.skip.append(resolve_skip(part))
 
     env_skip = os.environ.get("TEAM_SKIP", "")
     if env_skip:
-        cfg.skip.extend(resolve_phase(p) for p in env_skip.split(",") if p.strip())
+        cfg.skip.extend(resolve_skip(p) for p in env_skip.split(",") if p.strip())
 
     timeout = os.environ.get("TEAM_PHASE_TIMEOUT")
     if timeout:
@@ -647,7 +673,7 @@ def validate_config_update(section: str, key: str, kind: str, value: Any) -> Any
     if section == "run" and key == "skip":
         if not isinstance(value, list):
             value = parse_config_value("list", str(value))
-        return [resolve_phase(str(item)) for item in value if str(item).strip()]
+        return [resolve_skip(str(item)) for item in value if str(item).strip()]
     if kind == "str":
         return "" if value is None else str(value)
     return value
@@ -923,7 +949,7 @@ def _apply_toml(cfg: Config, data: Dict[str, Dict[str, Any]]) -> None:
         _set_role(cfg, str(role), str(runtime))
     run = data.get("run") or {}
     if isinstance(run.get("skip"), list):
-        cfg.skip.extend(resolve_phase(str(x)) for x in run["skip"])
+        cfg.skip.extend(resolve_skip(str(x)) for x in run["skip"])
     if run.get("phase_timeout") is not None:
         cfg.phase_timeout = int(run["phase_timeout"])
     review = data.get("review") or {}

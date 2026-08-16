@@ -1,3 +1,4 @@
+import inspect
 import os
 import sys
 import tempfile
@@ -11,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from team.cli import main
 from team.config import (
     CODING_RUNTIMES,
+    OPTIONAL_PHASES,
     ROLES,
     WRITE_CAPABILITIES,
     apply_range_reviewer,
@@ -44,6 +46,51 @@ class TomlTests(unittest.TestCase):
         self.assertEqual(data["roles"]["architect"], "grok")
         self.assertEqual(data["paths"]["test_root"], "tests")
         self.assertEqual(data["run"]["skip"], ["critic", "guardian"])
+
+
+class SkipValidationTests(unittest.TestCase):
+    """--skip named a phase the runner then ignored, and said nothing.
+
+    `team --skip reviewer review` was accepted, printed nothing, and ran the
+    reviewer. Every entry point (flag, TEAM_SKIP, [run] skip) resolves through
+    the same optional-phase set, so a name outside it is an error once.
+    """
+
+    def test_optional_phases_round_trip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp), skip=list(OPTIONAL_PHASES))
+            self.assertEqual(sorted(cfg.skip), sorted(OPTIONAL_PHASES))
+
+    def test_aliases_still_resolve(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(load_config(Path(tmp), skip=["attack"]).skip, ["adversarial"])
+
+    def test_a_phase_that_cannot_be_skipped_is_an_error(self):
+        for name in ("reviewer", "implementer", "not-a-phase"):
+            with self.subTest(name=name):
+                with tempfile.TemporaryDirectory() as tmp:
+                    with self.assertRaises(SystemExit) as ctx:
+                        load_config(Path(tmp), skip=[name])
+                    self.assertIn("cannot skip", str(ctx.exception))
+
+    def test_the_env_var_and_the_config_file_use_the_same_rule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            path = repo / ".team" / "config.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text('[run]\nskip = ["reviewer"]\n', encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                load_config(repo)
+            path.write_text("[run]\nskip = []\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"TEAM_SKIP": "reviewer"}):
+                with self.assertRaises(SystemExit):
+                    load_config(repo)
+
+    def test_the_runner_honours_exactly_this_set(self):
+        from team.pipeline import Pipeline
+
+        source = inspect.getsource(Pipeline._skip_reason)
+        self.assertIn("OPTIONAL_PHASES", source)
 
 
 class LoadConfigTests(unittest.TestCase):
@@ -485,6 +532,19 @@ class ConfigCommandTests(unittest.TestCase):
         with mock.patch("sys.stdout", buf), mock.patch("sys.stderr", err):
             rc = main(argv)
         return rc, buf.getvalue(), err.getvalue()
+
+    def test_init_writes_the_seed_and_a_missing_example_is_an_error_line(self):
+        rc, out, _err = self._run(["--repo", str(self.repo), "init"])
+        self.assertEqual(rc, 0)
+        dest = self.repo / ".team" / "config.toml"
+        self.assertIn("[roles]", dest.read_text(encoding="utf-8"))
+        self.assertIn(str(dest), out)
+        dest.unlink()
+        (self.engine / "config.example.toml").unlink()
+        rc, _out, err = self._run(["--repo", str(self.repo), "init"])
+        self.assertEqual(rc, 1)
+        self.assertIn("config.example.toml", err)
+        self.assertFalse(dest.exists())
 
     def test_show_does_not_create_file(self):
         rc, out, err = self._run(["--repo", str(self.repo), "config"])

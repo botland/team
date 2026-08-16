@@ -9,6 +9,7 @@ run does.
 
 from __future__ import annotations
 
+import io
 import os
 import re
 import sys
@@ -132,6 +133,31 @@ class DigestPinVacuityTests(unittest.TestCase):
             self.assertEqual(
                 [row["title"] for row in collect_review_findings(work)], ["stale"]
             )
+
+
+class CliErrorSurfaceTests(unittest.TestCase):
+    """Every error this program raises deliberately reaches the user as a line.
+
+    main() caught PipelineError and FindingsError only, so a bad ref or an
+    unknown runtime name arrived as a traceback.
+    """
+
+    def test_git_and_runtime_errors_are_error_lines(self):
+        from unittest import mock
+
+        from team import cli
+        from team.gitutil import GitError
+        from team.runners import RuntimeError_
+
+        for exc in (GitError("no such ref: nope"), RuntimeError_("unknown runtime: x")):
+            with self.subTest(exc=type(exc).__name__):
+                err = io.StringIO()
+                with mock.patch.object(cli, "cmd_list", side_effect=exc):
+                    with mock.patch("sys.stderr", err):
+                        rc = cli.main(["list"])
+                self.assertEqual(rc, 1)
+                self.assertIn("error:", err.getvalue())
+                self.assertIn(str(exc), err.getvalue())
 
 
 class UnverifiedSuiteSkipTests(unittest.TestCase):
