@@ -30,7 +30,7 @@ from team.findings import (
     empty_seq_state,
     pick_next_seq,
 )
-from team.gitutil import changed_paths, revert_product, snapshot
+from team.gitutil import changed_paths, porcelain_paths, revert_product, snapshot
 from team.pipeline import PipelineError, start_feature, start_range_review
 from team.runners import FakeRuntime
 from team.state import State
@@ -986,3 +986,53 @@ class ContractMutationCheckTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplySurfaceBudgetTests(SeededRepoTests):
+    """The patch a hop is handed is capped; the fence and the path list are not."""
+
+    def _fat_tree(self):
+        (self.repo / "coverage-html").mkdir()
+        (self.repo / "coverage-html" / "main_py.html").write_text(
+            "<p>generated</p>\n" * 20000, encoding="utf-8"
+        )
+        (self.repo / "src" / "keep.py").write_text(KEEP + "# edited\n", encoding="utf-8")
+
+    def test_generated_bulk_is_omitted_but_still_named(self):
+        self._fat_tree()
+        pipe = self._pipe(slug="surface-budget")
+        pipe.cfg.diff_budget = 64 * 1024
+        pipe._write_apply_surface()
+        patch = (pipe.work / "git" / "apply.patch").read_text(encoding="utf-8")
+        names = (pipe.work / "git" / "apply-names.txt").read_text(encoding="utf-8")
+        self.assertNotIn("<p>generated</p>", patch, "the bulk must not be in the patch")
+        self.assertIn("omitted from this patch", patch)
+        self.assertIn("coverage-html/main_py.html", patch, "the note names it")
+        self.assertIn(
+            "coverage-html/main_py.html", names, "the path list stays complete"
+        )
+        self.assertIn("src/keep.py", patch, "real work still gets reviewed")
+
+    def test_budget_does_not_shrink_the_write_fence(self):
+        self._fat_tree()
+        pipe = self._pipe(slug="surface-fence")
+        pipe.cfg.diff_budget = 64 * 1024
+        pipe._write_apply_surface()
+        dirty = porcelain_paths(self.repo)
+        self.assertIn("coverage-html/main_py.html", dirty)
+        self.assertIn("src/keep.py", dirty)
+
+    def test_no_budget_keeps_every_byte(self):
+        self._fat_tree()
+        pipe = self._pipe(slug="surface-nocap")
+        pipe.cfg.diff_budget = 0
+        pipe._write_apply_surface()
+        patch = (pipe.work / "git" / "apply.patch").read_text(encoding="utf-8")
+        self.assertIn("<p>generated</p>", patch)
+        self.assertNotIn("omitted from this patch", patch)
+
+    def test_a_clean_tree_gets_no_omission_header(self):
+        pipe = self._pipe(slug="surface-clean")
+        pipe._write_apply_surface()
+        patch = (pipe.work / "git" / "apply.patch").read_text(encoding="utf-8")
+        self.assertNotIn("omitted", patch)

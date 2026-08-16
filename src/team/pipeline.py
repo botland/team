@@ -1176,10 +1176,24 @@ class Pipeline:
             gitutil.write_path_list(self.work / "git" / "apply-names.txt", [])
             return
         dirty = gitutil.porcelain_paths(self.repo)
-        patch = gitutil.worktree_diff(self.repo, dirty)
-        self.write_artifact("git/apply.patch", patch or "(empty apply tree)\n")
-        names = gitutil.paths_from_diff(patch) or gitutil.product_paths(dirty)
+        # Sections carry their -z name, so the budget can drop bytes without
+        # dropping the path from apply-names.txt. The fence still sees every
+        # dirty path: porcelain_paths above is untouched by any of this.
+        sections = gitutil.worktree_diff_sections(self.repo, dirty)
+        patch, omitted = gitutil.budget_sections(
+            sections, total=self.cfg.diff_budget
+        )
+        note = gitutil.budget_note(
+            omitted, names_file="git/apply-names.txt", total=self.cfg.diff_budget
+        )
+        self.write_artifact("git/apply.patch", note + (patch or "(empty apply tree)\n"))
+        names = [rel for rel, _text in sections] or gitutil.product_paths(dirty)
         gitutil.write_path_list(self.work / "git" / "apply-names.txt", names)
+        if omitted:
+            self.log(
+                "apply surface: %d file(s) over the %d-byte budget, named in "
+                "git/apply-names.txt" % (len(omitted), self.cfg.diff_budget)
+            )
         range_md = self.read_artifact("range.md")
         if range_md and "## Apply working tree" not in range_md:
             extra = [
@@ -2994,12 +3008,19 @@ def start_range_review(
     write_text(work / "brief.md", desc + "\n")
     write_text(work / "range.md", "# Range\n\n%s\n\n- base: `%s`\n- kind: %s\n- commits: %d\n" % (desc, base or "(root)", kind, count))
     write_text(work / "git" / "log.txt", log or "(empty range)\n")
-    write_text(work / "git" / "diff.patch", diff or "(empty diff)\n")
     # Superset of the patch's paths: names.txt is the cheap map, so it carries
     # paths the deduped cumulative patch no longer shows (a file renamed or
-    # deleted mid-range). One derivation, in gitutil.
+    # deleted mid-range). One derivation, in gitutil. Read from the *uncapped*
+    # patch on the PR rail -- capping first would hide exactly the paths the
+    # budget note promises are listed here.
     names = gitutil.range_name_only(repo, base) if not pr else gitutil.paths_from_diff(diff)
     gitutil.write_path_list(work / "git" / "names.txt", names)
+    # The one rail with only patch text; names.txt above is the complete list.
+    diff, dropped = gitutil.budget_patch_text(diff, total=cfg.diff_budget)
+    diff_note = gitutil.budget_note(
+        count=dropped, names_file="git/names.txt", total=cfg.diff_budget
+    )
+    write_text(work / "git" / "diff.patch", diff_note + (diff or "(empty diff)\n"))
     for src, dest in RANGE_HEAD_LAW:
         blob = gitutil.committed_blob(repo, src)
         if blob.strip():

@@ -8,8 +8,13 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from team.gitutil import (
+    DIFF_BUDGET,
     GitError,
     already_dirty_mutations,
+    budget_note,
+    budget_patch_text,
+    budget_sections,
+    file_budget,
     changed_paths,
     delta_paths,
     name_status_paths,
@@ -21,6 +26,8 @@ from team.gitutil import (
     status_record_paths,
     submodule_paths,
     verify_delta,
+    worktree_diff,
+    worktree_diff_sections,
 )
 from tests.support.repo import git, init_repo
 
@@ -507,3 +514,94 @@ class PrBundleHowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewSurfaceBudgetTests(unittest.TestCase):
+    """A generated tree is not review material, and bytes are paid per turn.
+
+    ignored_untracked already says so, but it delegates the judgment to the
+    target repo's .gitignore. A repo that does not ignore its build output
+    handed every downstream hop an 11 MB patch. These pin the size law that
+    does not delegate -- and pin that the write fence is not part of it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _sections(self):
+        (self.repo / "small.py").write_text("x = 1\n", encoding="utf-8")
+        (self.repo / "generated.html").write_text("<p>y</p>\n" * 20000, encoding="utf-8")
+        return worktree_diff_sections(self.repo, porcelain_paths(self.repo))
+
+    def test_a_huge_file_is_omitted_and_the_small_one_survives(self):
+        patch, omitted = budget_sections(self._sections(), total=64 * 1024)
+        self.assertEqual(omitted, ["generated.html"])
+        self.assertIn("small.py", patch)
+        self.assertNotIn("<p>y</p>", patch)
+
+    def test_omitted_paths_are_named_not_dropped(self):
+        sections = self._sections()
+        _patch, omitted = budget_sections(sections, total=64 * 1024)
+        names = [rel for rel, _text in sections]
+        self.assertIn("generated.html", names)
+        self.assertTrue(set(omitted).issubset(set(names)))
+
+    def test_the_note_says_where_the_full_list_is(self):
+        note = budget_note(["generated.html"], names_file="git/apply-names.txt", total=999)
+        self.assertIn("generated.html", note)
+        self.assertIn("git/apply-names.txt", note)
+        self.assertIn("not an unchanged path", note)
+        self.assertEqual(budget_note([], names_file="x", total=999), "")
+
+    def test_the_note_reads_the_same_from_a_bare_count(self):
+        note = budget_note(count=3, names_file="git/names.txt", total=999)
+        self.assertIn("3 file(s) omitted", note)
+        self.assertIn("git/names.txt", note)
+
+    def test_zero_budget_is_no_cap(self):
+        sections = self._sections()
+        patch, omitted = budget_sections(sections, total=0)
+        self.assertEqual(omitted, [])
+        self.assertIn("<p>y</p>", patch)
+
+    def test_worktree_diff_still_returns_the_whole_patch(self):
+        """The budget is the caller's choice; the primitive stays complete."""
+        self._sections()
+        patch = worktree_diff(self.repo, porcelain_paths(self.repo))
+        self.assertIn("small.py", patch)
+        self.assertIn("<p>y</p>", patch)
+
+    def test_the_write_fence_still_sees_every_dirty_path(self):
+        """Containment is not a review surface. Capping bytes must not
+        shrink what porcelain_paths reports, or restore loses a file."""
+        self._sections()
+        dirty = porcelain_paths(self.repo)
+        _patch, omitted = budget_sections(
+            worktree_diff_sections(self.repo, dirty), total=64 * 1024
+        )
+        self.assertTrue(omitted, "the fixture must actually trip the budget")
+        for rel in omitted:
+            self.assertIn(rel, dirty, "an omitted path is still a fence member")
+        self.assertIn("small.py", dirty)
+        self.assertIn("generated.html", dirty)
+
+    def test_patch_text_budget_counts_what_it_drops(self):
+        big = "diff --git a/a b/a\n" + ("+line\n" * 40000)
+        small = "diff --git a/b b/b\n+one\n"
+        capped, dropped = budget_patch_text(big + small, total=64 * 1024)
+        self.assertEqual(dropped, 1)
+        self.assertIn("a/b b/b", capped)
+        self.assertNotIn("+line", capped)
+
+    def test_patch_text_under_budget_is_untouched(self):
+        patch = "diff --git a/a b/a\n+one\n"
+        self.assertEqual(budget_patch_text(patch, total=64 * 1024), (patch, 0))
+
+    def test_one_file_may_not_eat_the_whole_allowance(self):
+        self.assertEqual(file_budget(DIFF_BUDGET), DIFF_BUDGET // 8)
+        self.assertGreaterEqual(file_budget(1), 32 * 1024)

@@ -30,6 +30,11 @@ The orchestrator collected a commit range **and** the live dirty working tree. D
 
 An empty `git/diff.patch` does not mean nothing changed.
 
+Both patches are capped by a byte budget. When one opens with an omission
+header, the files it names were **not** included — read them from the tree by
+path. `git/names.txt` and `git/apply-names.txt` remain the complete path lists.
+An omitted path is not an unchanged path.
+
 ## Finding structure
 Every finding **must** set `kind` so the orchestrator can apply it:
 

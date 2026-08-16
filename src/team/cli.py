@@ -445,6 +445,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Write run.phase_timeout (seconds; 0 = no limit)",
     )
     cfg_cmd.add_argument(
+        "--diff-budget",
+        dest="set_diff_budget",
+        default=None,
+        type=int,
+        help="Write run.diff_budget (patch bytes handed to a hop; 0 = no cap)",
+    )
+    cfg_cmd.add_argument(
         "--unset",
         dest="unset_keys",
         action="append",
@@ -1167,6 +1174,7 @@ def cmd_config(args) -> int:
             skip=_config_skip(args.set_skip, args.skip),
             range_reviewer=args.set_range_reviewer,
             phase_timeout=args.set_phase_timeout,
+            diff_budget=args.set_diff_budget,
             effort=args.set_effort or args.effort,
         )
     except SystemExit as exc:
@@ -1220,6 +1228,7 @@ def _print_effective_config(dest: Path, cfg) -> None:
     print("[run]")
     print("  skip           %s" % (", ".join(cfg.skip) if cfg.skip else "(none)"))
     print("  phase_timeout  %s" % cfg.phase_timeout)
+    print("  diff_budget    %s" % (cfg.diff_budget or "(no cap)"))
     print("")
     print("[review]")
     print("  range_reviewer %s" % cfg.range_reviewer)
