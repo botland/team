@@ -141,34 +141,92 @@ class WarmChainTests(unittest.TestCase):
         self.assertIn("warm chain", "\n".join(pipe.log_lines))
 
     def test_a_failed_hop_does_not_hand_its_session_on(self):
+        """result.success is the *runtime's* verdict -- true for a schema
+        failure, a fence violation and an unfinished inspect alike. The next
+        hop must be cold, not merely un-recorded."""
         pipe = self._pipe("failed", warm=True)
-        rt = HostileRuntime(
-            [emit({"nope": 1}), emit(DESIGN)],
-            phases=("architect", "architect-revise"),
-            num_turns=2,
-            usage=Usage(input_tokens=1),
-        )
         seen = []
-        with register_runtime("fake", rt):
-            try:
-                pipe.invoke("architect", "architect", "p", "design.json")
-            except Exception:
-                pass
+
+        class Recorder(HostileRuntime):
+            def complete(self, **kw):
+                seen.append((kw.get("session_id"), kw.get("resume")))
+                return super().complete(**kw)
+
         with register_runtime(
             "fake",
-            HostileRuntime(
+            Recorder(
                 [emit(DESIGN)],
+                phases=("architect",),
+                num_turns=2,
+                usage=Usage(input_tokens=1),
+            ),
+        ):
+            pipe.invoke("architect", "architect", "p", "design.json")
+        self.assertFalse(seen[0][1])
+
+        # A hop the runtime calls a success and the pipeline does not.
+        with register_runtime(
+            "fake",
+            Recorder(
+                [emit({"not": "a design"})],
                 phases=("architect-revise",),
                 num_turns=2,
                 usage=Usage(input_tokens=1),
             ),
         ):
-            pipe.invoke("architect", "architect-revise", "p", "design.json")
-        chains = pipe._warm_chains
-        self.assertTrue(
-            all(v.get("session") for v in chains.values()),
-            "a chain only ever holds a session from a hop that succeeded",
+            with self.assertRaises(Exception):
+                pipe.invoke("architect", "architect-revise", "p", "design.json")
+        self.assertTrue(seen[1][1], "that hop did resume the live chain")
+
+        with register_runtime(
+            "fake",
+            Recorder(
+                [emit(DESIGN)],
+                phases=("architect-third",),
+                num_turns=2,
+                usage=Usage(input_tokens=1),
+            ),
+        ):
+            pipe.invoke("architect", "architect-third", "p", "design.json")
+        self.assertFalse(
+            seen[2][1],
+            "a hop that raised leaves its session in a state the next must not inherit",
         )
+
+    def test_moving_a_write_root_mid_run_breaks_the_chain(self):
+        """The filters are not a function of capability alone: both adapters
+        derive them from code_root/test_root/submodules, which a replan
+        rewrites mid-run. Sharing a session across that would resume with
+        different --allowedTools than it opened with."""
+        pipe = self._pipe("roots", warm=True)
+        seen = []
+
+        class Recorder(HostileRuntime):
+            def complete(self, **kw):
+                seen.append(kw.get("resume"))
+                return super().complete(**kw)
+
+        def hop(phase):
+            with register_runtime(
+                "fake",
+                Recorder(
+                    [emit({"summary": "s", "paths_touched": ["src/a.py"]})],
+                    phases=(phase,),
+                    num_turns=2,
+                    usage=Usage(input_tokens=1),
+                ),
+            ):
+                pipe.invoke(
+                    "implementer", phase, "p", "write_summary.json",
+                    capability="write-code",
+                )
+
+        hop("impl-one")
+        hop("impl-two")
+        self.assertTrue(seen[1], "same roots, same filters, same chain")
+        pipe.cfg.code_root = "src/inner"
+        hop("impl-three")
+        self.assertFalse(seen[2], "code_root moved, so the filters did too")
 
     def test_warm_and_cold_produce_the_same_artifacts(self):
         """The property that makes a chain droppable. If this ever fails,
@@ -197,12 +255,14 @@ class WarmChainTests(unittest.TestCase):
             return {
                 str(p.relative_to(pipe.work)): p.read_text(encoding="utf-8")
                 # The protocol is the artifacts. prompts/ and the spend ledger
-                # record hop mechanics -- session ids among them -- and are
-                # expected to differ between a warm run and a cold one.
+                # record hop mechanics -- session ids among them -- and git/
+                # records repo state, down to the commit sha two independently
+                # created fixtures cannot share. None of those is the handoff.
                 for p in sorted(pipe.work.rglob("*"))
                 if p.is_file()
                 and p.suffix in (".md", ".txt")
                 and "prompts" not in p.parts
+                and "git" not in p.parts
                 and not p.name.startswith("usage")
             }
 

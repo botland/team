@@ -27,6 +27,7 @@ from team.config import (
 )
 from team.merge import merge_reviews
 from team.runners import (
+    write_tool_path_filters,
     Result,
     Runtime,
     describe_runtime_failure,
@@ -267,10 +268,6 @@ class Pipeline:
         self._require_write_scope(role, cap)
         rt: Runtime = runtime_for(runtime_name)
         session_key = "%s:%s" % (role, runtime_name)
-        # Files are the handoff. A stored session is a log id, not a thread.
-        # Cold by default: mint a new --session-id, never --resume / -r.
-        # Under [run] warm the chain below may reuse one, and only then.
-        sid, resume = self._warm_session(role, runtime_name, cap)
         extra = dict(extra or {})
         extra.setdefault("code_root", normalize_root(self.cfg.code_root))
         extra.setdefault("test_root", normalize_root(self.cfg.test_root))
@@ -278,6 +275,13 @@ class Pipeline:
         level = self.cfg.effort_for(role)
         if level:
             extra.setdefault("effort", level)
+        # Files are the handoff. A stored session is a log id, not a thread.
+        # Cold by default: mint a new --session-id, never --resume / -r.
+        # Under [run] warm the chain below may reuse one, and only then.
+        # The key needs `extra`, hence the ordering: the tool filters are a
+        # function of the roots, not of the capability alone.
+        warm_key = self._warm_key(role, runtime_name, cap, extra)
+        sid, resume = self._warm_session(warm_key)
         before = self._snapshot_for_restore()
         complete_err: Optional[BaseException] = None
         result: Optional[Result] = None
@@ -333,7 +337,6 @@ class Pipeline:
             )
             if str(phase).startswith("reviewer-"):
                 self._record_review_result(result_path, num_turns=result.num_turns)
-            self._note_warm_hop(role, runtime_name, cap, result)
             self._record_usage(
                 role,
                 phase,
@@ -453,10 +456,43 @@ class Pipeline:
                 runtime_name=runtime_name,
                 write_verify=write_verify,
             )
+        # Only here: every way out of invoke above this line raised, and a hop
+        # that raised leaves its session in a state the next hop must not
+        # inherit. result.success is the *runtime's* verdict ("the CLI exited
+        # 0 and returned JSON"), which is true for a schema failure, a fence
+        # violation and an unfinished inspect alike.
+        self._note_warm_hop(warm_key, result)
         self._adopt_census(result.output)
         return result
 
-    def _warm_session(self, role: str, runtime: str, capability: str) -> tuple:
+    def _warm_key(
+        self, role: str, runtime: str, capability: str, extra: Dict[str, Any]
+    ) -> tuple:
+        """Everything that must match for two hops to share a session.
+
+        Not `(role, runtime, capability)`: for the write capabilities the
+        tool filters are not a function of capability alone. Both adapters
+        derive them with ``write_tool_path_filters(capability, extra)``, whose
+        `extra` carries code_root, test_root and submodule_paths -- and
+        `_adopt_design_roots` rewrites those mid-run from any architect or
+        replan output. Two implementer hops separated by a replan that moved
+        code_root would otherwise share a session while declaring different
+        --allowedTools / --allow globs on resume, which is exactly the vendor
+        behaviour capability was added to keep out of a chain.
+
+        Keyed on the filters themselves, so the key is derived from the argv
+        rather than from a proxy for it.
+        """
+        allow, deny = write_tool_path_filters(capability, extra)
+        return (
+            role,
+            runtime,
+            capability,
+            tuple(allow),
+            tuple(deny),
+        )
+
+    def _warm_session(self, key: tuple) -> tuple:
         """``(session_id, resume)`` for this hop. Cold unless a chain is live.
 
         Files stay the protocol: every prompt is self-contained and every
@@ -478,32 +514,28 @@ class Pipeline:
         fresh = str(uuid.uuid4())
         if not getattr(self.cfg, "warm", False):
             return fresh, False
-        key = (role, runtime, capability)
+        # Consumed, not merely read. A hop must re-earn the chain by finishing
+        # cleanly -- _note_warm_hop re-arms it at the one exit where the whole
+        # hop has succeeded. Anything that raises in between therefore leaves
+        # no chain, including a hop that resumed one and then failed.
         with self._state_lock:
-            live = self._warm_chains.get(key)
+            live = self._warm_chains.pop(key, None)
         if not live:
             return fresh, False
         if live.get("context", 0) > WARM_CONTEXT_CEILING:
             self.log(
                 "warm chain %s/%s broken: context %s over ceiling"
-                % (role, runtime, live.get("context"))
+                % (key[0], key[1], live.get("context"))
             )
-            with self._state_lock:
-                self._warm_chains.pop(key, None)
             return fresh, False
         return str(live["session"]), True
 
-    def _note_warm_hop(
-        self, role: str, runtime: str, capability: str, result: Result
-    ) -> None:
-        """Record or drop this role+runtime+capability chain after a hop."""
+    def _note_warm_hop(self, key: tuple, result: Result) -> None:
+        """Arm this chain. Called only where the whole hop has succeeded."""
         if not getattr(self.cfg, "warm", False):
             return
-        key = (role, runtime, capability)
         with self._state_lock:
             if not result.success or not result.session_id:
-                # A failed hop leaves a session in an unknown state. The next
-                # hop starts cold rather than inheriting it.
                 self._warm_chains.pop(key, None)
                 return
             usage = result.usage
