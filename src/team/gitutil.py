@@ -40,8 +40,12 @@ def committed_blob(repo: Path, rel: str, ref: str = "HEAD") -> str:
 
 
 def git(repo: Path, *args: str, check: bool = True) -> str:
+    # core.quotepath=false: a path with non-ASCII bytes arrives as UTF-8, not
+    # as "src/caf\303\251.py". Where the command can also emit -z records the
+    # caller asks for those instead (git_records) -- this only covers the
+    # readers that must parse text, such as a patch header.
     proc = subprocess.run(
-        ["git", "-C", str(repo), *args],
+        ["git", "-C", str(repo), "-c", "core.quotepath=false", *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -49,6 +53,19 @@ def git(repo: Path, *args: str, check: bool = True) -> str:
     if check and proc.returncode != 0:
         raise GitError(proc.stderr.strip() or proc.stdout.strip() or "git failed")
     return proc.stdout
+
+
+def git_records(repo: Path, *args: str, check: bool = False) -> List[str]:
+    """Split NUL-separated git output into records.
+
+    Every git command here that lists paths is asked for ``-z``. That is the
+    only reading of a path git guarantees: line output quotes and escapes
+    names (C-quoting, ``core.quotepath``), ``" -> "`` is a legal substring of
+    a filename, and a quote is a legal character in one. Under ``-z`` there is
+    no quoting to undo and no separator that can occur inside a name, so the
+    parsing is git's, not ours. Callers pass ``-z``; this splits.
+    """
+    return [rec for rec in git(repo, *args, check=check).split("\0") if rec]
 
 
 def is_git_repo(repo: Path) -> bool:
@@ -72,66 +89,67 @@ def head(repo: Path) -> str:
     return out if out and "fatal" not in out.lower() else ""
 
 
-def _unquote_git_path(raw: str) -> str:
-    text = (raw or "").strip()
-    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
-        text = text[1:-1].replace('\\"', '"').replace("\\\\", "\\")
-    return posix(text)
+def _changed_by(code: str, dest: str, source: str) -> List[str]:
+    """Paths a status code actually changed. One rule for both -z readers.
 
-
-def _status_code(line: str) -> str:
-    """Primary letter on a porcelain or name-status line (R, C, M, D, …)."""
-    text = (line or "").lstrip()
-    if not text:
-        return ""
-    if text[0] in "RCMADU" and len(text) > 1 and text[1].isdigit():
-        return text[0]
-    xy = (line or "")[:2]
-    if "R" in xy:
-        return "R"
-    if "C" in xy:
-        return "C"
-    return text[0]
-
-
-def paths_from_status_line(line: str) -> List[str]:
-    """Every path this porcelain / name-status line actually changed.
-
-    Rename (`R`, including `R100`) names source and dest. Copy (`C` / `C075`)
-    names only the dest — the source still exists. Plain add/modify/delete
-    name the one path. This is the pair: status text ↔ worktree change.
+    Rename (``R``) names source and dest: the source is gone. Copy (``C``)
+    names only the dest -- the source still exists, untouched. Everything
+    else names its one path.
     """
-    raw = (line or "").rstrip("\n")
-    if not raw.strip():
-        return []
-    if raw.startswith("!!"):
-        rest = raw[2:].lstrip()
-        if " -> " in rest:
-            left, right = rest.split(" -> ", 1)
-            return [p for p in (_unquote_git_path(left), _unquote_git_path(right)) if p]
-        path = _unquote_git_path(rest)
-        return [path] if path else []
-    code = _status_code(raw)
-    named: List[str] = []
-    if "\t" in raw:
-        parts = raw.split("\t")
-        named = [_unquote_git_path(p) for p in parts[1:] if p.strip()]
-    else:
-        match = re.match(r"^[ A-Z?]{1,2}\d*\s+(.*)$", raw)
-        rest = match.group(1) if match else (raw[3:] if len(raw) >= 4 else raw)
-        if " -> " in rest:
-            left, right = rest.split(" -> ", 1)
-            named = [_unquote_git_path(left), _unquote_git_path(right)]
-        else:
-            path = _unquote_git_path(rest)
-            if path:
-                named = [path]
-    named = [p for p in named if p]
-    if not named:
-        return []
-    if code == "C" and len(named) >= 2:
-        return [named[-1]]
-    return named
+    out = [dest]
+    if code.startswith("R") or "R" in code[:2]:
+        out.append(source)
+    return [posix(p) for p in out if p]
+
+
+def status_record_paths(records: Sequence[str]) -> List[str]:
+    """Paths from ``git status --porcelain -z`` records.
+
+    Each record is ``XY<space>path``. A rename or copy is followed by a
+    second record holding the source path.
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(records):
+        rec = records[i]
+        i += 1
+        if len(rec) < 4:
+            continue
+        code, dest = rec[:2], rec[3:]
+        source = ""
+        if "R" in code or "C" in code:
+            if i < len(records):
+                source = records[i]
+                i += 1
+        out.extend(_changed_by(code, dest, source))
+    return out
+
+
+def name_status_paths(records: Sequence[str]) -> List[str]:
+    """Paths from ``git diff --name-status -z`` records.
+
+    Records alternate status, path; ``R``/``C`` carry a similarity score and
+    two paths (source then dest).
+    """
+    out: List[str] = []
+    i = 0
+    while i < len(records):
+        code = records[i]
+        i += 1
+        if not code:
+            continue
+        if code[0] in ("R", "C"):
+            if i + 1 >= len(records):
+                break
+            source, dest = records[i], records[i + 1]
+            i += 2
+            out.extend(_changed_by(code, dest, source))
+            continue
+        if i >= len(records):
+            break
+        out.extend(_changed_by(code, records[i], ""))
+        i += 1
+    return out
 
 
 def _is_team_work(rel: str) -> bool:
@@ -146,10 +164,9 @@ def porcelain_paths(repo: Path) -> List[str]:
     Ignored ``.team/work`` stays protocol, not product; non-ignored dirty
     paths (including ``.team/work`` when it is not ignored) stay visible.
     """
-    paths = set()
-    out = git(repo, "status", "--porcelain", "-uall", check=False)
-    for line in out.splitlines():
-        paths.update(paths_from_status_line(line))
+    paths = set(
+        status_record_paths(git_records(repo, "status", "--porcelain", "-uall", "-z"))
+    )
     for rel in ignored_untracked(repo):
         if not _is_team_work(rel):
             paths.add(rel)
@@ -516,12 +533,8 @@ def ignored_untracked(repo: Path) -> Set[str]:
     the other direction — a generated tree is not review material, and dumping
     it costs every downstream hop its full byte count.
     """
-    out = git(repo, "ls-files", "-o", "-i", "--exclude-standard", check=False)
-    return {
-        rel
-        for rel in (_unquote_git_path(line) for line in out.splitlines())
-        if rel
-    }
+    records = git_records(repo, "ls-files", "-o", "-i", "--exclude-standard", "-z")
+    return {posix(rel) for rel in records if rel}
 
 
 def worktree_diff(repo: Path, paths: Sequence[str]) -> str:
@@ -570,11 +583,15 @@ def changed_paths(repo: Path, before: dict, after: dict) -> List[str]:
     after_head = after.get("head") or ""
     if before_head and after_head and before_head != after_head:
         # name-status (not name-only): rename/copy detection lists both
-        # sides; paths_from_status_line keeps the source of R and the dest
-        # of C. name-only would drop the rename source.
-        out = git(repo, "diff", "--name-status", before_head, after_head, check=False)
-        for line in out.splitlines():
-            found.update(paths_from_status_line(line))
+        # sides; name_status_paths keeps the source of R and the dest of C.
+        # name-only would drop the rename source.
+        found.update(
+            name_status_paths(
+                git_records(
+                    repo, "diff", "--name-status", "-z", before_head, after_head
+                )
+            )
+        )
     return sorted(found)
 
 
@@ -597,15 +614,16 @@ def submodule_paths(repo: Path) -> List[str]:
                 rel = posix(parts[1].strip()).rstrip("/")
                 if rel:
                     found.add(rel)
-    listed = git(repo, "ls-files", "-s", check=False)
-    for line in listed.splitlines():
-        if not line.startswith("160000 "):
+    for rec in git_records(repo, "ls-files", "-s", "-z"):
+        if not rec.startswith("160000 "):
             continue
-        parts = line.split(None, 3)
-        if len(parts) == 4:
-            rel = posix(parts[3].strip()).rstrip("/")
-            if rel:
-                found.add(rel)
+        # "<mode> <sha> <stage>\t<path>" — the tab is the only separator the
+        # path cannot contain, and -z means it is not quoted.
+        if "\t" not in rec:
+            continue
+        rel = posix(rec.split("\t", 1)[1]).rstrip("/")
+        if rel:
+            found.add(rel)
     return sorted(found)
 
 
@@ -786,9 +804,9 @@ def range_name_only(repo: Path, base: str) -> List[str]:
     """
     names = set(paths_from_diff(range_diff(repo, base)))
     spec = "%s..HEAD" % base if base else "HEAD"
-    log = git(repo, "log", "--name-only", "--format=", "-M", spec, check=False)
-    for line in log.splitlines():
-        rel = posix(_unquote_git_path(line).strip())
+    records = git_records(repo, "log", "--name-only", "--format=", "-M", "-z", spec)
+    for rec in records:
+        rel = posix(rec.strip())
         if rel and rel != "/dev/null":
             names.add(rel)
     return sorted(names)

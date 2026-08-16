@@ -12,12 +12,13 @@ from team.gitutil import (
     already_dirty_mutations,
     changed_paths,
     delta_paths,
-    paths_from_status_line,
+    name_status_paths,
     porcelain_paths,
     pr_bundle,
     product_paths,
     revert_product,
     snapshot,
+    status_record_paths,
     submodule_paths,
     verify_delta,
 )
@@ -204,93 +205,81 @@ class RenameTotalityTests(unittest.TestCase):
         self.assertIn("tests/test_a.py", delta)
         self.assertIn("src/stolen.py", delta)
 
-    def test_paths_from_status_line_rename_encodings_include_source_and_dest(self):
-        cases = (
-            "R  old -> new",
-            "R100 old -> new",
-            'R  "old name.py" -> "new name.py"',
-            "R100\told\tnew",
-        )
-        for line in cases:
-            with self.subTest(line=line):
-                got = paths_from_status_line(line)
-                if "name.py" in line:
-                    self.assertIn("old name.py", got, got)
-                    self.assertIn("new name.py", got, got)
-                else:
-                    self.assertIn("old", got, got)
-                    self.assertIn("new", got, got)
+    def test_status_records_rename_includes_source_and_dest(self):
+        # -z: "XY dest" then a bare record with the source. No quoting.
+        got = status_record_paths(["R  new name.py", "old name.py", " M plain.py"])
+        self.assertEqual(got, ["new name.py", "old name.py", "plain.py"])
 
-    def test_paths_from_status_line_copy_encodings_are_dest_only(self):
-        cases = (
-            "C  copy_src -> copy_dest",
-            "C075 copy_src -> copy_dest",
-            'C  "copy src.py" -> "copy dest.py"',
-            "C075\tcopy_src\tcopy_dest",
-        )
-        for line in cases:
-            with self.subTest(line=line):
-                got = paths_from_status_line(line)
-                if "dest.py" in line:
-                    self.assertIn("copy dest.py", got, got)
-                else:
-                    self.assertIn("copy_dest", got, got)
+    def test_status_records_copy_is_dest_only(self):
+        got = status_record_paths(["C  copy dest.py", "copy src.py"])
+        self.assertEqual(got, ["copy dest.py"])
 
-    def test_porcelain_rename_blob_has_no_copy_lines(self):
+    def test_name_status_records_keep_rename_source_and_copy_dest(self):
+        got = name_status_paths(
+            ["M", "a -> b", "R100", "old.py", "new.py", "C075", "src.py", "dst.py"]
+        )
+        self.assertEqual(got, ["a -> b", "new.py", "old.py", "dst.py"])
+
+    def test_hostile_names_survive_the_fence_reader(self):
+        """The fence decides root membership from these strings.
+
+        A name with non-ASCII bytes, an embedded " -> ", or a quote used to
+        arrive C-quoted or truncated, so _content_id looked at a path that
+        does not exist and the before/after comparison for it was vacuous.
+        """
+        hostile = ["café.py", "a -> b", 'q"uote.py', "sp ace.py"]
+        for name in hostile:
+            (self.repo / name).write_text("x\n", encoding="utf-8")
+        before = snapshot(self.repo)
+        paths = porcelain_paths(self.repo)
+        for name in hostile:
+            self.assertIn(name, paths, paths)
+            self.assertNotEqual(
+                (before.get("entries") or {}).get(name),
+                "missing",
+                "%s exists on disk but the snapshot could not find it" % name,
+            )
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "hostile")
+        git(self.repo, "mv", "--", "café.py", "café renamed.py")
+        git(self.repo, "commit", "-m", "rename")
+        after = snapshot(self.repo)
+        delta = changed_paths(self.repo, before, after)
+        self.assertIn("café.py", delta)
+        self.assertIn("café renamed.py", delta)
+
+    def _porcelain_with_status(self, records):
+        """porcelain_paths over a canned -z status blob; other git calls are real."""
         import team.gitutil as gu
 
         orig = gu.git
-        cases = [
-            "R  old -> new",
-            "R100 old -> new",
-            'R  "old name.py" -> "new name.py"',
-        ]
 
         def fake_git(repo, *args, check=True):
-            if args[:1] == ("status",) or (args[:2] == ("status", "--porcelain")):
-                blob = "\n".join(cases) + "\n"
-                self.assertFalse(
-                    any(line.lstrip()[:1] == "C" for line in blob.splitlines()),
-                    blob,
-                )
-                return blob
+            if args[:2] == ("status", "--porcelain"):
+                self.assertIn("-z", args, "porcelain must be read as -z records")
+                return "\0".join(records) + "\0"
             return orig(repo, *args, check=check)
 
         gu.git = fake_git
         try:
-            paths = porcelain_paths(self.repo)
+            return porcelain_paths(self.repo)
         finally:
             gu.git = orig
+
+    def test_porcelain_rename_blob_names_both_sides(self):
+        paths = self._porcelain_with_status(
+            ["R  new", "old", "RM new name.py", "old name.py"]
+        )
         for rel in ("old", "new", "old name.py", "new name.py"):
             self.assertIn(rel, paths, "porcelain rename blob missed %r in %s" % (rel, paths))
 
-    def test_porcelain_copy_blob_has_no_rename_lines(self):
-        import team.gitutil as gu
-
-        orig = gu.git
-        cases = [
-            "C  copy_src -> copy_dest",
-            "C075 copy_src -> copy_dest",
-            'C  "copy src.py" -> "copy dest.py"',
-        ]
-
-        def fake_git(repo, *args, check=True):
-            if args[:1] == ("status",) or (args[:2] == ("status", "--porcelain")):
-                blob = "\n".join(cases) + "\n"
-                self.assertFalse(
-                    any("R" in (line[:2] if line else "") for line in blob.splitlines()),
-                    blob,
-                )
-                return blob
-            return orig(repo, *args, check=check)
-
-        gu.git = fake_git
-        try:
-            paths = porcelain_paths(self.repo)
-        finally:
-            gu.git = orig
+    def test_porcelain_copy_blob_is_dest_only(self):
+        paths = self._porcelain_with_status(
+            ["C  copy_dest", "copy_src", "CM copy dest.py", "copy src.py"]
+        )
         self.assertIn("copy_dest", paths, paths)
         self.assertIn("copy dest.py", paths, paths)
+        self.assertNotIn("copy_src", paths, paths)
 
     def test_porcelain_rename_space_and_score_and_copy(self):
         # Real git mv is rename (R), never isolated copy. Copy dest-in-delta
