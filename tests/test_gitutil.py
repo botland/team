@@ -605,3 +605,88 @@ class ReviewSurfaceBudgetTests(unittest.TestCase):
     def test_one_file_may_not_eat_the_whole_allowance(self):
         self.assertEqual(file_budget(DIFF_BUDGET), DIFF_BUDGET // 8)
         self.assertGreaterEqual(file_budget(1), 32 * 1024)
+
+
+class BudgetOrderingTests(unittest.TestCase):
+    """Which bytes survive, not just how many.
+
+    The first budget kept sections in git's status order, which is lexical:
+    coverage-html/ precedes src/, and generated files are individually under
+    the per-file cap, so the cap never fired and the allowance went
+    first-come-first-served to build output. The fixture here is the shape of
+    the real case -- *many* files under the per-file cap -- which a fixture
+    with one huge file cannot exercise.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        (self.repo / "src").mkdir()
+        (self.repo / "coverage-html").mkdir()
+        for i in range(200):
+            (self.repo / "coverage-html" / ("f%03d.html" % i)).write_text(
+                "<p>gen</p>\n" * 1200, encoding="utf-8"
+            )
+        for i in range(6):
+            (self.repo / "src" / ("mod%d.py" % i)).write_text(
+                "# real work\n" * 400, encoding="utf-8"
+            )
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _budget(self, **kw):
+        sections = worktree_diff_sections(self.repo, porcelain_paths(self.repo))
+        return budget_sections(sections, total=512 * 1024, **kw)
+
+    def test_every_file_under_the_per_file_cap_still_trips_the_total(self):
+        """Precondition: no single section is oversized, so only the
+        aggregate budget and its ordering are under test."""
+        sections = worktree_diff_sections(self.repo, porcelain_paths(self.repo))
+        cap = file_budget(512 * 1024)
+        biggest = max(len(t.encode("utf-8")) for _r, t in sections)
+        self.assertLess(biggest, cap)
+        self.assertGreater(sum(len(t.encode("utf-8")) for _r, t in sections), 512 * 1024)
+
+    def test_the_role_roots_are_served_before_anything_else(self):
+        patch, _omitted = self._budget(prefer=["src", "tests"])
+        for i in range(6):
+            self.assertIn("src/mod%d.py" % i, patch, "real work must survive the cap")
+
+    def test_lexical_order_does_not_decide_who_survives(self):
+        """coverage-html sorts first; that must not be why it is kept."""
+        patch, _omitted = self._budget(prefer=["src", "tests"])
+        kept_gen = patch.count("diff --git a/coverage-html")
+        kept_src = patch.count("diff --git a/src")
+        self.assertEqual(kept_src, 6)
+        self.assertLess(
+            kept_gen,
+            200,
+            "generated output must not fill the allowance just by sorting first",
+        )
+
+    def test_outside_the_roots_may_not_take_the_whole_allowance(self):
+        patch, _omitted = self._budget(prefer=["src", "tests"])
+        outside = sum(
+            len(part.encode("utf-8"))
+            for part in patch.split("diff --git ")
+            if part.startswith("a/coverage-html")
+        )
+        self.assertLessEqual(
+            outside, 512 * 1024 // 2, "a budget is a cap, not a quota to spend"
+        )
+
+    def test_without_roots_the_smallest_sections_win(self):
+        """code_root='.' makes nothing second-class, so ratio decides."""
+        patch, omitted = self._budget(prefer=["."])
+        self.assertTrue(omitted)
+        kept = [p for p in patch.split("diff --git ") if p.strip()]
+        self.assertTrue(kept)
+
+    def test_the_patch_still_reads_in_tree_order(self):
+        patch, _omitted = self._budget(prefer=["src", "tests"])
+        names = [
+            p.split(" ")[0][2:] for p in patch.split("diff --git ") if p.startswith("a/")
+        ]
+        self.assertEqual(names, sorted(names), "budget order is not reading order")

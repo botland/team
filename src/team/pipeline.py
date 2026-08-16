@@ -1469,7 +1469,9 @@ class Pipeline:
         # dirty path: porcelain_paths above is untouched by any of this.
         sections = gitutil.worktree_diff_sections(self.repo, dirty)
         patch, omitted = gitutil.budget_sections(
-            sections, total=self.cfg.diff_budget
+            sections,
+            total=self.cfg.diff_budget,
+            prefer=[self.cfg.code_root, self.cfg.test_root],
         )
         note = gitutil.budget_note(
             omitted, names_file="git/apply-names.txt", total=self.cfg.diff_budget
@@ -2783,7 +2785,9 @@ class Pipeline:
         if gitutil.is_git_repo(self.repo):
             sections = gitutil.worktree_diff_sections(self.repo, touched)
             patch, omitted = gitutil.budget_sections(
-                sections, total=self.cfg.diff_budget
+                sections,
+                total=self.cfg.diff_budget,
+                prefer=[self.cfg.code_root, self.cfg.test_root],
             )
             patch = (
                 gitutil.budget_note(

@@ -568,33 +568,78 @@ def file_budget(total: int) -> int:
 
 
 def budget_sections(
-    sections: Sequence[Tuple[str, str]], *, total: int
+    sections: Sequence[Tuple[str, str]],
+    *,
+    total: int,
+    prefer: Sequence[str] = (),
 ) -> Tuple[str, List[str]]:
     """Cap a patch by bytes. Returns ``(patch, omitted paths)``.
 
     A review surface with no size law costs every downstream hop its full byte
     count -- the same reason ``ignored_untracked`` exists, except that rule
     delegates to the target repo's .gitignore and a repo that does not ignore
-    its build output gets an 11 MB patch. Omitted sections are *named*, never
-    silently dropped: the caller writes them to the path list beside the patch,
-    so a reviewer can still open any of them.
+    its build output gets an 11 MB patch.
+
+    Which bytes survive matters as much as how many. Sections arrive in git's
+    status order, which is lexical, so ``coverage-html/`` precedes ``src/``;
+    spending the allowance first-come-first-served fills it with generated
+    output that is individually *under* the per-file cap, and the reviewer
+    gets a correctly-sized patch of the wrong files. Two passes fix it:
+    paths under ``prefer`` (the role roots -- the code actually under review)
+    are served first, and inside each pass the smallest go first, because a
+    small section buys the most understanding per byte. That is the same
+    policy, for the same reason, as ``Pipeline._inline_choice``.
+
+    Omitted sections are *named*, never silently dropped: the caller writes
+    them to the path list beside the patch, so a reviewer can still open any.
 
     ``total <= 0`` disables the cap.
     """
     if total <= 0:
         return "".join(text for _rel, text in sections), []
     per_file = file_budget(total)
-    kept: List[str] = []
+    order = {rel: i for i, (rel, _text) in enumerate(sections)}
+    roots = [posix(r).strip("/") for r in prefer if str(r).strip() not in ("", ".")]
+
+    def preferred(rel: str) -> bool:
+        # No usable roots (unset, or '.') means nothing is second-class.
+        return not roots or any(under_root(rel, root) for root in roots)
+
+    ranked = sorted(
+        sections,
+        key=lambda pair: (
+            not preferred(pair[0]),
+            len(pair[1].encode("utf-8", "replace")),
+            pair[0],
+        ),
+    )
+    # A budget is a cap, not a quota to spend. Once the role roots are served,
+    # filling the remainder with whatever else is dirty buys nothing and is
+    # paid on every turn of every hop that reads it, so paths outside those
+    # roots may take at most half the allowance.
+    outside_cap = total // 2 if roots else total
+    kept: List[Tuple[str, str]] = []
     omitted: List[str] = []
     spent = 0
-    for rel, text in sections:
+    spent_outside = 0
+    for rel, text in ranked:
         size = len(text.encode("utf-8", "replace"))
-        if size > per_file or spent + size > total:
+        outside = not preferred(rel)
+        if (
+            size > per_file
+            or spent + size > total
+            or (outside and spent_outside + size > outside_cap)
+        ):
             omitted.append(rel)
             continue
-        kept.append(text)
+        kept.append((rel, text))
         spent += size
-    return "".join(kept), omitted
+        if outside:
+            spent_outside += size
+    # Emitted in the order the caller derived them: a patch that reads in tree
+    # order is the one a reviewer expects, whatever order the budget chose.
+    kept.sort(key=lambda pair: order.get(pair[0], 0))
+    return "".join(text for _rel, text in kept), sorted(omitted, key=lambda r: order.get(r, 0))
 
 
 def budget_patch_text(patch: str, *, total: int) -> Tuple[str, int]:
