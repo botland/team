@@ -14,7 +14,15 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from team.config import load_config, schema_path
-from team.pipeline import CENSUS_ARTIFACT, PipelineError, start_feature, start_range_review
+from team.pipeline import (
+    CENSUS_ARTIFACT,
+    CROSS_ROLE_ARTIFACTS,
+    INLINE_ARTIFACT_MAX,
+    INLINE_TOTAL_MAX,
+    PipelineError,
+    start_feature,
+    start_range_review,
+)
 from team.schemas import validate as validate_schema
 from team.util import load_json
 from tests.support.hostile import emit, register_runtime
@@ -96,7 +104,10 @@ class CensusTests(unittest.TestCase):
         self.assertIn("census.md is a map", later)
         self.assertIn("Do not recensus", later)
         self.assertIn("does not replace", later)
-        self.assertIn(str(pipe.work / CENSUS_ARTIFACT), later)
+        # A census this small rides in the prompt rather than costing the hop a
+        # tool round trip, but it is still present in full.
+        self.assertIn("layout", later)
+        self.assertIn("--- census.md (inlined", later)
 
     def test_census_does_not_remove_the_diff_from_required_reading(self):
         pipe = self._pipe()
@@ -197,3 +208,73 @@ class CensusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InlineScopeTests(unittest.TestCase):
+    """What rides in the prompt, and what a hop must still go and fetch.
+
+    Carrying a small input is cheaper than a tool round trip, which re-sends
+    the hop's whole context. But a prompt is also a scope: whatever the
+    orchestrator pastes in, the role has been handed. Artifacts that
+    aggregate findings across roles are never pasted, at any size.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        os.environ["TEAM_HOME"] = str(ROOT)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _pipe(self, slug="inline-scope"):
+        cfg = load_config(
+            self.repo, fake=True, force=True, code_root="src", test_root="tests"
+        )
+        return start_feature(cfg, "brief", slug)
+
+    def test_a_small_input_is_carried(self):
+        pipe = self._pipe()
+        pipe.write_artifact("design.md", "# Design\n\nsmall enough\n")
+        text = pipe._listed_artifacts(["design.md"])
+        self.assertIn("small enough", text)
+        self.assertIn("do not open it again", text)
+
+    def test_a_big_dump_stays_a_path(self):
+        pipe = self._pipe()
+        pipe.write_artifact("git/diff.patch", "x" * (80 * 1024))
+        text = pipe._listed_artifacts(["git/diff.patch"])
+        self.assertIn("Read these files with tools", text)
+        self.assertIn(str(pipe.artifact("git/diff.patch")), text)
+        self.assertNotIn("x" * 100, text)
+
+    def test_cross_role_reports_are_never_carried(self):
+        """A test-writer handed apply-plan.md has been handed every
+        implementation finding in it. Scope is what the orchestrator gives."""
+        pipe = self._pipe()
+        for name in sorted(CROSS_ROLE_ARTIFACTS):
+            pipe.write_artifact(name, "# %s\n\nfinding for another role\n" % name)
+        text = pipe._listed_artifacts(sorted(CROSS_ROLE_ARTIFACTS))
+        self.assertNotIn("finding for another role", text)
+        for name in sorted(CROSS_ROLE_ARTIFACTS):
+            self.assertIn(str(pipe.artifact(name)), text)
+
+    def test_the_total_cap_holds_when_many_artifacts_are_small(self):
+        pipe = self._pipe()
+        names = []
+        for i in range(12):
+            name = "small-%02d.md" % i
+            pipe.write_artifact(name, "y" * 3000)
+            names.append(name)
+        text = pipe._listed_artifacts(names)
+        carried = text.count("inlined below")
+        self.assertLessEqual(carried * 3000, INLINE_TOTAL_MAX)
+        self.assertIn("Read these files with tools", text)
+
+    def test_an_oversized_single_artifact_is_never_carried(self):
+        pipe = self._pipe()
+        pipe.write_artifact("design.md", "z" * (INLINE_ARTIFACT_MAX + 1))
+        text = pipe._listed_artifacts(["design.md"])
+        self.assertNotIn("z" * 100, text)
+        self.assertIn(str(pipe.artifact("design.md")), text)

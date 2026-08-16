@@ -738,7 +738,8 @@ class FakeApplyTests(unittest.TestCase):
         impl_prompts = list((work / "prompts").glob("*implementer-apply*"))
         impl_text = "\n".join(p.read_text(encoding="utf-8") for p in impl_prompts)
         self.assertIn("design.md", impl_text)
-        self.assertNotIn(design, impl_text)
+        # design.md is this role's own input, small enough to carry.
+        self.assertIn(design.strip(), impl_text)
         seq_dirs = list((work / "seq").iterdir())
         self.assertEqual(len(seq_dirs), 2)
         reviews = list((work / "seq").glob("*/review.md"))

@@ -63,6 +63,21 @@ class PipelineError(RuntimeError):
 # Diffs and working-tree files remain required reading.
 CENSUS_ARTIFACT = "census.md"
 
+# An artifact this small travels in the prompt instead of costing the hop a
+# tool round trip. Deliberately conservative: see Pipeline._inline_choice.
+INLINE_ARTIFACT_MAX = 4 * 1024
+INLINE_TOTAL_MAX = 12 * 1024
+
+# Artifacts that aggregate findings across roles. Never inlined at any size:
+# a role's scope is what the orchestrator *hands* it, and pasting the whole
+# plan into a test-writer's prompt hands it every implementation finding
+# too. They stay listed, exactly as before, so a hop that genuinely needs the
+# wider picture can still open one. The scoped findings for a hop arrive by
+# their own route (_findings_prompt_lines), already filtered by kind.
+CROSS_ROLE_ARTIFACTS = frozenset(
+    {"apply-plan.md", "review.md", "guardian.md", "followups.md", "apply-seq.md"}
+)
+
 # HEAD copies of product law, for comparison. Live AGENTS.md is still R.
 RANGE_HEAD_LAW = (
     ("AGENTS.md", "git/committed-AGENTS.md"),
@@ -641,6 +656,36 @@ class Pipeline:
             self.cfg.test_root = test
             self.state.test_root = test
 
+    def _inline_choice(self, sizes: Dict[str, int]) -> set:
+        """Which listed artifacts travel in the prompt instead of as a path.
+
+        Carrying S bytes inline costs S on every turn of the hop. Making the
+        model fetch them costs S on every turn *after* the read, plus a whole
+        extra turn -- and a turn re-sends the entire context, which is the
+        expensive part (measured: ~54k tokens/turn, 20 turns/hop).
+
+        The caps are deliberately small because that comparison has an
+        unmeasured term: an agent can fetch several files in one turn, so N
+        listed artifacts may cost one round trip rather than N. Under batching
+        the two strategies converge, and inlining only stays ahead for
+        artifacts small enough that carrying them is nearly free. A 4 KB file
+        is ~1k tokens, ~20k over a whole hop, well under one turn's context;
+        a 40 KB one would not be. Large dumps stay listed. prompt_bytes and
+        listed_bytes in the ledger are what these numbers get tuned against.
+
+        Small files are taken first because their ratio is best.
+        """
+        chosen = set()
+        spent = 0
+        for name, size in sorted(sizes.items(), key=lambda kv: (kv[1], kv[0])):
+            if name in CROSS_ROLE_ARTIFACTS:
+                continue
+            if size > INLINE_ARTIFACT_MAX or spent + size > INLINE_TOTAL_MAX:
+                continue
+            chosen.add(name)
+            spent += size
+        return chosen
+
     def _listed_artifacts(self, names: List[str]) -> str:
         seen = set()
         ordered: List[str] = []
@@ -649,18 +694,29 @@ class Pipeline:
                 continue
             seen.add(name)
             ordered.append(name)
-        present: List[str] = []
+        sizes: Dict[str, int] = {}
         missing: List[str] = []
-        offered = 0
         for name in ordered:
             path = self.artifact(name)
             if path.is_file():
-                present.append("- %s" % path)
-                offered += path.stat().st_size
+                sizes[name] = path.stat().st_size
             else:
                 missing.append("- %s" % name)
-        self._tls.listed_bytes = offered
+        self._tls.listed_bytes = sum(sizes.values())
+        inline = self._inline_choice(sizes)
+        present = [
+            "- %s" % self.artifact(name) for name in ordered if name in sizes and name not in inline
+        ]
         lines = ["Work directory: %s" % self.work]
+        for name in ordered:
+            if name not in inline:
+                continue
+            lines.append("")
+            lines.append("--- %s (inlined below; do not open it again) ---" % name)
+            lines.append(self.read_artifact(name).rstrip("\n"))
+            lines.append("--- end %s ---" % name)
+        if inline:
+            lines.append("")
         if present:
             lines.append("Read these files with tools before answering:")
             lines.extend(present)
@@ -680,9 +736,14 @@ class Pipeline:
                 "Judgments stay in your role artifact. "
                 "The orchestrator writes census.md once."
             )
+        # Inlined artifacts are already in front of the model, but the tree is
+        # not: a hop that answers from artifacts alone has reviewed nobody's
+        # code. unfinished_inspect enforces the same rule from the other side.
         lines.append(
-            "Use tools on the listed present files and the paths your task names. "
+            "%sUse tools on the paths your task names, and on the tree itself. "
+            "An inlined artifact is a claim, not the code. "
             "An empty or thin answer is valid only after that inspect."
+            % ("Do not re-open anything inlined above. " if inline else "")
         )
         return "\n".join(lines)
 
