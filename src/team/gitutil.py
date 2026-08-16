@@ -159,9 +159,15 @@ def name_status_paths(records: Sequence[str]) -> List[str]:
     return out
 
 
+# Orchestrator-owned trees inside .team. Not all of .team: a hop rewriting
+# .team/config.toml is still a violation, because that is the project's
+# configuration and not the orchestrator's scratch.
+PROTOCOL_ROOTS = (".team/work", ".team/census")
+
+
 def _is_team_work(rel: str) -> bool:
-    """Orchestrator work dir — exempt from product-tree membership."""
-    return under_root(rel, ".team/work")
+    """Orchestrator-owned paths — exempt from product-tree membership."""
+    return any(under_root(rel, root) for root in PROTOCOL_ROOTS)
 
 
 def porcelain_paths(repo: Path) -> List[str]:
@@ -445,12 +451,12 @@ def revert_product(
     repo: Path,
     before: dict,
     *,
-    skip_prefixes: Sequence[str] = (".team/work",),
+    skip_prefixes: Sequence[str] = PROTOCOL_ROOTS,
 ) -> None:
     """Revert product-tree create/modify/delete/commit to ``before``.
 
     Not unlink-only: tracked files return via git/HEAD; hop-start dirty
-    files return from stored blobs. ``.team/work`` is left alone.
+    files return from stored blobs. ``PROTOCOL_ROOTS`` are left alone.
     """
     before = before or {}
     before_head = str(before.get("head") or "")

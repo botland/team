@@ -74,6 +74,10 @@ INLINE_TOTAL_MAX = 12 * 1024
 # too. They stay listed, exactly as before, so a hop that genuinely needs the
 # wider picture can still open one. The scoped findings for a hop arrive by
 # their own route (_findings_prompt_lines), already filtered by kind.
+# Names appended to a reused census. A cap, not a summary: past this many the
+# map is stale enough that the count is the useful signal.
+_CENSUS_MOVED_MAX = 40
+
 CROSS_ROLE_ARTIFACTS = frozenset(
     {"apply-plan.md", "review.md", "guardian.md", "followups.md", "apply-seq.md"}
 )
@@ -153,6 +157,7 @@ class Pipeline:
         # builds two prompts on this one Pipeline at once, and a shared
         # attribute would bill one reviewer's listing to the other.
         self._tls = threading.local()
+        self._seed_census()
 
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
@@ -747,6 +752,61 @@ class Pipeline:
         )
         return "\n".join(lines)
 
+    def _census_key(self) -> str:
+        """What a cached census is a census *of*. Empty when unanswerable.
+
+        HEAD alone: a census is a tree inventory, which is a property of the
+        commit, not of the slug that paid for it. The dirty set rides in the
+        sidecar rather than the key, because a working tree changes on every
+        hop and keying on it would never hit.
+        """
+        if not gitutil.is_git_repo(self.repo):
+            return ""
+        return gitutil.head(self.repo) or ""
+
+    def _census_cache(self, key: str) -> Path:
+        return self.repo / ".team" / "census" / ("%s.md" % key)
+
+    def _seed_census(self) -> None:
+        """Reuse this repo state's census instead of buying it again.
+
+        census.md was per-slug, so every feature and every review paid an
+        inspect hop to re-derive the same tree map. Under .team/census it is
+        written once per commit and read by every later run. Nothing is
+        assumed about the dirty tree: paths that moved since the census was
+        written are named, so a reused map is never stale-in-a-lying-way.
+        """
+        if self.artifact(CENSUS_ARTIFACT).is_file():
+            return
+        key = self._census_key()
+        if not key:
+            return
+        cached = self._census_cache(key)
+        sidecar = cached.with_suffix(".json")
+        # No sidecar means no record of the tree it describes, so nothing can be
+        # said about what moved. Buy a fresh census rather than reuse a map
+        # whose staleness is unknowable.
+        if not cached.is_file() or not sidecar.is_file():
+            return
+        text = cached.read_text(encoding="utf-8")
+        stamped = set(as_list(load_json(sidecar).get("dirty")))
+        now = set(gitutil.product_paths(gitutil.porcelain_paths(self.repo)))
+        moved = sorted((now - stamped) | (stamped - now))
+        if moved:
+            text = text.rstrip() + "\n\n## Changed since this census\n\n" + "".join(
+                "- %s\n" % rel for rel in moved[:_CENSUS_MOVED_MAX]
+            )
+            if len(moved) > _CENSUS_MOVED_MAX:
+                text += "- ... and %d more\n" % (len(moved) - _CENSUS_MOVED_MAX)
+            text += (
+                "\nThese paths differ from the tree this census describes. "
+                "Read them; do not trust the map for them.\n"
+            )
+        self.write_artifact(CENSUS_ARTIFACT, text)
+        self.log(
+            "census reused from %s (%d path(s) changed since)" % (cached, len(moved))
+        )
+
     def _adopt_census(self, output: Any) -> None:
         """First inspect hop to emit census_markdown writes census.md. Later hops read it."""
         if not isinstance(output, dict):
@@ -759,6 +819,18 @@ class Pipeline:
             return
         self.write_artifact(CENSUS_ARTIFACT, text)
         self.log("census written")
+        key = self._census_key()
+        if not key:
+            return
+        write_text(self._census_cache(key), text)
+        dump_json(
+            self._census_cache(key).with_suffix(".json"),
+            {
+                "head": key,
+                "slug": self.state.slug,
+                "dirty": gitutil.product_paths(gitutil.porcelain_paths(self.repo)),
+            },
+        )
 
     def _engineering_rules(self) -> str:
         path = engine_root() / "docs" / "engineering.md"
@@ -829,7 +901,7 @@ class Pipeline:
         ok, bad = gitutil.verify_delta(
             delta,
             roots,
-            always_allowed=[work_root, ".team/work"],
+            always_allowed=[work_root, *gitutil.PROTOCOL_ROOTS],
             denied_roots=denied_roots,
         )
         # Extra-worktree is a different space than in-repo membership.
@@ -851,7 +923,7 @@ class Pipeline:
             self._run_start_entries(before_snap),
             dict(before_snap.get("entries") or {}),
             dict(after.get("entries") or {}),
-            exempt_roots=(work_root, ".team/work"),
+            exempt_roots=(work_root, *gitutil.PROTOCOL_ROOTS),
         )
         gitutil.write_path_list(self.work / "git" / ("after-%s.txt" % phase), delta)
         report = gitutil.describe_verify(
@@ -1657,7 +1729,7 @@ class Pipeline:
             and before.get("head") != after.get("head")
         )
         try:
-            self._verify_write(phase, [".team/work"], before)
+            self._verify_write(phase, list(gitutil.PROTOCOL_ROOTS), before)
             if head_changed:
                 raise PipelineError(
                     "%s changed HEAD %s -> %s (read-only hop must not commit)"

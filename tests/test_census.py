@@ -27,7 +27,8 @@ from team.schemas import validate as validate_schema
 from team.util import load_json
 from tests.support.hostile import emit, register_runtime
 from tests.support.hostile import HostileRuntime
-from tests.support.repo import init_repo
+from team.gitutil import product_paths
+from tests.support.repo import git, init_repo
 
 
 class CensusTests(unittest.TestCase):
@@ -278,3 +279,98 @@ class InlineScopeTests(unittest.TestCase):
         text = pipe._listed_artifacts(["design.md"])
         self.assertNotIn("z" * 100, text)
         self.assertIn(str(pipe.artifact("design.md")), text)
+
+
+class CensusCacheTests(unittest.TestCase):
+    """A census is a property of the commit, not of the slug that paid for it.
+
+    Per-slug, every feature and every review bought the same tree map again.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        os.environ["TEAM_HOME"] = str(ROOT)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _pipe(self, slug):
+        cfg = load_config(self.repo, fake=True, force=True)
+        cfg.code_root = "src"
+        cfg.test_root = "tests"
+        return start_feature(cfg, "brief", slug)
+
+    def _write_census(self, pipe, body="# Census\n\nlayout\n"):
+        hostile = HostileRuntime(
+            [
+                emit(
+                    {
+                        "design_markdown": "# D\n",
+                        "code_root": "src",
+                        "test_root": "tests",
+                        "census_markdown": body,
+                    }
+                )
+            ],
+            phases=("architect",),
+            num_turns=2,
+        )
+        with register_runtime("fake", hostile):
+            pipe.invoke("architect", "architect", "d", "design.json")
+
+    def test_a_second_slug_at_the_same_head_does_not_buy_it_again(self):
+        first = self._pipe("cache-one")
+        self._write_census(first)
+        self.assertTrue((first.work / CENSUS_ARTIFACT).is_file())
+        second = self._pipe("cache-two")
+        self.assertTrue(
+            (second.work / CENSUS_ARTIFACT).is_file(),
+            "a new slug at the same HEAD starts with the census already in hand",
+        )
+        self.assertIn("layout", (second.work / CENSUS_ARTIFACT).read_text(encoding="utf-8"))
+
+    def test_a_new_commit_does_not_reuse_the_old_map(self):
+        first = self._pipe("cache-head-one")
+        self._write_census(first)
+        (self.repo / "new.py").write_text("x = 1\n", encoding="utf-8")
+        git(self.repo, "add", "new.py")
+        git(self.repo, "commit", "-m", "move HEAD")
+        second = self._pipe("cache-head-two")
+        self.assertFalse(
+            (second.work / CENSUS_ARTIFACT).is_file(),
+            "the tree changed, so the cached map is not a map of it",
+        )
+
+    def test_a_reused_map_names_what_moved_under_it(self):
+        first = self._pipe("cache-dirty-one")
+        self._write_census(first)
+        (self.repo / "scratch.py").write_text("y = 2\n", encoding="utf-8")
+        second = self._pipe("cache-dirty-two")
+        text = (second.work / CENSUS_ARTIFACT).read_text(encoding="utf-8")
+        self.assertIn("Changed since this census", text)
+        self.assertIn("scratch.py", text)
+        self.assertIn("do not trust the map for them", text)
+
+    def test_a_cache_without_its_sidecar_is_not_reused(self):
+        first = self._pipe("cache-bare-one")
+        self._write_census(first)
+        for stray in (self.repo / ".team" / "census").glob("*.json"):
+            stray.unlink()
+        second = self._pipe("cache-bare-two")
+        self.assertFalse(
+            (second.work / CENSUS_ARTIFACT).is_file(),
+            "staleness that cannot be computed is not staleness that is absent",
+        )
+
+    def test_the_cache_is_not_product(self):
+        """.team/census is orchestrator scratch, like .team/work: a hop that
+        writes there has not written the product tree."""
+        first = self._pipe("cache-fence")
+        self._write_census(first)
+        cached = list((self.repo / ".team" / "census").glob("*.md"))
+        self.assertTrue(cached)
+        self.assertEqual(
+            product_paths([str(p.relative_to(self.repo)) for p in cached]), []
+        )
