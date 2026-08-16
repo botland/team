@@ -185,6 +185,7 @@ def hop_record(
     ts: Optional[str] = None,
     prompt_bytes: Optional[int] = None,
     listed_bytes: Optional[int] = None,
+    inlined_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     rec: Dict[str, Any] = {
         "ts": ts or _now_utc(),
@@ -197,13 +198,17 @@ def hop_record(
         "num_turns": num_turns,
     }
     # What the orchestrator handed the hop, beside what the hop then spent.
-    # A hop's tokens are turns x context; these two say how much of the
-    # starting context we chose, so a context cut is attributable to a cause
-    # instead of to luck.
+    # A hop's tokens are turns x context; these say how much of the starting
+    # context we chose, so a context cut is attributable to a cause instead of
+    # to luck. listed_bytes is what is left to *fetch* and inlined_bytes what
+    # travels in the prompt -- disjoint, so moving an artifact between them
+    # moves the ledger.
     if prompt_bytes is not None:
         rec["prompt_bytes"] = int(prompt_bytes)
     if listed_bytes is not None:
         rec["listed_bytes"] = int(listed_bytes)
+    if inlined_bytes is not None:
+        rec["inlined_bytes"] = int(inlined_bytes)
     if usage is not None:
         rec.update(usage.to_dict())
     return rec
@@ -336,6 +341,21 @@ def summarize(hops: List[Dict[str, Any]]) -> Dict[str, Any]:
     context = totals.get("input_tokens", 0) + totals.get(
         "cache_read_input_tokens", 0
     )
+    # The ratio is only meaningful over hops that reported both factors.
+    # Dividing every hop's context by some hops' turns invents a number:
+    # a 100k-context hop with no num_turns beside a 2-turn hop reported
+    # ~51k/turn. Hops missing either side are counted and named instead.
+    paired = [
+        hop
+        for hop in hops
+        if _as_int(hop.get("num_turns")) and hop_has_tokens(hop)
+    ]
+    paired_turns = sum(_as_int(hop.get("num_turns")) or 0 for hop in paired)
+    paired_context = sum(
+        (_as_int(hop.get("input_tokens")) or 0)
+        + (_as_int(hop.get("cache_read_input_tokens")) or 0)
+        for hop in paired
+    )
     return {
         "hops": len(hops),
         "hops_with_tokens": hops_with_tokens,
@@ -346,15 +366,29 @@ def summarize(hops: List[Dict[str, Any]]) -> Dict[str, Any]:
         "num_turns": turns_sum,
         "hops_with_turns": turns_known,
         "context_tokens": context,
-        "context_per_turn": int(context / turns_sum) if turns_sum else None,
-        "prompt_bytes": sum(
-            _as_int(hop.get("prompt_bytes")) or 0 for hop in hops
+        "context_per_turn": (
+            int(paired_context / paired_turns) if paired_turns else None
         ),
-        "listed_bytes": sum(
-            _as_int(hop.get("listed_bytes")) or 0 for hop in hops
-        ),
+        "hops_missing_ratio": len(hops) - len(paired),
+        # Absent is unknown, not zero -- the rule the $ column already
+        # follows. A ledger written before these fields existed must not
+        # summarize as "we handed the hops nothing".
+        **_byte_totals(hops),
         **totals,
     }
+
+
+_BYTE_KEYS = ("prompt_bytes", "listed_bytes", "inlined_bytes")
+
+
+def _byte_totals(hops: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key in _BYTE_KEYS:
+        known = [_as_int(hop.get(key)) for hop in hops]
+        known = [value for value in known if value is not None]
+        out[key] = sum(known) if known else None
+        out["hops_with_" + key] = len(known)
+    return out
 
 
 def group_hops(hops: List[Dict[str, Any]], key: str) -> List[tuple]:
@@ -553,13 +587,15 @@ def format_costs_listing(
             complete=complete,
             missing=int(summary.get("hops_missing_cost") or 0),
         )
-        label = str(name or "")
-        if label == "total":
-            slug_cell = style.paint(label, style.BOLD, enabled=enabled) + (
-                " " * max(0, 28 - len(label))
+        # Not `label`: that names the column, and rebinding it here read as
+        # if the header could change per row.
+        cell = str(name or "")
+        if cell == "total":
+            slug_cell = style.paint(cell, style.BOLD, enabled=enabled) + (
+                " " * max(0, 28 - len(cell))
             )
         else:
-            slug_cell = label.ljust(28)
+            slug_cell = cell.ljust(28)
         token_cell = (
             style.tokens(token_raw, enabled=enabled)
             if tokens

@@ -35,19 +35,14 @@ def load_json(path: Path) -> Any:
     return json.loads(read_text(path))
 
 
-def dump_json(path: Path, obj: Any) -> Path:
-    """Write JSON so a reader never sees a partial document.
+def write_atomic(path: Path, text: str) -> Path:
+    """Write text so a reader never sees a partial file.
 
-    ``write_text`` truncates and then writes: a concurrent or interrupted write
-    leaves a prefix on disk, and a *shorter* write landing inside a longer one
-    leaves a complete document followed by trailing garbage -- which parses as a
-    JSONDecodeError at load and takes down every command that touches the slug.
-    Rename is atomic within a filesystem, so readers see the old file or the new
-    one and never a half of either. The temp file is a sibling to keep the
-    rename on one filesystem.
+    The mechanism dump_json documents, for callers whose payload is not JSON.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(obj, indent=2, sort_keys=True) + "\n"
+    if not text.endswith("\n"):
+        text += "\n"
     # Unique per call, not per process: two threads writing the same path would
     # otherwise share one temp name and the second os.replace would find it
     # already renamed away.
@@ -62,6 +57,20 @@ def dump_json(path: Path, obj: Any) -> Path:
             pass
         raise
     return path
+
+
+def dump_json(path: Path, obj: Any) -> Path:
+    """Write JSON so a reader never sees a partial document.
+
+    ``write_text`` truncates and then writes: a concurrent or interrupted write
+    leaves a prefix on disk, and a *shorter* write landing inside a longer one
+    leaves a complete document followed by trailing garbage -- which parses as a
+    JSONDecodeError at load and takes down every command that touches the slug.
+    Rename is atomic within a filesystem, so readers see the old file or the new
+    one and never a half of either. The temp file is a sibling to keep the
+    rename on one filesystem.
+    """
+    return write_atomic(path, json.dumps(obj, indent=2, sort_keys=True))
 
 
 def slugify(text: str, max_len: int = 40) -> str:

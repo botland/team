@@ -129,11 +129,13 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--fake", action="store_true", help="Do not call Claude/Grok; emit canned artifacts.")
     p.add_argument(
         "--warm",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help=(
             "Resume a session across consecutive hops of one role+runtime+capability "
             "instead of minting a new one. Files stay the protocol; any link can be "
-            "dropped and rerun cold with the same result."
+            "dropped and rerun cold with the same result. --no-warm overrides "
+            "[run] warm for one run."
         ),
     )
     p.add_argument("--code-root", default="", help="Override implementation root")
@@ -517,7 +519,7 @@ def _cfg(args, **kwargs):
         test_command=args.test_command,
         depth=getattr(args, "depth", "") or "",
         effort=getattr(args, "effort", None) or [],
-        warm=bool(getattr(args, "warm", False)),
+        warm=getattr(args, "warm", None),
         **kwargs,
     )
 
@@ -1106,7 +1108,7 @@ def cmd_costs(args) -> int:
     if not hops:
         print("no usage logged in %s" % (repo / ".team" / "work"))
         return 0
-    if group and group != "slug":
+    if group:
         print(_costs_grouped(hops, group))
         return 0
     by_slug: Dict[str, List[dict]] = {}

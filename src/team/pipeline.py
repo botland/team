@@ -52,6 +52,7 @@ from team.util import (
     load_json,
     posix,
     normalize_root,
+    write_atomic,
     write_text,
 )
 
@@ -343,7 +344,7 @@ class Pipeline:
                 runtime_name,
                 result,
                 prompt_bytes=len(prompt.encode("utf-8")),
-                listed_bytes=getattr(self._tls, "listed_bytes", None),
+                **self._take_listing_bytes(),
             )
         if before is not None:
             self._fence_after_invoke(cap, phase, before, write_verify)
@@ -582,6 +583,7 @@ class Pipeline:
         *,
         prompt_bytes: Optional[int] = None,
         listed_bytes: Optional[int] = None,
+        inlined_bytes: Optional[int] = None,
     ) -> None:
         """Persist provider spend for this hop. Missing $ is logged, not dropped."""
         rec = usage_mod.hop_record(
@@ -595,6 +597,7 @@ class Pipeline:
             usage=result.usage,
             prompt_bytes=prompt_bytes,
             listed_bytes=listed_bytes,
+            inlined_bytes=inlined_bytes,
         )
         usage_mod.record_hop(self.work, rec)
         self.log(usage_mod.format_hop_console(rec))
@@ -774,6 +777,22 @@ class Pipeline:
             self.cfg.test_root = test
             self.state.test_root = test
 
+    def _take_listing_bytes(self) -> Dict[str, Any]:
+        """Read and clear what the last _listed_artifacts on this thread offered.
+
+        Cleared, not merely read: the value travels by thread-local because
+        prompt building and invoking are separate calls, and a hop whose
+        prompt listed nothing must bill nothing rather than inherit its
+        predecessor's figure. Absent is unknown, the same rule as the $ column.
+        """
+        out = {
+            "listed_bytes": getattr(self._tls, "listed_bytes", None),
+            "inlined_bytes": getattr(self._tls, "inlined_bytes", None),
+        }
+        self._tls.listed_bytes = None
+        self._tls.inlined_bytes = None
+        return out
+
     def _inline_choice(self, sizes: Dict[str, int]) -> set:
         """Which listed artifacts travel in the prompt instead of as a path.
 
@@ -820,8 +839,18 @@ class Pipeline:
                 sizes[name] = path.stat().st_size
             else:
                 missing.append("- %s" % name)
-        self._tls.listed_bytes = sum(sizes.values())
         inline = self._inline_choice(sizes)
+        # Only what is left to fetch. Counting inlined artifacts here too
+        # would double-count them -- they are already inside prompt_bytes --
+        # and moving one from listed to inlined would not move the ledger on
+        # this axis at all, which is precisely the comparison the field
+        # exists to make.
+        self._tls.listed_bytes = sum(
+            size for name, size in sizes.items() if name not in inline
+        )
+        self._tls.inlined_bytes = sum(
+            size for name, size in sizes.items() if name in inline
+        )
         present = [
             "- %s" % self.artifact(name) for name in ordered if name in sizes and name not in inline
         ]
@@ -907,7 +936,11 @@ class Pipeline:
                 "entries": self._census_entries(),
             },
         )
-        write_text(cached, text)
+        # Atomic, for the reason dump_json's own docstring gives: write_text
+        # truncates then writes, and two reviewer threads can reach this path
+        # concurrently, leaving a reader in another process a torn map beside
+        # a valid sidecar.
+        write_atomic(cached, text)
         self._note_orchestrator_write(cached)
         self._note_orchestrator_write(cached.with_suffix(".json"))
 
@@ -2821,14 +2854,15 @@ class Pipeline:
                 total=self.cfg.diff_budget,
                 prefer=[self.cfg.code_root, self.cfg.test_root],
             )
-            patch = (
-                gitutil.budget_note(
-                    omitted,
-                    names_file=str(seq_dir / "checkpoint.json") + " (touched)",
-                    total=self.cfg.diff_budget,
-                )
-                + patch
+            note = gitutil.budget_note(
+                omitted,
+                names_file="this class's checkpoint.json (\"touched\")",
+                total=self.cfg.diff_budget,
             )
+            # Only when there is a diff to annotate. A file containing nothing
+            # but an omission header is not "exactly what this class changed",
+            # which is what phase_seq_review tells the hop it is reading.
+            patch = (note + patch) if patch.strip() else ""
         if patch.strip():
             write_text(seq_dir / "delta.patch", patch)
         assumptions = []

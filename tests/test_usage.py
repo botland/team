@@ -703,10 +703,38 @@ class InvokeBytesTests(unittest.TestCase):
         pipe.invoke("architect", "architect", "prompt body", "design.json")
         hop = load_hops(pipe.work)[0]
         self.assertEqual(hop["prompt_bytes"], len(b"prompt body"))
-        # brief.md is on disk and was listed; census.md is not.
-        self.assertEqual(
-            hop["listed_bytes"], (pipe.work / "brief.md").stat().st_size
+        # brief.md is small, so it travels in the prompt. The two fields are
+        # disjoint: what is left to fetch, and what was carried.
+        brief = (pipe.work / "brief.md").stat().st_size
+        self.assertEqual(hop["inlined_bytes"], brief)
+        self.assertEqual(hop["listed_bytes"], 0)
+
+    def test_a_big_artifact_is_billed_as_left_to_fetch(self):
+        cfg = load_config(
+            self.repo, fake=True, force=True, code_root="src", test_root="tests"
         )
+        pipe = start_feature(cfg, "brief", "usage-bytes-big")
+        pipe.write_artifact("git/diff.patch", "x" * (80 * 1024))
+        pipe._listed_artifacts(["git/diff.patch"])
+        pipe.invoke("architect", "architect", "p", "design.json")
+        hop = load_hops(pipe.work)[0]
+        self.assertGreater(hop["listed_bytes"], 80 * 1024 - 1)
+        self.assertEqual(hop["inlined_bytes"], 0)
+
+    def test_a_hop_that_listed_nothing_bills_nothing(self):
+        """Not its predecessor's figure: the value takes the long way round
+        through a thread-local, so it is cleared when it is read."""
+        cfg = load_config(
+            self.repo, fake=True, force=True, code_root="src", test_root="tests"
+        )
+        pipe = start_feature(cfg, "brief", "usage-bytes-none")
+        pipe._listed_artifacts(["brief.md"])
+        pipe.invoke("architect", "architect", "p", "design.json")
+        pipe.invoke("architect", "architect-revise", "p", "design.json")
+        hops = load_hops(pipe.work)
+        self.assertIn("inlined_bytes", hops[0])
+        self.assertNotIn("inlined_bytes", hops[1])
+        self.assertNotIn("listed_bytes", hops[1])
 
 
 if __name__ == "__main__":

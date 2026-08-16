@@ -307,7 +307,7 @@ def load_config(
     test_command: str = "",
     depth: str = "",
     effort: Optional[Iterable[str]] = None,
-    warm: bool = False,
+    warm: Optional[bool] = None,
 ) -> Config:
     cfg = Config()
     cfg.repo = repo.resolve()
@@ -354,19 +354,27 @@ def load_config(
     if env_skip:
         cfg.skip.extend(resolve_skip(p) for p in env_skip.split(",") if p.strip())
 
+    # Through the same validator the file and the flag use: an env var is
+    # another spelling of the option, not a bypass. TEAM_DIFF_BUDGET=abc was
+    # an uncaught traceback and =-5 silently disabled a cap the writer
+    # explicitly refuses to store.
     timeout = os.environ.get("TEAM_PHASE_TIMEOUT")
     if timeout:
-        cfg.phase_timeout = int(timeout)
+        cfg.phase_timeout = validate_config_update(
+            "run", "phase_timeout", "int", timeout
+        )
 
     budget = os.environ.get("TEAM_DIFF_BUDGET")
     if budget:
-        cfg.diff_budget = int(budget)
+        cfg.diff_budget = validate_config_update(
+            "run", "diff_budget", "int", budget
+        )
 
     warm_env = os.environ.get("TEAM_WARM")
     if warm_env:
         cfg.warm = parse_bool(warm_env, what="TEAM_WARM")
-    if warm:
-        cfg.warm = True
+    if warm is not None:
+        cfg.warm = bool(warm)
 
     return cfg
 
