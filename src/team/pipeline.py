@@ -2208,6 +2208,18 @@ class Pipeline:
     ) -> None:
         seq = findings_mod.load_seq_state(self.work)
         pool = list(review_findings) + list(guardian)
+        # Drain markers whose class the pool no longer holds, and say so. The
+        # queue reads them resolved either way; persisting keeps the ledger,
+        # team list, and apply-seq.md from telling three different stories.
+        resolved = findings_mod.resolve_seq_state(seq, pool)
+        dropped = findings_mod.dropped_seq_markers(seq, resolved)
+        if dropped:
+            seq = resolved
+            findings_mod.write_findings(self.work, review_findings + guardian, seq=seq)
+            self.log(
+                "seq: dropped %d marker(s) for class(es) no longer in the review: %s"
+                % (len(dropped), ", ".join(dropped))
+            )
         if skip_failed and seq.get("failed"):
             failed_id = str(seq.get("failed") or "")
             dummy = {"id": failed_id, "title": "(skipped)", "kind": "", "path": ""}

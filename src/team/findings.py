@@ -500,6 +500,58 @@ def write_findings(
     )
 
 
+def live_class_ids(findings: Iterable[Dict[str, Any]]) -> set:
+    """Class ids the current pool still contains. One derivation of membership."""
+    return {
+        finding_id(item)
+        for item in findings
+        if (item.get("kind") or "") in ACTIONABLE
+    }
+
+
+def resolve_seq_state(
+    seq: Dict[str, Any],
+    findings: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Pending markers resolved against the live pool. Nothing else reads them raw.
+
+    A class id the pool no longer holds is not pending. ``--reopen A``
+    followed by a review that re-words the same defect gives it a new id
+    (the title is part of the class id), and the old ``resume`` then had no
+    exit: ``--skip-failed`` only clears ``failed``, and ``mark_seq_step``
+    clears ``resume`` only when the class being marked *is* the resumed one.
+    ``seq_apply_complete`` read the leftover as an unfinished queue forever,
+    so every later ``apply --seq`` logged "queue not exhausted" and exited 0.
+
+    One rule over the whole ``{resume, failed, stale}`` space, not a branch
+    per way a marker can go missing. ``applied`` / ``skipped`` are history,
+    not pending, and are left alone.
+    """
+    live = live_class_ids(findings)
+    out = dict(seq)
+    out["failed"] = as_str(seq.get("failed")) if as_str(seq.get("failed")) in live else ""
+    out["resume"] = as_str(seq.get("resume")) if as_str(seq.get("resume")) in live else ""
+    out["stale"] = [
+        as_str(x) for x in as_list(seq.get("stale")) if as_str(x) and as_str(x) in live
+    ]
+    return out
+
+
+def dropped_seq_markers(seq: Dict[str, Any], resolved: Dict[str, Any]) -> List[str]:
+    """Class ids resolve_seq_state took out of the pending sets, in ledger order."""
+    out: List[str] = []
+    for key in ("failed", "resume"):
+        was = as_str(seq.get(key))
+        if was and was != as_str(resolved.get(key)):
+            out.append(was)
+    kept = {as_str(x) for x in as_list(resolved.get("stale"))}
+    for x in as_list(seq.get("stale")):
+        fid = as_str(x)
+        if fid and fid not in kept and fid not in out:
+            out.append(fid)
+    return out
+
+
 def seq_candidates(
     findings: Iterable[Dict[str, Any]],
     seq: Dict[str, Any],
@@ -529,13 +581,12 @@ def seq_apply_complete(
 
     Orthogonal to pick_next is None: stale is done only while resume or
     failed marks an unresolved prefix. Leftover stale with both empty is
-    a dead-letter suffix, not a finished queue.
+    a dead-letter suffix, not a finished queue -- and a marker whose class
+    left the pool is neither (resolve_seq_state).
     """
-    actionable = {
-        finding_id(item)
-        for item in findings
-        if (item.get("kind") or "") in ACTIONABLE
-    }
+    findings = list(findings)
+    actionable = live_class_ids(findings)
+    seq = resolve_seq_state(seq, findings)
     applied = {as_str(x) for x in as_list(seq.get("applied")) if as_str(x)}
     skipped = {as_str(x) for x in as_list(seq.get("skipped")) if as_str(x)}
     stale = {as_str(x) for x in as_list(seq.get("stale")) if as_str(x)}
@@ -552,6 +603,8 @@ def pick_next_seq(
     findings: Iterable[Dict[str, Any]],
     seq: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
+    findings = list(findings)
+    seq = resolve_seq_state(seq, findings)
     candidates = seq_candidates(findings, seq)
     for key in (as_str(seq.get("failed")), as_str(seq.get("resume"))):
         if not key:

@@ -12,6 +12,7 @@ from team.findings import (
     collect_all,
     collect_guardian_findings,
     collect_review_findings,
+    dropped_seq_markers,
     empty_seq_state,
     finding_id,
     format_chain,
@@ -26,6 +27,8 @@ from team.findings import (
     render_followups,
     render_seq_log,
     reopen_prefix,
+    resolve_seq_state,
+    seq_apply_complete,
     seq_candidates,
     seq_status_for,
     take_important,
@@ -553,6 +556,67 @@ class FindingsTests(unittest.TestCase):
         self.assertEqual(by_id[finding_id(arch)], "applied")
         self.assertIn(by_id[finding_id(impl)], ("", "pending"))
         self.assertNotEqual(seq_status_for(impl, seq), "stale")
+
+    def test_reopened_class_that_leaves_the_pool_does_not_wedge_the_queue(self):
+        """A marker whose class the review no longer reports is not pending.
+
+        --reopen A, then a review that re-words A: the new title is a new
+        class id, so nothing can ever mark the old one. resume used to stay
+        set forever -- --skip-failed only clears failed -- and every later
+        apply --seq exited 0 saying "queue not exhausted".
+        """
+        arch = {
+            "kind": "architecture",
+            "severity": "high",
+            "title": "one egress",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        impl = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "credential",
+            "path": "src/a.py",
+            "source": "reviewer-fake",
+        }
+        seq = empty_seq_state()
+        for item in (arch, impl):
+            seq = mark_seq_step(seq, dict(item, id=finding_id(item)), status="applied")
+        seq = reopen_prefix(seq, finding_id(arch))
+        reworded = dict(arch, title="one egress path")
+        pool = [reworded, impl]
+        self.assertNotEqual(finding_id(reworded), finding_id(arch))
+
+        resolved = resolve_seq_state(seq, pool)
+        self.assertEqual(resolved["resume"], "")
+        self.assertEqual(dropped_seq_markers(seq, resolved), [finding_id(arch)])
+
+        # The queue is drainable: the re-worded class, then the suffix the
+        # reopen made stale.
+        drained = []
+        while True:
+            nxt = pick_next_seq(pool, seq)
+            if nxt is None:
+                break
+            drained.append(nxt["id"])
+            seq = mark_seq_step(seq, nxt, status="applied")
+            self.assertLessEqual(len(drained), 4, "queue does not terminate")
+        self.assertEqual(drained, [finding_id(reworded), finding_id(impl)])
+        self.assertTrue(seq_apply_complete(pool, seq))
+
+    def test_stale_marker_for_a_vanished_class_does_not_block_completion(self):
+        item = {
+            "kind": "test",
+            "severity": "high",
+            "title": "gone next round",
+            "path": "tests/t.py",
+            "source": "reviewer-fake",
+        }
+        seq = mark_seq_step(
+            empty_seq_state(), dict(item, id=finding_id(item)), status="stale"
+        )
+        self.assertFalse(seq_apply_complete([item], seq))
+        self.assertTrue(seq_apply_complete([], seq))
 
     def test_reopen_rejects_skipped(self):
         item = {
