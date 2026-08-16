@@ -428,13 +428,23 @@ def finding_path(item: Dict[str, Any]) -> str:
 
 
 def finding_identity(item: Dict[str, Any]) -> tuple:
-    """Collect, seq-id, and related agree on this key.
+    """Collect, seq-id, and related agree on this key. There is one opinion.
 
-    Kind, normalized path, title, and evidence. Two rows that differ only
-    in evidence are two classes; ``./src/a.py`` and ``src/a.py`` are one path.
+    Normalized path, title, and evidence -- what the defect *is*. Two rows
+    that differ only in evidence are two classes; ``./src/a.py`` and
+    ``src/a.py`` are one path.
+
+    ``kind`` is deliberately not part of it. Kind is the router's answer
+    (architecture -> replan, test -> tdd, implementation -> implementer) and
+    a re-review can change it for the same defect; with kind in the key,
+    re-classifying a finding minted a new class id, so the seq ledger's
+    ``applied`` row stopped matching and apply ran the class a second time.
+
+    What remains representable: the title is model text, so a re-worded
+    finding is still a new class. Nothing in the payload is more stable, and
+    the ledger no longer strands on it (resolve_seq_state).
     """
     return (
-        normalize_kind(item.get("kind")),
         finding_path(item),
         as_str(item.get("title")).strip().lower(),
         as_str(item.get("evidence")).strip(),
@@ -442,7 +452,7 @@ def finding_identity(item: Dict[str, Any]) -> tuple:
 
 
 def finding_id(item: Dict[str, Any]) -> str:
-    raw = "%s|%s|%s|%s" % finding_identity(item)
+    raw = "%s|%s|%s" % finding_identity(item)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -1072,7 +1082,7 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     order: List[tuple] = []
     for item in items:
         key = finding_identity(item)
-        path, title = key[1], key[2]
+        path, title = key[0], key[1]
         if not title and not path:
             extras.append(item)
             continue
@@ -1081,8 +1091,11 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             by_key[key] = item
             order.append(key)
             continue
-        prev_kind = prev.get("kind") or ""
-        kind = item.get("kind") or ""
-        if not prev_kind and kind:
+        # Same defect, two reviewers, two answers about kind: the classified
+        # one wins. normalize_finding guarantees a kind, so "" is not the
+        # unclassified case -- the word is.
+        if kind_is_unclassified(prev.get("kind")) and not kind_is_unclassified(
+            item.get("kind")
+        ):
             by_key[key] = item
     return [by_key[k] for k in order] + extras

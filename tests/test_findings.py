@@ -1245,6 +1245,46 @@ class FindingIdentityTests(unittest.TestCase):
             self.assertIn(finding_id(second), cands)
             self.assertNotIn(finding_id(second), seq["applied"])
 
+    def test_reclassified_finding_keeps_its_class_id(self):
+        """Kind is the router's answer, not what the defect is.
+
+        With kind in the identity, a review that moved a defect from test to
+        implementation minted a new id, the ledger's applied row stopped
+        matching, and apply --seq ran the same class twice.
+        """
+        as_test = {
+            "kind": "test",
+            "severity": "high",
+            "title": "leak",
+            "path": "src/a.py",
+            "evidence": "missing guard",
+            "source": "reviewer-fake",
+        }
+        as_impl = dict(as_test, kind="implementation")
+        self.assertEqual(finding_id(as_test), finding_id(as_impl))
+        seq = mark_seq_step(empty_seq_state(), _with_id(as_test), status="applied")
+        self.assertNotIn(finding_id(as_impl), _candidate_ids([as_impl], seq))
+
+    def test_one_defect_classified_by_one_reviewer_only_keeps_the_kind(self):
+        classified = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "leak",
+            "path": "src/a.py",
+            "evidence": "same hole",
+            "source": "reviewer-claude",
+        }
+        vague = dict(classified, kind="mystery", source="reviewer-grok")
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            prompts = work / "prompts"
+            prompts.mkdir()
+            dump_json(prompts / "reviewer-grok.result.json", {"findings": [vague]})
+            dump_json(prompts / "reviewer-claude.result.json", {"findings": [classified]})
+            found = collect_review_findings(work)
+            self.assertEqual(len(found), 1, found)
+            self.assertEqual(found[0]["kind"], "implementation")
+
     def test_path_spellings_are_one_finding_and_one_related_path(self):
         dotted = {
             "kind": "implementation",
