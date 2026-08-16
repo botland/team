@@ -78,6 +78,12 @@ INLINE_TOTAL_MAX = 12 * 1024
 # map is stale enough that the count is the useful signal.
 _CENSUS_MOVED_MAX = 40
 
+# Accumulated context past which a warm chain costs more than it saves. A turn
+# re-sends everything the session holds, so a long chain inverts: measured
+# hops average ~54k context per turn, and a session carrying twice that is
+# paying more per turn than a cold hop pays in total.
+WARM_CONTEXT_CEILING = 120_000
+
 CROSS_ROLE_ARTIFACTS = frozenset(
     {"apply-plan.md", "review.md", "guardian.md", "followups.md", "apply-seq.md"}
 )
@@ -157,6 +163,9 @@ class Pipeline:
         # builds two prompts on this one Pipeline at once, and a shared
         # attribute would bill one reviewer's listing to the other.
         self._tls = threading.local()
+        # Live warm chains, (role, runtime, capability) -> session + context.
+        # In-process only: a resumed run has no live session and starts cold.
+        self._warm_chains: Dict[tuple, Dict[str, Any]] = {}
         self._seed_census()
 
     def log(self, msg: str) -> None:
@@ -255,8 +264,9 @@ class Pipeline:
         rt: Runtime = runtime_for(runtime_name)
         session_key = "%s:%s" % (role, runtime_name)
         # Files are the handoff. A stored session is a log id, not a thread.
-        # Always mint a new --session-id; never --resume / -r.
-        sid = str(uuid.uuid4())
+        # Cold by default: mint a new --session-id, never --resume / -r.
+        # Under [run] warm the chain below may reuse one, and only then.
+        sid, resume = self._warm_session(role, runtime_name, cap)
         extra = dict(extra or {})
         extra.setdefault("code_root", normalize_root(self.cfg.code_root))
         extra.setdefault("test_root", normalize_root(self.cfg.test_root))
@@ -276,7 +286,7 @@ class Pipeline:
                 schema=self.schema(schema_name),
                 capability=cap,
                 session_id=sid,
-                resume=False,
+                resume=resume,
                 work=self.work,
                 repo=self.repo,
                 timeout=self.cfg.phase_timeout,
@@ -319,6 +329,7 @@ class Pipeline:
             )
             if str(phase).startswith("reviewer-"):
                 self._record_review_result(result_path, num_turns=result.num_turns)
+            self._note_warm_hop(role, runtime_name, cap, result)
             self._record_usage(
                 role,
                 phase,
@@ -440,6 +451,72 @@ class Pipeline:
             )
         self._adopt_census(result.output)
         return result
+
+    def _warm_session(self, role: str, runtime: str, capability: str) -> tuple:
+        """``(session_id, resume)`` for this hop. Cold unless a chain is live.
+
+        Files stay the protocol: every prompt is self-contained and every
+        artifact is written either way, so any link can be dropped and run
+        cold without changing the result. That is what the warm/cold
+        equivalence test pins, and it is why this is an accelerator rather
+        than a second channel.
+
+        A chain needs the same role, runtime **and capability**. Capability
+        because a resumed hop re-declaring different tool filters is exactly
+        the vendor semantics nothing here executes (open class L2) -- so the
+        gate/write pair stays cold, deliberately.
+
+        It also needs the accumulated context to be under a ceiling. A warm
+        chain saves re-derivation for two or three hops and then inverts: a
+        turn re-sends the whole context, so a session that has grown past the
+        ceiling costs more per turn than a cold hop pays in total.
+        """
+        fresh = str(uuid.uuid4())
+        if not getattr(self.cfg, "warm", False):
+            return fresh, False
+        key = (role, runtime, capability)
+        with self._state_lock:
+            live = self._warm_chains.get(key)
+        if not live:
+            return fresh, False
+        if live.get("context", 0) > WARM_CONTEXT_CEILING:
+            self.log(
+                "warm chain %s/%s broken: context %s over ceiling"
+                % (role, runtime, live.get("context"))
+            )
+            with self._state_lock:
+                self._warm_chains.pop(key, None)
+            return fresh, False
+        return str(live["session"]), True
+
+    def _note_warm_hop(
+        self, role: str, runtime: str, capability: str, result: Result
+    ) -> None:
+        """Record or drop this role+runtime+capability chain after a hop."""
+        if not getattr(self.cfg, "warm", False):
+            return
+        key = (role, runtime, capability)
+        with self._state_lock:
+            if not result.success or not result.session_id:
+                # A failed hop leaves a session in an unknown state. The next
+                # hop starts cold rather than inheriting it.
+                self._warm_chains.pop(key, None)
+                return
+            usage = result.usage
+            context = 0
+            if usage is not None:
+                context = (usage.input_tokens or 0) + (
+                    usage.cache_read_input_tokens or 0
+                )
+                turns = result.num_turns or 0
+                if turns:
+                    # cache_read is context summed over turns; one turn's worth
+                    # is the best available estimate of what the session holds.
+                    context = int(context / turns)
+            self._warm_chains[key] = {
+                "session": result.session_id,
+                "context": context,
+            }
 
     def _require_write_scope(self, role: str, capability: str) -> None:
         if capability == "write-code" and not explicit_roots(self.cfg.code_root):

@@ -139,3 +139,19 @@ def grok_search_replace_permitted(argv: Sequence[object], rel: str) -> bool:
         return any(path_glob_matches(glob, rel) for glob in allow)
     # No allow list: write-code ``code_root='.'`` (deny roots only) or unscoped.
     return True
+
+
+def grok_session_resumed(argv: Sequence[object]) -> bool:
+    """True when this argv continues a thread rather than opening one.
+
+    Grok spells it -r <id>; the cold form is --session-id <id>.
+    """
+    return "-r" in [str(a) for a in argv]
+
+
+def grok_session_id(argv: Sequence[object]) -> str:
+    for flag in ("-r", "--session-id"):
+        found = _flag_values(argv, flag)
+        if found:
+            return found[0]
+    return ""

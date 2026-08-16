@@ -30,11 +30,14 @@ from team.runners import (
 )
 from team.util import extract_json, load_json
 from tests.support.claude_argv import (
+    assert_claude_language,
     claude_allowed_write_roots,
     claude_flag_occurrences,
     claude_read_tools_enabled,
     claude_terminal_permitted,
     claude_tool_permitted,
+    claude_session_id,
+    claude_session_resumed,
     claude_write_denied,
 )
 from tests.support.grok_argv import (
@@ -42,6 +45,8 @@ from tests.support.grok_argv import (
     grok_flag_values,
     grok_read_tools_enabled,
     grok_search_replace_permitted,
+    grok_session_id,
+    grok_session_resumed,
     grok_write_denied,
     path_glob_matches,
 )
@@ -1115,3 +1120,67 @@ class FakeOutputSchemaSeamTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WarmSessionParityTests(unittest.TestCase):
+    """Resume is one question asked of both adapters.
+
+    A warm chain is an accelerator, so the two CLIs must agree on when a hop
+    continues a thread and when it opens one -- otherwise "warm" would mean
+    something different depending on which runtime a role happens to hold.
+    """
+
+    def _pair(self, *, resume):
+        claude = claude_cmd(
+            prompt="hi",
+            schema=None,
+            capability="read-only",
+            session_id="sid-1",
+            resume=resume,
+        )
+        grok = grok_cmd(
+            prompt_path=Path("/tmp/p.md"),
+            schema=None,
+            capability="read-only",
+            session_id="sid-1",
+            resume=resume,
+            repo=Path("/tmp/r"),
+        )
+        return claude, grok
+
+    def test_cold_opens_a_session_on_both(self):
+        claude, grok = self._pair(resume=False)
+        self.assertFalse(claude_session_resumed(claude))
+        self.assertFalse(grok_session_resumed(grok))
+        self.assertEqual(claude_session_id(claude), "sid-1")
+        self.assertEqual(grok_session_id(grok), "sid-1")
+
+    def test_warm_continues_the_same_session_on_both(self):
+        claude, grok = self._pair(resume=True)
+        self.assertTrue(claude_session_resumed(claude))
+        self.assertTrue(grok_session_resumed(grok))
+        self.assertEqual(
+            claude_session_id(claude),
+            grok_session_id(grok),
+            "both adapters continue the id they were handed",
+        )
+
+    def test_resume_without_an_id_is_still_cold(self):
+        """Nothing to continue is not a reason to drop the flag entirely."""
+        claude = claude_cmd(
+            prompt="hi",
+            schema=None,
+            capability="read-only",
+            session_id="",
+            resume=True,
+        )
+        self.assertFalse(claude_session_resumed(claude))
+
+    def test_headless_survives_a_warm_hop(self):
+        """Resuming must not cost either CLI its headless spelling."""
+        claude, grok = self._pair(resume=True)
+        assert_claude_language(claude)
+        flat = [str(a) for a in grok]
+        self.assertIn("--no-alt-screen", flat)
+        self.assertIn("--prompt-file", flat)
+        self.assertNotIn("--fullscreen", flat)

@@ -127,6 +127,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Skip optional phases (critic, adversarial, guardian, debugger).",
     )
     p.add_argument("--fake", action="store_true", help="Do not call Claude/Grok; emit canned artifacts.")
+    p.add_argument(
+        "--warm",
+        action="store_true",
+        help=(
+            "Resume a session across consecutive hops of one role+runtime+capability "
+            "instead of minting a new one. Files stay the protocol; any link can be "
+            "dropped and rerun cold with the same result."
+        ),
+    )
     p.add_argument("--code-root", default="", help="Override implementation root")
     p.add_argument("--test-root", default="", help="Override test root")
     p.add_argument("--test-command", default="", help="Override test command")
@@ -452,6 +461,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Write run.diff_budget (patch bytes handed to a hop; 0 = no cap)",
     )
     cfg_cmd.add_argument(
+        "--warm",
+        dest="set_warm",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help="Write run.warm (resume sessions within one role+runtime+capability)",
+    )
+    cfg_cmd.add_argument(
         "--unset",
         dest="unset_keys",
         action="append",
@@ -501,6 +517,7 @@ def _cfg(args, **kwargs):
         test_command=args.test_command,
         depth=getattr(args, "depth", "") or "",
         effort=getattr(args, "effort", None) or [],
+        warm=bool(getattr(args, "warm", False)),
         **kwargs,
     )
 
@@ -1175,6 +1192,7 @@ def cmd_config(args) -> int:
             range_reviewer=args.set_range_reviewer,
             phase_timeout=args.set_phase_timeout,
             diff_budget=args.set_diff_budget,
+            warm=args.set_warm,
             effort=args.set_effort or args.effort,
         )
     except SystemExit as exc:
@@ -1229,6 +1247,7 @@ def _print_effective_config(dest: Path, cfg) -> None:
     print("  skip           %s" % (", ".join(cfg.skip) if cfg.skip else "(none)"))
     print("  phase_timeout  %s" % cfg.phase_timeout)
     print("  diff_budget    %s" % (cfg.diff_budget or "(no cap)"))
+    print("  warm           %s" % ("on" if cfg.warm else "off"))
     print("")
     print("[review]")
     print("  range_reviewer %s" % cfg.range_reviewer)

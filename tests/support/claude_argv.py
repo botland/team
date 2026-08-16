@@ -116,3 +116,19 @@ def claude_read_tools_enabled(argv: Sequence[object]) -> bool:
 
 def claude_terminal_permitted(argv: Sequence[object]) -> bool:
     return claude_tool_permitted(argv, "Bash")
+
+
+def claude_session_resumed(argv: Sequence[object]) -> bool:
+    """True when this argv continues a thread rather than opening one.
+
+    Claude spells it --resume <id>; the cold form is --session-id <id>.
+    """
+    return "--resume" in [str(a) for a in argv]
+
+
+def claude_session_id(argv: Sequence[object]) -> str:
+    for flag in ("--resume", "--session-id"):
+        found = _flag_values(argv, flag)
+        if found:
+            return found[0]
+    return ""
