@@ -12,7 +12,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from team.cli import main
 from team.config import load_config
-from team.pipeline import start_feature
+from team.pipeline import load_pipeline, start_feature
+from team.util import write_text
 from team.findings import (
     collect_guardian_findings,
     collect_review_findings,
@@ -877,6 +878,28 @@ class FakeApplyTests(unittest.TestCase):
         self.assertTrue((work / "seq" / steps[0].name / "review.md").is_file() or any(
             (p / "review.md").is_file() for p in (work / "seq").iterdir()
         ))
+
+    def test_class_review_is_handed_its_own_delta(self):
+        """A class hop has no terminal, so "inspect git status" was an
+        instruction it could not follow. delta.patch is what the class
+        changed, and _write_seq_checkpoint already derives it."""
+        work = self._feature()
+        cfg = load_config(self.repo, fake=True, force=False)
+        pipe = load_pipeline(cfg, "add-greet-helper")
+        seq_dir = work / "seq" / "abc123"
+        (seq_dir / "prompts").mkdir(parents=True, exist_ok=True)
+        self.assertEqual(pipe._seq_delta_artifact(seq_dir), [])
+        write_text(seq_dir / "delta.patch", "diff --git a/src/greet.py b/src/greet.py\n")
+        self.assertEqual(
+            pipe._seq_delta_artifact(seq_dir), ["seq/abc123/delta.patch"]
+        )
+        items = [{"id": "abc123", "kind": "implementation", "title": "t", "path": "src/greet.py"}]
+        pipe.phase_seq_review(seq_dir, items)
+        prompt = (work / "prompts" / "seq-reviewer-fake.prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("delta.patch", prompt)
+        self.assertNotIn("git status", prompt, "the hop has no terminal to run it")
 
     def test_seq_writes_checkpoint(self):
         work = self._feature()

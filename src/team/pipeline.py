@@ -2552,8 +2552,21 @@ class Pipeline:
     ) -> None:
         end = self._snapshot()
         touched = gitutil.product_paths(gitutil.changed_paths(self.repo, start, end))
-        patch = gitutil.worktree_diff(self.repo, touched) if gitutil.is_git_repo(self.repo) else ""
-        if patch:
+        patch = ""
+        if gitutil.is_git_repo(self.repo):
+            sections = gitutil.worktree_diff_sections(self.repo, touched)
+            patch, omitted = gitutil.budget_sections(
+                sections, total=self.cfg.diff_budget
+            )
+            patch = (
+                gitutil.budget_note(
+                    omitted,
+                    names_file=str(seq_dir / "checkpoint.json") + " (touched)",
+                    total=self.cfg.diff_budget,
+                )
+                + patch
+            )
+        if patch.strip():
             write_text(seq_dir / "delta.patch", patch)
         assumptions = []
         if item.get("kind") == "architecture":
@@ -2680,6 +2693,17 @@ class Pipeline:
             % (self.cfg.code_root, self.cfg.test_root)
         )
 
+    def _seq_delta_artifact(self, seq_dir: Path) -> List[str]:
+        """The one patch a class hop needs: what this class changed.
+
+        _write_seq_checkpoint already derives it from the class's own start
+        and end snapshots. Listing it is what turns "inspect git status" --
+        which an inspect hop has no terminal for -- into something the hop can
+        actually do, and it is a fraction of the whole apply surface.
+        """
+        rel = seq_dir.relative_to(self.work) / "delta.patch"
+        return [str(rel)] if (self.work / rel).is_file() else []
+
     def phase_seq_review(self, seq_dir: Path, items: List[Dict[str, Any]]) -> None:
         runtimes = expand_reviewer(self.cfg.assignment("reviewer"))
         artifacts = [
@@ -2690,6 +2714,7 @@ class Pipeline:
             "apply-impl-summary.md",
             "apply-tdd-summary.md",
             "apply-test-report.md",
+            *self._seq_delta_artifact(seq_dir),
         ]
 
         def one(runtime: str) -> Result:
@@ -2700,7 +2725,8 @@ class Pipeline:
                     "CLASS REVIEW. Review only the class that apply --seq just closed.",
                     "The original review.md is out of scope. Do not rewrite it.",
                     *self._inspect_only_lines(),
-                    "Inspect the actual files and git status.",
+                    "The listed delta.patch is exactly what this class changed. "
+                    "Read it and the files it names. You have no terminal.",
                     self._reviewer_finding_rules(),
                     "Class:\n" + json.dumps(items, indent=2),
                     "You are the %s reviewer. Do not assume another reviewer exists."
@@ -2754,6 +2780,7 @@ class Pipeline:
                         "test-contract.md",
                         "apply-plan.md",
                         "apply-test-report.md",
+                        *self._seq_delta_artifact(seq_dir),
                     ]
                 ),
                 "CLASS GUARDIAN. Evaluate only this applied class.",
