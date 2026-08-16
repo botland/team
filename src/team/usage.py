@@ -183,6 +183,8 @@ def hop_record(
     num_turns: Optional[int],
     usage: Optional[Usage],
     ts: Optional[str] = None,
+    prompt_bytes: Optional[int] = None,
+    listed_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
     rec: Dict[str, Any] = {
         "ts": ts or _now_utc(),
@@ -194,6 +196,14 @@ def hop_record(
         "success": bool(success),
         "num_turns": num_turns,
     }
+    # What the orchestrator handed the hop, beside what the hop then spent.
+    # A hop's tokens are turns x context; these two say how much of the
+    # starting context we chose, so a context cut is attributable to a cause
+    # instead of to luck.
+    if prompt_bytes is not None:
+        rec["prompt_bytes"] = int(prompt_bytes)
+    if listed_bytes is not None:
+        rec["listed_bytes"] = int(listed_bytes)
     if usage is not None:
         rec.update(usage.to_dict())
     return rec
@@ -317,6 +327,15 @@ def summarize(hops: List[Dict[str, Any]]) -> Dict[str, Any]:
         cost_usd = ticks_sum / float(_TICKS_PER_USD)
     else:
         cost_usd = cost_sum
+    # turns and context are the two factors of a hop's bill: a hop costs
+    # roughly turns x context, because every turn re-sends the whole context.
+    # Summing them here is what makes "we cut context" a checkable claim.
+    turns = [_as_int(hop.get("num_turns")) for hop in hops]
+    turns_sum = sum(value for value in turns if value is not None)
+    turns_known = sum(1 for value in turns if value is not None)
+    context = totals.get("input_tokens", 0) + totals.get(
+        "cache_read_input_tokens", 0
+    )
     return {
         "hops": len(hops),
         "hops_with_tokens": hops_with_tokens,
@@ -324,8 +343,34 @@ def summarize(hops: List[Dict[str, Any]]) -> Dict[str, Any]:
         "hops_missing_cost": hops_missing_cost,
         "cost_complete": hops_with_tokens > 0 and hops_missing_cost == 0,
         "cost_usd": cost_usd,
+        "num_turns": turns_sum,
+        "hops_with_turns": turns_known,
+        "context_tokens": context,
+        "context_per_turn": int(context / turns_sum) if turns_sum else None,
+        "prompt_bytes": sum(
+            _as_int(hop.get("prompt_bytes")) or 0 for hop in hops
+        ),
+        "listed_bytes": sum(
+            _as_int(hop.get("listed_bytes")) or 0 for hop in hops
+        ),
         **totals,
     }
+
+
+def group_hops(hops: List[Dict[str, Any]], key: str) -> List[tuple]:
+    """``(name, summary)`` rows for one hop field, dearest first.
+
+    ``key`` is a hop field (``phase``, ``role``, ``runtime``, ``slug``). The
+    ordering is total tokens descending because the question this answers is
+    always "where did the tokens go", never "what is alphabetically first".
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    for hop in hops:
+        name = str(hop.get(key) or "") or "(unknown)"
+        buckets.setdefault(name, []).append(hop)
+    rows = [(name, summarize(rows_)) for name, rows_ in buckets.items()]
+    rows.sort(key=lambda row: (-(row[1].get("total_tokens") or 0), row[0]))
+    return rows
 
 
 def format_usd(
@@ -473,12 +518,29 @@ def render_console(
 
 
 def format_costs_listing(
-    rows: List[tuple], *, enabled: Optional[bool] = None
+    rows: List[tuple],
+    *,
+    enabled: Optional[bool] = None,
+    label: str = "SLUG",
+    show_turns: bool = False,
 ) -> str:
-    """rows is ``(slug, summary)``. ``total`` is painted as a summary row."""
+    """rows is ``(name, summary)``. ``total`` is painted as a summary row.
+
+    ``show_turns`` adds the two columns a token cut is judged on: turns, and
+    context re-sent per turn. Their product is the bill.
+    """
     if enabled is None:
         enabled = style.color_enabled()
-    header = "%-28s %5s %10s  %s" % ("SLUG", "HOPS", "TOKENS", "COST")
+    header = "%-28s %5s %10s  %s" % (label, "HOPS", "TOKENS", "COST")
+    if show_turns:
+        header = "%-28s %5s %6s %9s %10s  %s" % (
+            label,
+            "HOPS",
+            "TURNS",
+            "CTX/TURN",
+            "TOKENS",
+            "COST",
+        )
     lines = [style.dim(header, enabled=enabled)]
     for name, summary in rows:
         tokens = (
@@ -503,6 +565,20 @@ def format_costs_listing(
             if tokens
             else style.dim(token_raw, enabled=enabled)
         )
+        if show_turns:
+            per_turn = summary.get("context_per_turn")
+            lines.append(
+                "%s %5d %6s %9s %s  %s"
+                % (
+                    slug_cell,
+                    summary.get("hops") or 0,
+                    summary.get("num_turns") or "-",
+                    compact_int(int(per_turn)) if per_turn else "-",
+                    token_cell,
+                    style.usd(cost, complete=complete, enabled=enabled),
+                )
+            )
+            continue
         lines.append(
             "%s %5d %s  %s"
             % (

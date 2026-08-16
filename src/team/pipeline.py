@@ -133,6 +133,11 @@ class Pipeline:
         # raises "dictionary changed size during iteration", and two unsynchronised
         # read-modify-writes of last_review drop one reviewer's recording.
         self._state_lock = threading.RLock()
+        # Bytes the last _listed_artifacts offered this hop, for the ledger.
+        # Thread-local for the same reason the lock exists: reviewer="both"
+        # builds two prompts on this one Pipeline at once, and a shared
+        # attribute would bill one reviewer's listing to the other.
+        self._tls = threading.local()
 
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
@@ -294,7 +299,14 @@ class Pipeline:
             )
             if str(phase).startswith("reviewer-"):
                 self._record_review_result(result_path, num_turns=result.num_turns)
-            self._record_usage(role, phase, runtime_name, result)
+            self._record_usage(
+                role,
+                phase,
+                runtime_name,
+                result,
+                prompt_bytes=len(prompt.encode("utf-8")),
+                listed_bytes=getattr(self._tls, "listed_bytes", None),
+            )
         if before is not None:
             self._fence_after_invoke(cap, phase, before, write_verify)
         if complete_err is not None:
@@ -428,7 +440,16 @@ class Pipeline:
             self.state.last_review = {"attempt": attempt, "results": []}
             self.save()
 
-    def _record_usage(self, role: str, phase: str, runtime: str, result: Result) -> None:
+    def _record_usage(
+        self,
+        role: str,
+        phase: str,
+        runtime: str,
+        result: Result,
+        *,
+        prompt_bytes: Optional[int] = None,
+        listed_bytes: Optional[int] = None,
+    ) -> None:
         """Persist provider spend for this hop. Missing $ is logged, not dropped."""
         rec = usage_mod.hop_record(
             slug=self.state.slug,
@@ -439,6 +460,8 @@ class Pipeline:
             success=result.success,
             num_turns=result.num_turns,
             usage=result.usage,
+            prompt_bytes=prompt_bytes,
+            listed_bytes=listed_bytes,
         )
         usage_mod.record_hop(self.work, rec)
         self.log(usage_mod.format_hop_console(rec))
@@ -628,12 +651,15 @@ class Pipeline:
             ordered.append(name)
         present: List[str] = []
         missing: List[str] = []
+        offered = 0
         for name in ordered:
             path = self.artifact(name)
             if path.is_file():
                 present.append("- %s" % path)
+                offered += path.stat().st_size
             else:
                 missing.append("- %s" % name)
+        self._tls.listed_bytes = offered
         lines = ["Work directory: %s" % self.work]
         if present:
             lines.append("Read these files with tools before answering:")

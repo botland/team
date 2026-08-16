@@ -349,6 +349,12 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help="Work slug. Omit to list every .team/work run.",
     )
+    costs.add_argument(
+        "--by",
+        choices=("slug", "phase", "role", "runtime"),
+        default="",
+        help="Group spend by this field, dearest first, with turns and context/turn.",
+    )
     costs.set_defaults(func=cmd_costs)
 
     roles = sub.add_parser(
@@ -1049,6 +1055,7 @@ def cmd_status(args) -> int:
 def cmd_costs(args) -> int:
     repo = Path(args.repo).resolve() if args.repo else Path.cwd()
     slug = args.slug or ""
+    group = getattr(args, "by", "") or ""
     if slug:
         hops = usage_mod.load_repo_hops(repo, slug=slug)
         if not hops:
@@ -1057,6 +1064,9 @@ def cmd_costs(args) -> int:
                 print("No run at %s (missing state.json)" % work, file=sys.stderr)
                 return 1
             print("no usage logged for %s" % slug)
+            return 0
+        if group:
+            print(_costs_grouped(hops, group))
             return 0
         print(usage_mod.render_console(hops, slug=slug))
         ledger = usage_mod.repo_ledger_path(repo)
@@ -1072,6 +1082,9 @@ def cmd_costs(args) -> int:
     if not hops:
         print("no usage logged in %s" % (repo / ".team" / "work"))
         return 0
+    if group and group != "slug":
+        print(_costs_grouped(hops, group))
+        return 0
     by_slug: Dict[str, List[dict]] = {}
     for hop in hops:
         by_slug.setdefault(str(hop.get("slug") or "(none)"), []).append(hop)
@@ -1080,6 +1093,16 @@ def cmd_costs(args) -> int:
         rows.append(("total", usage_mod.summarize(hops)))
     print(usage_mod.format_costs_listing(rows))
     return 0
+
+
+def _costs_grouped(hops: List[dict], group: str) -> str:
+    """One grouped listing. A hop costs turns x context; both columns show."""
+    rows = usage_mod.group_hops(hops, group)
+    if len(rows) > 1:
+        rows.append(("total", usage_mod.summarize(hops)))
+    return usage_mod.format_costs_listing(
+        rows, label=group.upper(), show_turns=True
+    )
 
 
 def cmd_roles(args) -> int:

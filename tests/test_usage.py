@@ -28,7 +28,9 @@ from team.usage import (
     Usage,
     format_hop_console,
     format_summary_line,
+    format_costs_listing,
     format_usd,
+    group_hops,
     hop_has_cost,
     hop_record,
     load_hops,
@@ -525,6 +527,186 @@ class CostsCommandTests(unittest.TestCase):
             rc = main(["--repo", str(self.repo), "costs", "no-such"])
         self.assertEqual(rc, 1)
         self.assertIn("No run", err.getvalue())
+
+    def test_costs_by_phase_groups_dearest_first(self):
+        cfg = load_config(
+            self.repo, fake=True, force=True, code_root="src", test_root="tests"
+        )
+        pipe = start_feature(cfg, "brief", "usage-by")
+        cheap = Usage(input_tokens=10, output_tokens=1, cost_usd=0.01)
+        dear = Usage(
+            input_tokens=100,
+            output_tokens=10,
+            cache_read_input_tokens=9000,
+            cost_usd=0.90,
+        )
+        design = emit(
+            {
+                "design_markdown": "# D",
+                "code_root": "src",
+                "test_root": "tests",
+                "census_markdown": "# C",
+            }
+        )
+        with register_runtime(
+            "fake",
+            HostileRuntime([design], phases=("architect",), num_turns=2, usage=cheap),
+        ):
+            pipe.invoke("architect", "architect", "p", "design.json")
+        with register_runtime(
+            "fake",
+            HostileRuntime(
+                [design], phases=("architect-revise",), num_turns=20, usage=dear
+            ),
+        ):
+            pipe.invoke("architect", "architect-revise", "p", "design.json")
+        buf = StringIO()
+        with mock.patch("sys.stdout", buf):
+            rc = main(["--repo", str(self.repo), "costs", "--by", "phase"])
+        self.assertEqual(rc, 0)
+        text = style.strip_ansi(buf.getvalue())
+        self.assertIn("PHASE", text)
+        self.assertIn("CTX/TURN", text)
+        self.assertLess(
+            text.index("architect-revise"),
+            text.index("architect "),
+            "the dearest phase is the one you are looking for; it sorts first",
+        )
+
+
+class SpendAttributionTests(unittest.TestCase):
+    """turns x context is the bill. The ledger has to carry both factors."""
+
+    def test_summarize_reports_context_per_turn(self):
+        hops = [
+            hop_record(
+                slug="s",
+                phase="reviewer",
+                role="reviewer",
+                runtime="grok",
+                session_id="a",
+                success=True,
+                num_turns=10,
+                usage=Usage(input_tokens=1000, cache_read_input_tokens=9000),
+            )
+        ]
+        summary = summarize(hops)
+        self.assertEqual(summary["context_tokens"], 10000)
+        self.assertEqual(summary["num_turns"], 10)
+        self.assertEqual(summary["context_per_turn"], 1000)
+
+    def test_no_turns_reported_is_no_ratio_not_a_zero(self):
+        hops = [
+            hop_record(
+                slug="s",
+                phase="p",
+                role="r",
+                runtime="grok",
+                session_id="a",
+                success=True,
+                num_turns=None,
+                usage=Usage(input_tokens=50),
+            )
+        ]
+        self.assertIsNone(summarize(hops)["context_per_turn"])
+
+    def test_group_hops_buckets_and_sorts_by_tokens(self):
+        def row(phase, tokens):
+            return hop_record(
+                slug="s",
+                phase=phase,
+                role="r",
+                runtime="grok",
+                session_id="",
+                success=True,
+                num_turns=1,
+                usage=Usage(input_tokens=tokens),
+            )
+
+        rows = group_hops([row("a", 10), row("b", 500), row("a", 20)], "phase")
+        self.assertEqual([name for name, _ in rows], ["b", "a"])
+        self.assertEqual(rows[1][1]["hops"], 2)
+        self.assertEqual(rows[1][1]["input_tokens"], 30)
+
+    def test_listing_shows_turns_only_when_asked(self):
+        rows = group_hops(
+            [
+                hop_record(
+                    slug="s",
+                    phase="p",
+                    role="r",
+                    runtime="grok",
+                    session_id="",
+                    success=True,
+                    num_turns=4,
+                    usage=Usage(input_tokens=4000),
+                )
+            ],
+            "phase",
+        )
+        plain = style.strip_ansi(format_costs_listing(rows, enabled=False))
+        self.assertNotIn("CTX/TURN", plain)
+        wide = style.strip_ansi(
+            format_costs_listing(rows, enabled=False, label="PHASE", show_turns=True)
+        )
+        self.assertIn("PHASE", wide)
+        self.assertIn("1k", wide, "4000 context over 4 turns is 1k per turn")
+
+    def test_hop_record_carries_what_the_orchestrator_handed_over(self):
+        rec = hop_record(
+            slug="s",
+            phase="p",
+            role="r",
+            runtime="grok",
+            session_id="",
+            success=True,
+            num_turns=1,
+            usage=None,
+            prompt_bytes=1234,
+            listed_bytes=99,
+        )
+        self.assertEqual(rec["prompt_bytes"], 1234)
+        self.assertEqual(rec["listed_bytes"], 99)
+
+    def test_omitted_bytes_stay_absent_rather_than_zero(self):
+        rec = hop_record(
+            slug="s",
+            phase="p",
+            role="r",
+            runtime="grok",
+            session_id="",
+            success=True,
+            num_turns=1,
+            usage=None,
+        )
+        self.assertNotIn("prompt_bytes", rec)
+        self.assertNotIn("listed_bytes", rec)
+
+
+class InvokeBytesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        os.environ["TEAM_HOME"] = str(ROOT)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_invoke_bills_the_prompt_and_the_listing(self):
+        cfg = load_config(
+            self.repo, fake=True, force=True, code_root="src", test_root="tests"
+        )
+        pipe = start_feature(cfg, "brief", "usage-bytes")
+        listing = pipe._listed_artifacts(["brief.md"])
+        self.assertIn("brief.md", listing)
+        pipe.invoke("architect", "architect", "prompt body", "design.json")
+        hop = load_hops(pipe.work)[0]
+        self.assertEqual(hop["prompt_bytes"], len(b"prompt body"))
+        # brief.md is on disk and was listed; census.md is not.
+        self.assertEqual(
+            hop["listed_bytes"], (pipe.work / "brief.md").stat().st_size
+        )
 
 
 if __name__ == "__main__":
