@@ -5,10 +5,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 from team.cli import main
+from team.config import load_config
+from team.pipeline import PipelineError, start_audit
 from team.state import State
+from tests.support.hostile import HostileRuntime, emit, register_runtime, write
 
 
 def _git_repo(root: Path) -> None:
@@ -78,6 +83,82 @@ class FakeAuditTests(unittest.TestCase):
         rc = main(["--repo", str(bare), "--fake", "audit", "--force"])
         self.assertEqual(rc, 0)
         self.assertTrue((bare / ".team" / "work" / "audit" / "report.md").is_file())
+        self.assertFalse((bare / "src").exists())
+        self.assertFalse((bare / "tests").exists())
+
+    def test_non_git_audit_product_write_is_fence_error_and_does_not_persist(self):
+        """report.md existing is not the fence. Product bytes must not persist."""
+        bare = Path(self.tmp.name) / "bare-hostile"
+        bare.mkdir()
+        (bare / "README").write_text("x\n", encoding="utf-8")
+        cfg = load_config(bare, fake=True, force=True)
+        pipe = start_audit(cfg, "what's missing", "audit")
+        hostile = HostileRuntime(
+            [
+                write("src/pwned.py", "pwned-audit\n"),
+                emit(
+                    {
+                        "roots": ["."],
+                        "components": [
+                            {
+                                "name": "readme",
+                                "path": "README",
+                                "state": "done",
+                                "evidence": "README exists",
+                            }
+                        ],
+                        "notes": "hostile",
+                    }
+                ),
+            ],
+            phases=("scout",),
+            num_turns=2,
+        )
+        with register_runtime("fake", hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.phase_scout()
+        self.assertIn("src/pwned.py", str(ctx.exception))
+        self.assertFalse((bare / "src" / "pwned.py").exists())
+        self.assertFalse(
+            (bare / "src").exists() and any((bare / "src").iterdir()),
+            "audit must not leave product bytes outside .team/work/",
+        )
+
+    def test_audit_write_outside_repo_is_fence_error_and_does_not_persist(self):
+        outside = Path(self.tmp.name) / "vibe.rc"
+        outside.write_text("user-outside\n", encoding="utf-8")
+        cfg = load_config(self.repo, fake=True, force=True)
+        pipe = start_audit(cfg, "status?", "audit-out")
+        hostile = HostileRuntime(
+            [
+                write(str(outside), "pwned-audit\n"),
+                emit(
+                    {
+                        "roots": ["."],
+                        "components": [
+                            {
+                                "name": "readme",
+                                "path": "README",
+                                "state": "done",
+                                "evidence": "README exists",
+                            }
+                        ],
+                        "notes": "hostile",
+                    }
+                ),
+            ],
+            phases=("scout",),
+            num_turns=2,
+        )
+        with register_runtime("fake", hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.phase_scout()
+        self.assertTrue(
+            "vibe.rc" in str(ctx.exception) or str(outside) in str(ctx.exception),
+            ctx.exception,
+        )
+        self.assertEqual(outside.read_text(encoding="utf-8"), "user-outside\n")
+        self.assertFalse((self.repo / "src").exists())
 
     def test_dry_run_stops_before_review(self):
         rc = main(

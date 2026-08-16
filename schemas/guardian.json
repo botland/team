@@ -1,42 +1,93 @@
 {
   "type": "object",
-  "required": ["risks", "guardian_markdown", "chain"],
+  "required": [
+    "risks",
+    "guardian_markdown",
+    "chain"
+  ],
   "properties": {
-    "guardian_markdown": { "type": "string" },
+    "guardian_markdown": {
+      "type": "string"
+    },
     "chain": {
       "type": "object",
-      "required": ["r_to_a", "a_to_t", "t_to_i", "i_to_r"],
+      "required": [
+        "r_to_a",
+        "a_to_t",
+        "t_to_i",
+        "i_to_r"
+      ],
       "properties": {
         "r_to_a": {
           "type": "object",
-          "required": ["ok", "note"],
+          "required": [
+            "ok",
+            "note"
+          ],
           "properties": {
-            "ok": { "type": "boolean" },
-            "note": { "type": "string" }
+            "ok": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
           }
         },
         "a_to_t": {
           "type": "object",
-          "required": ["ok", "note"],
+          "required": [
+            "ok",
+            "note"
+          ],
           "properties": {
-            "ok": { "type": "boolean" },
-            "note": { "type": "string" }
+            "ok": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
           }
         },
         "t_to_i": {
           "type": "object",
-          "required": ["ok", "note"],
+          "required": [
+            "ok",
+            "note"
+          ],
           "properties": {
-            "ok": { "type": "boolean" },
-            "note": { "type": "string" }
+            "ok": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
           }
         },
         "i_to_r": {
           "type": "object",
-          "required": ["ok", "note"],
+          "required": [
+            "ok",
+            "note"
+          ],
           "properties": {
-            "ok": { "type": "boolean" },
-            "note": { "type": "string" }
+            "ok": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "note": {
+              "type": "string"
+            }
           }
         }
       }
@@ -46,17 +97,38 @@
       "maxItems": 10,
       "items": {
         "type": "object",
-        "required": ["title", "evidence", "link"],
+        "required": [
+          "title",
+          "evidence",
+          "link"
+        ],
         "properties": {
-          "title": { "type": "string" },
-          "evidence": { "type": "string" },
-          "path": { "type": "string" },
+          "title": {
+            "type": "string"
+          },
+          "evidence": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
           "link": {
             "type": "string",
-            "description": "r_to_a | a_to_t | t_to_i | i_to_r | invariant"
+            "description": "Which arrow this risk belongs to. Closed set; pinned against findings._GUARDIAN_LINK_KIND.",
+            "enum": [
+              "r_to_a",
+              "a_to_t",
+              "t_to_i",
+              "i_to_r",
+              "invariant"
+            ]
           }
         }
       }
+    },
+    "census_markdown": {
+      "type": "string",
+      "description": "Tree inventory (layout, missing layers, verified path:line facts). Orchestrator writes census.md once. Not a chain judgment."
     }
   }
 }

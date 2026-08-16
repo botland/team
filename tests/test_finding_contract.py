@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from team.cli import main
-from team.config import schema_path
+from team.config import load_config, schema_path
 from team.findings import (
     KINDS,
     collect_review_findings,
@@ -30,6 +30,7 @@ from team.findings import (
 )
 from tests.support.hostile import HostileRuntime, emit, register_runtime
 from team.merge import merge_reviews
+from team.pipeline import start_audit, start_feature, start_range_review
 from team.state import State
 from team.util import dump_json, load_json
 from tests.support.repo import init_repo
@@ -159,6 +160,7 @@ class ApplyUnclassifiedTests(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         work = self.repo / ".team" / "work" / "add-greet-helper"
+        (work / "review.md").write_text("# Review\n", encoding="utf-8")
         injected = {
             "summary": "injected",
             "findings": [_finding("something wrong", kind="security", path="src/greet.py")],
@@ -174,7 +176,6 @@ class ApplyUnclassifiedTests(unittest.TestCase):
                     "--test-command",
                     "true",
                     "apply",
-                    "--no-review",
                     "add-greet-helper",
                 ]
             )
@@ -219,13 +220,230 @@ class ApplyUnclassifiedTests(unittest.TestCase):
                     "--test-command",
                     "true",
                     "apply",
-                    "--no-review",
                     "kind-security-invoke",
                 ]
             )
         self.assertEqual(rc, 0)
         self.assertEqual(State.load(pipe.work).stop_reason, "needs-classification")
         self.assertFalse((pipe.work / "apply-impl-summary.md").is_file())
+
+    def test_apply_does_not_classify_premature_progress_as_finished_review(self):
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "feature",
+                "--force",
+                "Add greet helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        work = self.repo / ".team" / "work" / "add-greet-helper"
+        (work / "review.md").write_text("# Review\n", encoding="utf-8")
+        dump_json(
+            work / "prompts" / "reviewer-fake.result.json",
+            {
+                "summary": "Reviewing the collected range first.",
+                "findings": [
+                    _finding(
+                        "Review in progress",
+                        kind="implementation",
+                        path="src/greet.py",
+                        evidence="Starting with the orchestrator artifacts.",
+                    )
+                ],
+                "review_markdown": "progress",
+            },
+        )
+        result_path = work / "prompts" / "reviewer-fake.result.json"
+        state = State.load(work)
+        rec = dict(state.last_review or {})
+        rec["results"] = [
+            {
+                "name": result_path.name,
+                "digest": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+            }
+        ]
+        state.last_review = rec
+        state.save(work)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "add-greet-helper",
+            ]
+        )
+        plan = ""
+        if (work / "apply-plan.md").is_file():
+            plan = (work / "apply-plan.md").read_text(encoding="utf-8")
+        self.assertNotIn("Review in progress", plan)
+        self.assertFalse((work / "apply-impl-summary.md").is_file())
+        self.assertNotEqual(State.load(work).stop_reason, "applied")
+        self.assertNotEqual(rc, 0)
+
+
+class ApplyDigestBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        os.environ["TEAM_HOME"] = str(ROOT)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _feature(self):
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "feature",
+                "--force",
+                "Add greet helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "review",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        return self.repo / ".team" / "work" / "add-greet-helper"
+
+    def test_apply_digest_mismatch_is_fail_closed(self):
+        work = self._feature()
+        dump_json(
+            work / "prompts" / "reviewer-fake.result.json",
+            {
+                "summary": "tampered",
+                "findings": [
+                    _finding(
+                        "greet ignores empty name",
+                        kind="implementation",
+                        path="src/greet.py",
+                    )
+                ],
+            },
+        )
+        dump_json(
+            work / "prompts" / "reviewer-stale.result.json",
+            {
+                "summary": "stale extra",
+                "findings": [
+                    _finding("extra bug", kind="implementation", path="src/greet.py")
+                ],
+            },
+        )
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "add-greet-helper",
+            ]
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(State.load(work).stop_reason, "applied")
+        self.assertFalse((work / "apply-impl-summary.md").is_file())
+
+    def test_needs_classify_ignores_unclassified_extra_when_pin_is_classified(self):
+        work = self._feature()
+        dump_json(
+            work / "prompts" / "reviewer-fake.result.json",
+            {
+                "summary": "pinned",
+                "findings": [
+                    _finding(
+                        "greet ignores empty name",
+                        kind="implementation",
+                        path="src/greet.py",
+                    )
+                ],
+            },
+        )
+        dump_json(
+            work / "prompts" / "reviewer-stale.result.json",
+            {
+                "summary": "leftover extra",
+                "findings": [_finding("mystery leftover", kind="security", path="src/x.py")],
+            },
+        )
+        pin = work / "prompts" / "reviewer-fake.result.json"
+        state = State.load(work)
+        rec = dict(state.last_review or {})
+        rec["results"] = [
+            {"name": pin.name, "digest": hashlib.sha256(pin.read_bytes()).hexdigest()}
+        ]
+        attempt = int(rec.get("attempt") or 1)
+        rec["attempt"] = attempt
+        state.last_review = rec
+        state.save(work)
+        found = collect_review_findings(work)
+        self.assertFalse(needs_classify(found, work=work))
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        after = State.load(work)
+        self.assertEqual((after.last_review or {}).get("attempt"), attempt)
+        plan = (work / "apply-plan.md").read_text(encoding="utf-8")
+        self.assertIn("implementation (1)", plan)
+        self.assertNotEqual(after.stop_reason, "needs-classification")
+
+    def test_apply_pin_lost_does_not_glob_stale_extras(self):
+        work = self._feature()
+        recorded = work / "prompts" / "reviewer-fake.result.json"
+        self.assertTrue(recorded.is_file())
+        recorded.unlink()
+        dump_json(
+            work / "prompts" / "reviewer-stale.result.json",
+            {
+                "summary": "stale extra",
+                "findings": [
+                    _finding("extra bug", kind="implementation", path="src/greet.py")
+                ],
+            },
+        )
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "add-greet-helper",
+            ]
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(State.load(work).stop_reason, "applied")
+        self.assertFalse((work / "apply-impl-summary.md").is_file())
 
 
 class StaleResultTests(unittest.TestCase):
@@ -325,6 +543,230 @@ class StaleResultTests(unittest.TestCase):
         found = collect_review_findings(self.work)
         evidences = {item["evidence"] for item in found}
         self.assertEqual(evidences, {"first evidence", "second evidence"})
+
+
+def _with_slow_record_as_list(fn):
+    """Widen the unlocked last_review RMW window. A lock around the whole
+    record step serializes as_list and keeps both pins."""
+    import inspect
+    import time
+
+    import team.pipeline as pipeline_mod
+
+    orig = pipeline_mod.as_list
+
+    def slow_as_list(value):
+        if any(frame.function == "_record_review_result" for frame in inspect.stack()[:12]):
+            time.sleep(0.05)
+        return orig(value)
+
+    pipeline_mod.as_list = slow_as_list
+    try:
+        return fn()
+    finally:
+        pipeline_mod.as_list = orig
+
+
+def _review_payload(title):
+    return {
+        "summary": title,
+        "findings": [_finding(title, kind="implementation")],
+        "review_markdown": "# %s\n" % title,
+    }
+
+
+class DualReviewPinTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        os.environ["TEAM_HOME"] = str(ROOT)
+        (self.repo / "src").mkdir()
+        (self.repo / "tests").mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _both_runtime(self):
+        return HostileRuntime(
+            by_phase={
+                "reviewer-claude": [emit(_review_payload("A"))],
+                "reviewer-grok": [emit(_review_payload("B"))],
+            },
+            num_turns=2,
+        )
+
+    def _enable_both(self, pipe):
+        pipe.cfg.fake = False
+        pipe.cfg.roles["reviewer"] = "both"
+
+    def _assert_both_pins(self, pipe):
+        claude = pipe.work / "prompts" / "reviewer-claude.result.json"
+        grok = pipe.work / "prompts" / "reviewer-grok.result.json"
+        self.assertTrue(claude.is_file(), "claude result missing")
+        self.assertTrue(grok.is_file(), "grok result missing")
+        results = list((pipe.state.last_review or {}).get("results") or [])
+        names = {row.get("name") for row in results}
+        self.assertEqual(names, {claude.name, grok.name})
+        by_name = {row["name"]: row for row in results}
+        for path in (claude, grok):
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(by_name[path.name]["digest"], digest)
+        found = collect_review_findings(pipe.work)
+        self.assertEqual({item["title"] for item in found}, {"A", "B"})
+        review = (pipe.work / "review.md").read_text(encoding="utf-8")
+        self.assertIn("A", review)
+        self.assertIn("B", review)
+
+    def _run_both(self, fn):
+        """Widen the unlocked pin RMW window without deadlocking a lock."""
+        return _with_slow_record_as_list(fn)
+
+    def test_feature_reviewer_both_parallel_keeps_both_pins(self):
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "both-feature")
+        self._enable_both(pipe)
+        hostile = self._both_runtime()
+        with register_runtime(("claude", "grok"), hostile):
+            self._run_both(pipe.phase_reviewer)
+        self._assert_both_pins(pipe)
+
+    def test_range_reviewer_both_parallel_keeps_both_pins(self):
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_range_review(cfg, slug="both-range")
+        self._enable_both(pipe)
+        hostile = self._both_runtime()
+        with register_runtime(("claude", "grok"), hostile):
+            self._run_both(pipe.phase_range_reviewer)
+        self._assert_both_pins(pipe)
+
+    def test_status_reviewer_both_parallel_keeps_both_pins(self):
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_audit(cfg, "status?", "both-audit")
+        self._enable_both(pipe)
+        hostile = self._both_runtime()
+        with register_runtime(("claude", "grok"), hostile):
+            self._run_both(pipe.phase_status_reviewer)
+        self._assert_both_pins(pipe)
+
+    def test_overlapping_record_review_result_keeps_both_names(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "overlap-record")
+        pipe._begin_review_attempt()
+        a = pipe.work / "prompts" / "reviewer-claude.result.json"
+        b = pipe.work / "prompts" / "reviewer-grok.result.json"
+        dump_json(a, _review_payload("A"))
+        dump_json(b, _review_payload("B"))
+
+        def race():
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futs = [
+                    pool.submit(pipe._record_review_result, a),
+                    pool.submit(pipe._record_review_result, b),
+                ]
+                for fut in futs:
+                    fut.result()
+
+        _with_slow_record_as_list(race)
+        names = {row.get("name") for row in (pipe.state.last_review or {}).get("results") or []}
+        self.assertEqual(names, {a.name, b.name})
+        by_name = {
+            row["name"]: row for row in (pipe.state.last_review or {}).get("results") or []
+        }
+        self.assertEqual(by_name[a.name]["digest"], hashlib.sha256(a.read_bytes()).hexdigest())
+        self.assertEqual(by_name[b.name]["digest"], hashlib.sha256(b.read_bytes()).hexdigest())
+
+
+class ResultPersistenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        init_repo(self.repo)
+        os.environ["TEAM_HOME"] = str(ROOT)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_invoke_result_json_round_trips_payload_larger_than_200k(self):
+        import json
+
+        from team.pipeline import start_feature
+
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "big-review")
+        findings = [
+            _finding("finding-%02d" % i, kind="implementation", path="src/f%02d.py" % i)
+            for i in range(10)
+        ]
+        payload = {
+            "summary": "large",
+            "findings": findings,
+            "review_markdown": "M" * 210000,
+        }
+        self.assertGreater(len(json.dumps(payload, indent=2)), 200000)
+        hostile = HostileRuntime([emit(payload)], phases=("reviewer-fake",), num_turns=2)
+        with register_runtime("fake", hostile):
+            pipe.phase_reviewer()
+        result_path = pipe.work / "prompts" / "reviewer-fake.result.json"
+        try:
+            data = load_json(result_path)
+        except Exception as exc:
+            self.fail(
+                "result JSON must round-trip a >200k payload, got %s"
+                % exc
+            )
+        titles = [item["title"] for item in data.get("findings") or []]
+        self.assertEqual(len(titles), 10)
+        for i in range(10):
+            self.assertIn("finding-%02d" % i, titles)
+        digest = hashlib.sha256(result_path.read_bytes()).hexdigest()
+        recorded = (pipe.state.last_review or {}).get("results") or []
+        self.assertEqual(recorded[0]["digest"], digest)
+        found = collect_review_findings(pipe.work)
+        self.assertEqual({item["title"] for item in found}, set(titles))
+
+    def test_collect_and_apply_fail_closed_on_unparseable_recorded_pin(self):
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "feature",
+                "--force",
+                "Add greet helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        work = self.repo / ".team" / "work" / "add-greet-helper"
+        (work / "review.md").write_text("# Review\n", encoding="utf-8")
+        pin = work / "prompts" / "reviewer-fake.result.json"
+        pin.write_text('{"summary": "trunc", "findings": [', encoding="utf-8")
+        digest = hashlib.sha256(pin.read_bytes()).hexdigest()
+        state = State.load(work)
+        rec = dict(state.last_review or {})
+        rec["results"] = [{"name": pin.name, "digest": digest}]
+        state.last_review = rec
+        state.save(work)
+        with self.assertRaises(Exception):
+            collect_review_findings(work)
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "apply",
+                "add-greet-helper",
+            ]
+        )
+        self.assertNotEqual(rc, 0)
+        self.assertNotEqual(State.load(work).stop_reason, "applied")
+        self.assertFalse((work / "apply-impl-summary.md").is_file())
 
 
 class MergeOverlapTests(unittest.TestCase):

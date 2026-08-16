@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Sequence, Tuple
 
+from team.findings import finding_path
+
 
 def merge_reviews(parts: Sequence[Tuple[str, Dict[str, Any], str]]) -> str:
     """parts: (label, schema_output, markdown)."""
@@ -53,7 +55,7 @@ def _overlap(parts: Sequence[Tuple[str, Dict[str, Any], str]]) -> List[str]:
         keys = set()
         for finding in (data or {}).get("findings") or []:
             title = (finding.get("title") or "").strip().lower()
-            path = (finding.get("path") or "").strip()
+            path = finding_path(finding)
             if title or path:
                 keys.add((path, title))
         bags.append(keys)

@@ -3,12 +3,22 @@
 
 [paths]
 # Leave empty to let the architect discover roots.
+# '.' is the repository except test_root and git submodules.
+# A package path is a tightening, not the default law.
 code_root = ""
+# Write fence for test-writer. Not the host suite.
+# Empty still excludes the conventional tests/ tree from write-code
+# (same fallback testhost uses for discovery).
 test_root = ""
+# Host suite. Nested packages almost always need this (cwd, PYTHONPATH,
+# selected dirs). Discovery will not invent those; empty + a nested
+# test_root is not a selected-dir suite.
 test_command = ""
 
 [roles]
-# Runtimes: claude | grok | both | host
+# Runtimes: a shipped coding adapter (claude, grok), both (reviewer
+# parallel), host (tester suite), fake (tests), or a registered third
+# headless CLI. Coding roles accept every shipped adapter.
 # "both" is only valid for reviewer.
 # "host" is only valid for tester (orchestrator runs the suite).
 architect = "claude"
@@ -24,8 +34,30 @@ guardian = "claude"
 scout = "grok"
 
 [review]
-# Past-commits (unscoped / --since) uses one runtime. PR and feature use roles.reviewer.
+# Past-commits (unscoped / --since) default. claude | grok | both.
+# PR and feature use roles.reviewer unless --reviewer / --assign overrides.
 range_reviewer = "grok"
+
+[effort]
+# Per-role reasoning effort. Not a runtime name.
+# Runtime-neutral integer: 0 is the lowest, 5 the highest. Each runtime gets
+# the nearest rung it actually implements, so a level one CLI lacks degrades
+# instead of being dropped:
+#
+#   level   claude    grok
+#   0       low       low
+#   1       low       low
+#   2       medium    medium
+#   3       high      high
+#   4       xhigh     xhigh
+#   5       max       xhigh     <- grok has no fifth rung
+#
+# The names low | medium | high | xhigh | max are still accepted and are
+# stored as their level, so "xhigh" and 4 are the same setting.
+# Unset roles keep the engine default: 3 for architect, critic, reviewer,
+# guardian, tdd-design; omitted for everyone else.
+# architect = 4
+# reviewer = 4
 
 [run]
 # Skip optional phases: critic, adversarial, guardian

@@ -4,18 +4,23 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Sequence
 
 from team.config import (
     AUDIT_PHASE_ORDER,
     DEFAULT_AUDIT_QUERY,
+    DEFAULT_RANGE_SLUG,
+    EFFORT_MAX,
+    EFFORT_MIN,
     PHASE_ORDER,
     RANGE_PHASE_ORDER,
+    REVIEWER_RUNTIMES,
     ROLES,
     apply_range_reviewer,
     collect_config_edits,
     config_path,
     default_roles,
+    expand_reviewer,
     format_toml_value,
     load_config,
     resolve_phase,
@@ -24,6 +29,7 @@ from team.config import (
 from team.pipeline import (
     OptionalPhaseError,
     PipelineError,
+    QuotaExhausted,
     load_pipeline,
     start_audit,
     start_feature,
@@ -31,9 +37,16 @@ from team.pipeline import (
 )
 from team import findings as findings_mod
 from team import gitutil
+from team import runners
 from team import style
 from team.state import State, require_work, work_dir
+from team import usage as usage_mod
 from team.util import as_str, engine_root, load_json, slugify, write_text
+
+# Above this, the untagged empty-tree fallback needs --whole-branch. Not a
+# review-quality threshold: it is the point where "read the whole patch" stops
+# being a per-run cost and becomes a per-hop one.
+RANGE_FALLBACK_MAX_BYTES = 64 * 1024
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -41,8 +54,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except QuotaExhausted as exc:
+        # Not a failure of the run: the tree, the artifacts, and the phase are
+        # all intact. Distinct exit code so a wrapper can retry instead of
+        # treating it as a broken pipeline.
+        print("suspended: %s" % exc, file=sys.stderr)
+        _print_usage_on_error(args)
+        return 3
     except (PipelineError, findings_mod.FindingsError) as exc:
         print("error: %s" % exc, file=sys.stderr)
+        _print_usage_on_error(args)
         return 1
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
@@ -55,13 +76,14 @@ def _parser() -> argparse.ArgumentParser:
         description="Split-team orchestrator: files as protocol, roles assigned to runtimes.",
         epilog=(
             "Each command has -h/--help, e.g. team review --help\n"
-            "Global flags (--repo, --assign, --fake, --skip) go BEFORE the command:\n"
+            "Global flags (--repo, --assign, --effort, --fake, --skip) go BEFORE the command:\n"
             "  team --assign reviewer=claude review\n"
             "  team --assign all=grok resume review-since-tag\n"
+            "  team --effort architect=xhigh --effort all=high feature Add X\n"
             "Past-commits reviewer can also be set on the command:\n"
             "  team review --reviewer claude\n"
             "Persist project paths and other file-backed options:\n"
-            "  team config --code-root inferedge-phase1/controller "
+            "  team config --code-root . "
             "--test-root inferedge-phase1/tests"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -80,6 +102,18 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--effort",
+        action="append",
+        default=[],
+        metavar="ROLE=LEVEL",
+        help=(
+            "Override role effort (repeatable). ROLE=0..5 (0 lowest, 5 highest), "
+            "or all=4. Names low|medium|high|xhigh|max are accepted and stored as "
+            "their level. A level the runtime lacks snaps to its nearest rung. "
+            "Does not change the runtime name; later flags win."
+        ),
+    )
+    p.add_argument(
         "--skip",
         action="append",
         default=[],
@@ -94,7 +128,10 @@ def _parser() -> argparse.ArgumentParser:
     f = sub.add_parser(
         "feature",
         help="Start a feature pipeline",
-        description="Architect → critic → TDD → implement → test → review.",
+        description=(
+            "Architect → critic → TDD → implement → test → adversarial. "
+            "Does not review. Then: team review <slug> && team apply <slug>."
+        ),
     )
     f.add_argument("brief", nargs=argparse.REMAINDER, help="Feature brief")
     f.add_argument("--slug", default="", help="Work slug (default: derived from brief)")
@@ -119,15 +156,16 @@ def _parser() -> argparse.ArgumentParser:
         help="Review a work slug, or commits since the last reviewed-* tag (not only PRs)",
         description=(
             "Three scopes:\n"
-            "  team review <slug>     re-review a feature/audit run (uses that run's reviewer)\n"
+            "  team review <slug>     review a feature/audit run (uses that run's reviewer)\n"
             "  team review --pr N     PR review: Claude and Grok (both)\n"
-            "  team review            past commits since last reviewed-* tag: one reviewer\n"
+            "  team review            past commits since last reviewed-* tag (default: grok)\n"
             "\n"
-            "Past-commits default is grok. Force Claude with:\n"
+            "Reviewer can be claude, grok, or both (parallel) in all modes.\n"
+            "Past-commits default is grok. PR default is both. Override with:\n"
+            "  team review --reviewer both\n"
             "  team review --reviewer claude\n"
-            "  team --assign reviewer=claude review\n"
-            "Config: [review] range_reviewer = \"claude\"\n"
-            "reviewer=both is rejected on past-commits."
+            "  team --assign reviewer=both review\n"
+            "Config: [review] range_reviewer = \"both\""
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -147,10 +185,15 @@ def _parser() -> argparse.ArgumentParser:
     v.add_argument("--no-stamp", action="store_true", help="Do not create a reviewed-* tag")
     v.add_argument("--force", action="store_true", help="Replace an existing range-review work dir")
     v.add_argument(
+        "--whole-branch",
+        action="store_true",
+        help="Allow the empty-tree fallback: review every commit on the branch. Costs a full-repo read per hop.",
+    )
+    v.add_argument(
         "--reviewer",
-        choices=("claude", "grok"),
+        choices=REVIEWER_RUNTIMES,
         default=None,
-        help="Force the past-commits reviewer (default: grok). Also allowed with --pr.",
+        help="Force the reviewer: claude, grok, or both (parallel). Default: grok for past-commits, both for --pr.",
     )
     v.add_argument(
         "--list-tags",
@@ -191,27 +234,32 @@ def _parser() -> argparse.ArgumentParser:
 
     p_ap = sub.add_parser(
         "apply",
-        help="Apply classified review findings (re-review if kind= is missing)",
+        help="Apply classified review findings (does not review or run guardian)",
         description=(
-            "Route review findings by kind: architecture → replan, test → contract+tests, "
-            "implementation → production. Unstructured findings trigger a re-review first.\n"
-            "  team apply <slug> --seq   one class at a time until failure\n"
-            "  team apply <slug> --seq --reopen ID   reopen an earlier class; later ids go stale\n"
-            "Class reviews land in seq/<id>/review.md; review.md is left alone.\n"
+            "Route review findings by kind: architecture → replan "
+            "(writes design.md if missing), test → contract+tests, "
+            "implementation → production. Unstructured findings stop apply; run team review.\n"
+            "Apply does not invoke reviewer or guardian. Loop with:\n"
+            "  team review && team apply\n"
+            "  team apply --seq   one class at a time until failure\n"
+            "  team apply --seq --reopen ID   reopen an earlier class; later ids go stale\n"
+            "Omit the slug to use the same default as team review (%s).\n"
+            "Re-review a finished class with team review --seq. review.md is left alone.\n"
             "team list shows each class id and status."
+            % DEFAULT_RANGE_SLUG
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p_ap.add_argument("slug")
+    p_ap.add_argument(
+        "slug",
+        nargs="?",
+        default="",
+        help="Work slug (default: %s, same as unscoped team review)" % DEFAULT_RANGE_SLUG,
+    )
     p_ap.add_argument(
         "--dry-run",
         action="store_true",
         help="Classify and write apply-plan.md; do not edit the repo",
-    )
-    p_ap.add_argument(
-        "--no-review",
-        action="store_true",
-        help="Do not run a closing review after applying",
     )
     p_ap.add_argument(
         "--seq",
@@ -220,6 +268,15 @@ def _parser() -> argparse.ArgumentParser:
             "Apply one class at a time (architecture → test → implementation, "
             "then severity) until a class fails or the queue is empty. "
             "Does not overwrite review.md."
+        ),
+    )
+    p_ap.add_argument(
+        "--repair",
+        action="store_true",
+        help=(
+            "Run debugger + repair when the suite fails after applying. "
+            "Off by default: it is the most expensive stretch of a hop and is "
+            "moving to its own rail. Without it apply stops at needs-repair."
         ),
     )
     p_ap.add_argument(
@@ -242,14 +299,14 @@ def _parser() -> argparse.ArgumentParser:
     p_re = sub.add_parser(
         "replan",
         help="Architect writes a design delta",
-        description="Read review.md and write design-replan.md. --continue applies it and resumes TDD.",
+        description="Read review.md and write design-replan.md. --continue merges it into design.md and resumes TDD.",
     )
     p_re.add_argument("slug")
     p_re.add_argument(
         "--continue",
         dest="do_continue",
         action="store_true",
-        help="Apply design-replan.md as design.md and resume from TDD design",
+        help="Merge design-replan.md into design.md and resume from TDD design",
     )
     p_re.set_defaults(func=cmd_replan)
 
@@ -270,6 +327,22 @@ def _parser() -> argparse.ArgumentParser:
     )
     s.add_argument("slug")
     s.set_defaults(func=cmd_status)
+
+    costs = sub.add_parser(
+        "costs",
+        help="Print token/$ spend from usage.jsonl (no model)",
+        description=(
+            "Read the orchestrator spend ledger. Omit the slug to list every "
+            "run. Provider-reported $ only; omitted cost is unknown, never free."
+        ),
+    )
+    costs.add_argument(
+        "slug",
+        nargs="?",
+        default="",
+        help="Work slug. Omit to list every .team/work run.",
+    )
+    costs.set_defaults(func=cmd_costs)
 
     roles = sub.add_parser(
         "roles",
@@ -294,9 +367,10 @@ def _parser() -> argparse.ArgumentParser:
             "pairs write only those keys (creates the file from the example "
             "if needed).\n"
             "  team config\n"
-            "  team config --code-root inferedge-phase1/controller "
+            "  team config --code-root . "
             "--test-root inferedge-phase1/tests\n"
             "  team config --assign implementer=grok --skip critic\n"
+            "  team config --effort architect=xhigh\n"
             "  team config test_command=\"make test\" phase_timeout=1800\n"
             "  team config --unset code_root"
         ),
@@ -329,6 +403,14 @@ def _parser() -> argparse.ArgumentParser:
         help="Write roles.<role> (repeatable; all=grok is allowed)",
     )
     cfg_cmd.add_argument(
+        "--effort",
+        dest="set_effort",
+        action="append",
+        default=[],
+        metavar="ROLE=LEVEL",
+        help="Write effort.<role> as 0..5 (repeatable; all=4 is allowed)",
+    )
+    cfg_cmd.add_argument(
         "--skip",
         dest="set_skip",
         action="append",
@@ -339,8 +421,8 @@ def _parser() -> argparse.ArgumentParser:
         "--range-reviewer",
         dest="set_range_reviewer",
         default=None,
-        choices=("claude", "grok"),
-        help="Write review.range_reviewer",
+        choices=REVIEWER_RUNTIMES,
+        help="Write review.range_reviewer (claude, grok, or both)",
     )
     cfg_cmd.add_argument(
         "--phase-timeout",
@@ -398,6 +480,7 @@ def _cfg(args, **kwargs):
         test_root=args.test_root,
         test_command=args.test_command,
         depth=getattr(args, "depth", "") or "",
+        effort=getattr(args, "effort", None) or [],
         **kwargs,
     )
 
@@ -424,6 +507,7 @@ def cmd_feature(args) -> int:
     print("repo: %s" % cfg.repo)
     print("work: %s" % work_dir(cfg.repo, slug))
     print("assign: %s" % _fmt_roles({k: cfg.assignment(k) for k in cfg.roles}))
+    print("effort: %s" % _fmt_effort(cfg))
     pipe = start_feature(cfg, brief, slug)
     pipe.run()
     _print_done(pipe)
@@ -464,6 +548,8 @@ def cmd_review(args) -> int:
         if args.seq:
             return _cmd_review_seq(pipe, args.seq)
         print("== team review %s" % slug)
+        if pipe.state.mode != "audit":
+            pipe._write_apply_surface()
         pipe.phase_reviewer()
         pipe.state.mark("reviewer")
         if pipe.state.mode != "audit" and "guardian" not in cfg.skip:
@@ -472,6 +558,7 @@ def cmd_review(args) -> int:
                 pipe.state.mark("guardian")
             except OptionalPhaseError as exc:
                 pipe._skip("guardian", str(exc))
+        pipe._write_followups()
         pipe.save()
         _print_done(pipe)
         return 0
@@ -492,13 +579,17 @@ def cmd_review(args) -> int:
         desc = "PR %s" % args.pr
         who = cfg.roles.get("reviewer") or "both"
     else:
-        slug = slug or "review-since-tag"
+        slug = slug or DEFAULT_RANGE_SLUG
         desc = "commits since last dedicated tag"
         who = cfg.roles.get("reviewer") or cfg.range_reviewer
     print("== team review %s" % slug)
     print("repo: %s" % cfg.repo)
     print("scope: %s" % desc)
     print("reviewer: %s" % who)
+    if not args.pr:
+        rc = _check_range_bound(cfg, args)
+        if rc:
+            return rc
     pipe = start_range_review(cfg, slug=slug, pr=args.pr, since=args.since)
     print("range: %s" % pipe.state.brief)
     pipe.run()
@@ -511,16 +602,89 @@ def cmd_review(args) -> int:
     return 0
 
 
+def stamp_message(
+    *,
+    slug: str,
+    head_sha: str,
+    runtimes: Sequence[str],
+    assignment: str,
+    findings_count: int,
+    guardian_status: str,
+    range_base: str,
+) -> str:
+    """Body of the annotated reviewed-* tag: the evidence of who reviewed what.
+
+    Pure so the fallbacks are assertable. The reviewer line needs its parens:
+    ``%`` binds tighter than ``or``, so ``"reviewer=%s" % ",".join(x) or y``
+    is ``("reviewer=" + joined) or y`` -- always truthy, fallback unreachable,
+    and an empty runtimes list stamps a tag that records ``reviewer=``.
+    """
+    return "\n".join(
+        [
+            "slug=%s" % slug,
+            "reviewed-head=%s" % head_sha,
+            "reviewer=%s" % (",".join(runtimes) or assignment),
+            "findings=%d" % findings_count,
+            "guardian=%s" % guardian_status,
+            "range-base=%s" % (range_base or "(root)"),
+        ]
+    )
+
+
+def _check_range_bound(cfg, args) -> int:
+    """Refuse an unbounded, expensive range before anything is built or erased.
+
+    Runs ahead of ``start_range_review`` on purpose: that call honours --force
+    by removing the existing work dir, so a check placed after it would destroy
+    a previous review's artifacts on the way to refusing. Nothing here writes.
+
+    A warning the operator reads *after* the bill is not a control. Every hop is
+    told to read the collected patches end to end, so those bytes are charged
+    once per hop for the whole run. Gate on the bytes actually handed out rather
+    than on the fallback itself: a small repo with no tags is cheap.
+    """
+    _base, kind = gitutil.resolve_review_base(cfg.repo, args.since)
+    if kind != "branch" or args.whole_branch:
+        return 0
+    size = len(gitutil.range_diff(cfg.repo, "").encode("utf-8", "replace"))
+    size += len(
+        gitutil.worktree_diff(
+            cfg.repo, gitutil.porcelain_paths(cfg.repo)
+        ).encode("utf-8", "replace")
+    )
+    commits = gitutil.commit_count(cfg.repo, "")
+    if size <= RANGE_FALLBACK_MAX_BYTES:
+        print(
+            "warning: no reviewed-* tag; range is the whole branch from empty tree "
+            "(%d commit(s), %s). Stamp HEAD after a real delta: team review --mark HEAD"
+            % (commits, _fmt_bytes(size)),
+            file=sys.stderr,
+        )
+        return 0
+    print(
+        "error: no reviewed-* tag and no tag to fall back to, so the range is the\n"
+        "whole branch from the empty tree: %d commit(s), %s of patch. Every hop\n"
+        "reads all of it, so this is charged once per hop for the whole run.\n"
+        "\n"
+        "  team review --mark HEAD     stamp now, then review only future deltas\n"
+        "  team review --since <ref>   review one bounded range\n"
+        "  team review --whole-branch  do it anyway"
+        % (commits, _fmt_bytes(size)),
+        file=sys.stderr,
+    )
+    return 2
+
+
 def _stamp_review(pipe, *, explicit: bool) -> int:
     reasons = []
     if pipe.state.stop_reason != "complete":
         reasons.append("stop_reason=%s" % (pipe.state.stop_reason or "unset"))
 
     assignment = pipe.cfg.assignment("reviewer")
-    if assignment == "both":
-        expected = ["reviewer-claude.result.json", "reviewer-grok.result.json"]
-    else:
-        expected = ["reviewer-%s.result.json" % assignment]
+    expected = [
+        "reviewer-%s.result.json" % runtime
+        for runtime in expand_reviewer(assignment)
+    ]
     findings_count = 0
     runtimes = []
     for name in expected:
@@ -572,15 +736,14 @@ def _stamp_review(pipe, *, explicit: bool) -> int:
 
     head_sha = collected or now
     guardian_status = "skipped" if skipped else "ok"
-    message = "\n".join(
-        [
-            "slug=%s" % pipe.state.slug,
-            "reviewed-head=%s" % head_sha,
-            "reviewer=%s" % ",".join(runtimes) or assignment,
-            "findings=%d" % findings_count,
-            "guardian=%s" % guardian_status,
-            "range-base=%s" % (pipe.state.range_base or "(root)"),
-        ]
+    message = stamp_message(
+        slug=pipe.state.slug,
+        head_sha=head_sha,
+        runtimes=runtimes,
+        assignment=assignment,
+        findings_count=findings_count,
+        guardian_status=guardian_status,
+        range_base=pipe.state.range_base,
     )
     try:
         tag = gitutil.stamp_reviewed(pipe.repo, head_sha or "HEAD", message=message)
@@ -676,7 +839,7 @@ def _cmd_review_show_range(args, repo: Path) -> int:
         return 2
     if args.pr:
         log, _diff, how = gitutil.pr_bundle(repo, args.pr)
-        count = len([ln for ln in log.splitlines() if ln.strip()])
+        count = gitutil.oneline_commit_count(log)
         desc = gitutil.describe_range(args.pr, "pr", count) + " [%s]" % how
         print("kind: pr")
         print("pr: %s" % args.pr)
@@ -702,9 +865,10 @@ def _cmd_review_show_range(args, repo: Path) -> int:
 
 
 def cmd_apply(args) -> int:
+    slug = args.slug or DEFAULT_RANGE_SLUG
     cfg = _cfg(args, dry_run=args.dry_run)
-    pipe = load_pipeline(cfg, args.slug)
-    print("== team apply %s" % args.slug)
+    pipe = load_pipeline(cfg, slug)
+    print("== team apply %s" % slug)
     print("work: %s" % pipe.work)
     if args.skip_failed and not args.seq:
         print("error: --skip-failed requires --seq", file=sys.stderr)
@@ -717,10 +881,10 @@ def cmd_apply(args) -> int:
         return 2
     pipe.apply_review(
         dry_run=args.dry_run,
-        rereview=not args.no_review,
         seq=args.seq,
         skip_failed=args.skip_failed,
         reopen=args.reopen,
+        repair=args.repair,
     )
     _print_done(pipe)
     if pipe.state.stop_reason == "seq-failed":
@@ -871,6 +1035,43 @@ def cmd_status(args) -> int:
     apply_summary = work / "apply-summary.md"
     if apply_summary.is_file():
         print("apply: %s" % apply_summary)
+    _print_usage_summary(work)
+    return 0
+
+
+def cmd_costs(args) -> int:
+    repo = Path(args.repo).resolve() if args.repo else Path.cwd()
+    slug = args.slug or ""
+    if slug:
+        hops = usage_mod.load_repo_hops(repo, slug=slug)
+        if not hops:
+            work = work_dir(repo, slug)
+            if not (work / "state.json").is_file():
+                print("No run at %s (missing state.json)" % work, file=sys.stderr)
+                return 1
+            print("no usage logged for %s" % slug)
+            return 0
+        print(usage_mod.render_console(hops, slug=slug))
+        ledger = usage_mod.repo_ledger_path(repo)
+        print(
+            "%s %s"
+            % (
+                style.dim("ledger:"),
+                style.path(str(ledger or (repo / ".team" / "work" / usage_mod.USAGE_JSONL))),
+            )
+        )
+        return 0
+    hops = usage_mod.load_repo_hops(repo)
+    if not hops:
+        print("no usage logged in %s" % (repo / ".team" / "work"))
+        return 0
+    by_slug: Dict[str, List[dict]] = {}
+    for hop in hops:
+        by_slug.setdefault(str(hop.get("slug") or "(none)"), []).append(hop)
+    rows = [(name, usage_mod.summarize(by_slug[name])) for name in sorted(by_slug)]
+    if len(rows) > 1:
+        rows.append(("total", usage_mod.summarize(hops)))
+    print(usage_mod.format_costs_listing(rows))
     return 0
 
 
@@ -879,11 +1080,26 @@ def cmd_roles(args) -> int:
     print("engine: %s" % engine_root())
     print("repo:   %s" % cfg.repo)
     print("")
-    print("%-14s %-10s %s" % ("ROLE", "ASSIGNED", "ALLOWED"))
+    print("%-14s %-10s %-8s %s" % ("ROLE", "ASSIGNED", "EFFORT", "ALLOWED"))
     for role, spec in ROLES.items():
-        print("%-14s %-10s %s" % (role, cfg.assignment(role), ", ".join(spec["runtimes"])))
+        print(
+            "%-14s %-10s %-8s %s"
+            % (
+                role,
+                cfg.assignment(role),
+                _fmt_effort_level(cfg.effort_for(role)),
+                ", ".join(spec["runtimes"]),
+            )
+        )
+    legend = _effort_legend(cfg.effort_for(role) for role in ROLES)
+    if legend:
+        print("")
+        print("effort %d (lowest) .. %d (highest); a level a runtime lacks snaps to its nearest:"
+              % (EFFORT_MIN, EFFORT_MAX))
+        for line in legend:
+            print(line)
     print("")
-    print("range_reviewer %s  (past-commits; one runtime)" % cfg.range_reviewer)
+    print("range_reviewer %s  (past-commits default; claude, grok, or both)" % cfg.range_reviewer)
     return 0
 
 
@@ -915,6 +1131,7 @@ def cmd_config(args) -> int:
             skip=_config_skip(args.set_skip, args.skip),
             range_reviewer=args.set_range_reviewer,
             phase_timeout=args.set_phase_timeout,
+            effort=args.set_effort or args.effort,
         )
     except SystemExit as exc:
         print("error: %s" % exc, file=sys.stderr)
@@ -974,6 +1191,10 @@ def _print_effective_config(dest: Path, cfg) -> None:
     print("[roles]")
     for role in ROLES:
         print("  %-14s %s" % (role, cfg.assignment(role)))
+    print("")
+    print("[effort]")
+    for role in ROLES:
+        print("  %-14s %s" % (role, _fmt_effort_level(cfg.effort_for(role))))
 
 
 def cmd_audit(args) -> int:
@@ -1002,14 +1223,60 @@ def cmd_audit(args) -> int:
     print("depth: %s" % cfg.depth)
     print("work: %s" % work_dir(cfg.repo, slug))
     print("assign: %s" % _fmt_roles({k: cfg.assignment(k) for k in cfg.roles}))
+    print("effort: %s" % _fmt_effort(cfg))
     pipe = start_audit(cfg, query, slug)
     pipe.run()
     _print_done(pipe)
     return 0
 
 
+def _fmt_bytes(n: int) -> str:
+    if n >= 1024 * 1024:
+        return "%.1fMB" % (n / (1024 * 1024))
+    if n >= 1024:
+        return "%dKB" % (n // 1024)
+    return "%dB" % n
+
+
 def _fmt_roles(roles: dict) -> str:
     return " ".join("%s=%s" % (k, v) for k, v in roles.items())
+
+
+def _fmt_effort_level(level) -> str:
+    """Level 0 is a real setting, so the test is ``is None``.
+
+    ``or "-"`` would print the lowest effort as "unset".
+    """
+    return "-" if level is None else str(level)
+
+
+def _effort_legend(levels) -> List[str]:
+    """One line per level in use: what each CLI is actually sent.
+
+    Per-row would repeat the same mapping on every role. The translation is a
+    property of the level, not of the role, so it belongs beside the table once.
+    """
+    out = []
+    for level in sorted({lv for lv in levels if lv is not None}):
+        out.append(
+            "  %s -> claude %-6s grok %s"
+            % (
+                level,
+                runners.resolve_effort(level, runners.CLAUDE_EFFORT_LADDER),
+                runners.resolve_effort(level, runners.GROK_EFFORT_LADDER),
+            )
+        )
+    return out
+
+
+def _fmt_effort(cfg) -> str:
+    return _fmt_roles(
+        {
+            role: cfg.effort_for(role)
+            for role in ROLES
+            if cfg.effort_for(role) is not None
+        }
+    )
 
 
 def _print_done(pipe) -> None:
@@ -1033,3 +1300,45 @@ def _print_done(pipe) -> None:
     apply_summary = pipe.work / "apply-summary.md"
     if apply_summary.is_file():
         print("apply: %s" % apply_summary)
+    _print_usage_summary(pipe.work)
+
+
+def _print_usage_summary(work: Path) -> None:
+    hops = usage_mod.load_hops(work)
+    if not hops:
+        ledger = usage_mod.repo_ledger_path(work)
+        if ledger is not None and ledger.is_file():
+            hops = [
+                row
+                for row in usage_mod.load_repo_hops(ledger.parent.parent.parent, slug=work.name)
+            ]
+    if not hops:
+        return
+    print(usage_mod.format_summary_line(usage_mod.summarize(hops)))
+    shown = usage_mod.repo_ledger_path(work) or (work / usage_mod.USAGE_MD)
+    print("%s %s" % (style.dim("usage:"), style.path(str(shown))))
+
+
+def _print_usage_on_error(args) -> None:
+    """Spend footer after a failed command. --force must not hide the bill.
+
+    This run's hops first. The repo ledger is the fallback for a run that died
+    before its own work dir had a ledger, and it is labelled, because every
+    range review reuses one slug and the ledger never rolls over.
+    """
+    repo = Path(args.repo).resolve() if getattr(args, "repo", None) else Path.cwd()
+    slug = str(getattr(args, "slug", "") or "")
+    cmd = getattr(args, "cmd", "")
+    if not slug and cmd in ("review", "apply"):
+        slug = DEFAULT_RANGE_SLUG
+    scope = ""
+    hops = usage_mod.load_hops(work_dir(repo, slug)) if slug else []
+    if not hops:
+        hops = usage_mod.load_repo_hops(repo, slug=slug)
+        scope = "all runs in ledger"
+    if not hops:
+        return
+    print(usage_mod.format_summary_line(usage_mod.summarize(hops), scope=scope))
+    ledger = usage_mod.repo_ledger_path(repo)
+    if ledger is not None:
+        print("%s %s" % (style.dim("usage:"), style.path(str(ledger))))

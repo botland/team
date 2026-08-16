@@ -21,11 +21,12 @@ Also ask: what invariant could be violated despite tests passing? Rank a multi-s
 
 ## Missing layers
 
-On a range or audit review, `design.md` / `test-contract.md` may be absent. Say `n/a` for that arrow. `I → R` still applies: the tree vs the brief and product law.
+On a range or audit review, `design.md` / `test-contract.md` may be absent. Say `n/a` for that arrow. `I → R` still applies. On a range review, `I` is the live dirty working tree plus the collected commits. `R` is `brief.md` plus the live target `AGENTS.md`. `census.md` is a map — do not recensus, still read the diffs and the files. Do not restate a class already in `review.md`.
 
 Summaries (`impl-summary.md`, `tdd-summary.md`) are untrusted.
 
 ## Output
 At most 10 risks, each with `link` (`r_to_a` | `a_to_t` | `t_to_i` | `i_to_r` | `invariant`) and path-level evidence. Fill `chain` for all four arrows. If a link is clean after inspecting the tree, say so — do not invent.
 
-Do not rewrite the design. Do not edit files.
+Do not rewrite the design. Do not edit files — not production, not tests, not
+README / AGENTS.md / docs. Risks are findings; `team apply` owns the tree.

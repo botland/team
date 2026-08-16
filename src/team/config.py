@@ -6,73 +6,91 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from team.util import engine_root, write_text
+from team.util import engine_root, normalize_root, write_text
+
+# Shipped headless coding-agent adapters. Interchangeable: any role that
+# accepts one accepts the others. A third CLI is another adapter (register
+# + this tuple if it is a shipped peer), not a phase fork.
+CODING_RUNTIMES = ("claude", "grok")
+
+# Reviewer (and review.range_reviewer) may be one runtime or every shipped
+# coding runtime in parallel. ``both`` expands via expand_reviewer().
+REVIEWER_RUNTIMES = CODING_RUNTIMES + ("both",)
+
+# Only these capabilities may edit the product tree. Every other persona
+# (read-only inspect, execute/tester) is non-write: no write tools, inspect fence.
+WRITE_CAPABILITIES = frozenset(("write-tests", "write-code"))
+
+
+def may_write(capability: str) -> bool:
+    return (capability or "") in WRITE_CAPABILITIES
+
 
 # role -> default runtime, allowed runtimes, capability
 ROLES: Dict[str, Dict[str, Any]] = {
     "architect": {
         "default": "claude",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "read-only",
         "optional": False,
     },
     "critic": {
         "default": "claude",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "read-only",
         "optional": True,
     },
     "tdd-design": {
         "default": "claude",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "read-only",
         "optional": False,
     },
     "test-writer": {
         "default": "grok",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "write-tests",
         "optional": False,
     },
     "implementer": {
         "default": "grok",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "write-code",
         "optional": False,
     },
     "tester": {
         "default": "host",
-        "runtimes": ("host", "claude", "grok"),
+        "runtimes": ("host",) + CODING_RUNTIMES,
         "capability": "execute",
         "optional": False,
     },
     "adversarial": {
         "default": "grok",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "write-tests",
         "optional": True,
     },
     "debugger": {
         "default": "claude",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "read-only",
         "optional": True,
     },
     "reviewer": {
         "default": "both",
-        "runtimes": ("claude", "grok", "both"),
+        "runtimes": REVIEWER_RUNTIMES,
         "capability": "read-only",
         "optional": False,
     },
     "guardian": {
         "default": "claude",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "read-only",
         "optional": True,
     },
     "scout": {
         "default": "grok",
-        "runtimes": ("claude", "grok"),
+        "runtimes": CODING_RUNTIMES,
         "capability": "read-only",
         "optional": False,
     },
@@ -91,8 +109,6 @@ PHASE_ORDER = [
     "verify-test",
     "adversarial",
     "adversarial-test",
-    "reviewer",
-    "guardian",
 ]
 
 PHASE_ALIASES = {
@@ -122,6 +138,8 @@ RANGE_PHASE_ORDER = [
     "guardian",
 ]
 
+DEFAULT_RANGE_SLUG = "review-since-tag"
+
 DEFAULT_AUDIT_QUERY = "Status of this workspace: WIP, finished, missing"
 
 DEPTH_ALIASES = {
@@ -132,12 +150,64 @@ DEPTH_ALIASES = {
     "very thorough": "thorough",
 }
 
+# Effort is a runtime-neutral integer, 0 (lowest) .. 5 (highest). Not a runtime
+# name, not audit --depth. Vendors disagree on both the names and the number of
+# rungs -- Claude has five (low..max), Grok four (low..xhigh) -- so the config
+# layer must not speak either vocabulary. ``runners`` owns the translation and
+# snaps a level the runtime does not implement to its nearest rung.
+EFFORT_MIN = 0
+EFFORT_MAX = 5
+
+# Legacy spellings, kept because they are the words both CLIs still use. They
+# name positions on the neutral scale; they are not the value we store.
+EFFORT_ALIASES = {
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    "xhigh": 4,
+    "max": 5,
+}
+
+# Reasoning roles only. 3 is the former "high" default, unchanged.
+DEFAULT_EFFORT = {
+    "architect": 3,
+    "critic": 3,
+    "reviewer": 3,
+    "guardian": 3,
+    "tdd-design": 3,
+}
+
 
 def normalize_depth(value: str) -> str:
     key = (value or "medium").strip().lower()
     if key not in DEPTH_ALIASES:
         raise SystemExit("Unknown depth %r (quick | medium | thorough)" % value)
     return DEPTH_ALIASES[key]
+
+
+def normalize_effort(value: Any) -> int:
+    """Any accepted spelling -> the neutral 0..5 integer we store.
+
+    Names are accepted because both CLIs and every existing config file use
+    them, but they are translated on the way in: one representation reaches the
+    rest of the program, so no caller has to know a vendor's ladder.
+    """
+    key = str(value if value is not None else "").strip().lower()
+    if key in EFFORT_ALIASES:
+        return EFFORT_ALIASES[key]
+    try:
+        level = int(key)
+    except (TypeError, ValueError):
+        raise SystemExit(
+            "Unknown effort %r (%d..%d, or %s)"
+            % (value, EFFORT_MIN, EFFORT_MAX, " | ".join(EFFORT_ALIASES))
+        )
+    if not EFFORT_MIN <= level <= EFFORT_MAX:
+        raise SystemExit(
+            "Effort %r out of range (%d is lowest, %d is highest)"
+            % (value, EFFORT_MIN, EFFORT_MAX)
+        )
+    return level
 
 
 class Config:
@@ -147,6 +217,8 @@ class Config:
         self.code_root = ""
         self.test_root = ""
         self.test_command = ""
+        self.lock_code_root = False
+        self.lock_test_root = False
         self.roles: Dict[str, str] = {name: spec["default"] for name, spec in ROLES.items()}
         self.skip: List[str] = []
         self.phase_timeout = 1800
@@ -156,7 +228,10 @@ class Config:
         self.stop_after: Optional[str] = None
         self.depth = "medium"
         self.role_overrides: set = set()
-        # Past-commits (unscoped / --since) reviewer. One runtime. PR/feature use roles["reviewer"].
+        # Per-role effort, on the neutral 0..5 scale. Not a runtime name.
+        self.effort: Dict[str, int] = {}
+        # Past-commits (unscoped / --since) default. A coding runtime or both.
+        # PR and feature use roles["reviewer"] unless --reviewer / --assign overrides.
         self.range_reviewer = "grok"
 
     def assignment(self, role: str) -> str:
@@ -165,6 +240,12 @@ class Config:
                 return "host"
             return "fake"
         return self.roles[role]
+
+    def effort_for(self, role: str) -> Optional[int]:
+        """Resolved neutral effort for this role. None means omit the flag."""
+        if role in self.effort:
+            return self.effort[role]
+        return DEFAULT_EFFORT.get(role)
 
 
 def default_roles() -> Dict[str, str]:
@@ -189,6 +270,7 @@ def load_config(
     test_root: str = "",
     test_command: str = "",
     depth: str = "",
+    effort: Optional[Iterable[str]] = None,
 ) -> Config:
     cfg = Config()
     cfg.repo = repo.resolve()
@@ -209,15 +291,21 @@ def load_config(
             _apply_toml(cfg, parse_simple_toml(path.read_text(encoding="utf-8")))
 
     if code_root:
-        cfg.code_root = code_root
+        cfg.code_root = normalize_root(code_root)
+        cfg.lock_code_root = True
     if test_root:
-        cfg.test_root = test_root
+        cfg.test_root = normalize_root(test_root)
+        cfg.lock_test_root = True
     if test_command:
         cfg.test_command = test_command
     if assign:
         for item in assign:
             role, runtime = _parse_assign(item)
             _apply_assign(cfg, role, runtime)
+    if effort:
+        for item in effort:
+            role, level = _parse_effort(item)
+            _apply_effort(cfg, role, level)
     if skip:
         for item in skip:
             for part in str(item).split(","):
@@ -236,6 +324,53 @@ def load_config(
     return cfg
 
 
+def expand_reviewer(assignment: str) -> List[str]:
+    """Concrete reviewer runtimes. ``both`` is every shipped coding adapter."""
+    name = (assignment or "").strip()
+    if name == "both":
+        return list(CODING_RUNTIMES)
+    if not name:
+        return []
+    return [name]
+
+
+def is_model_runtime(name: str) -> bool:
+    """True for a headless coding-agent adapter (shipped, fake, or registered).
+
+    ``host`` and the ``both`` alias are not adapters.
+    """
+    runtime = (name or "").strip()
+    if runtime in ("", "host", "both"):
+        return False
+    if runtime == "fake" or runtime in CODING_RUNTIMES:
+        return True
+    return _is_registered_runtime(runtime)
+
+
+def role_accepts_runtime(role: str, runtime: str) -> bool:
+    """Whether this role may run on this adapter.
+
+    Shipped coding runtimes are interchangeable. A registered third
+    adapter is accepted on any role that already accepts the shipped pair.
+    """
+    if role not in ROLES:
+        return False
+    allowed = ROLES[role]["runtimes"]
+    if runtime in allowed or runtime == "fake":
+        return True
+    if runtime in ("host", "both"):
+        return runtime in allowed
+    if not _is_registered_runtime(runtime):
+        return False
+    return any(name in allowed for name in CODING_RUNTIMES)
+
+
+def _is_registered_runtime(name: str) -> bool:
+    from team.runners import is_registered
+
+    return is_registered(name)
+
+
 def _apply_assign(cfg: Config, role: str, runtime: str) -> None:
     """``all=grok`` / ``*=claude`` sets every role that allows that runtime.
 
@@ -246,17 +381,17 @@ def _apply_assign(cfg: Config, role: str, runtime: str) -> None:
         if not runtime:
             raise SystemExit("Assignment must be all=runtime, got empty runtime")
         matched = False
-        for name, spec in ROLES.items():
-            allowed = spec["runtimes"]
-            if runtime in allowed or runtime == "fake":
+        for name in ROLES:
+            if role_accepts_runtime(name, runtime):
                 cfg.roles[name] = runtime
                 cfg.role_overrides.add(name)
                 matched = True
-        if runtime in ("claude", "grok"):
+        if runtime in REVIEWER_RUNTIMES:
             cfg.range_reviewer = runtime
         if not matched:
             raise SystemExit(
-                "No role accepts runtime %s (try claude, grok, both, host)" % runtime
+                "No role accepts runtime %s (try %s, host, or a registered adapter)"
+                % (runtime, ", ".join(CODING_RUNTIMES + ("both",)))
             )
         return
     _set_role(cfg, role, runtime)
@@ -269,11 +404,10 @@ def _set_role(cfg: Config, role: str, runtime: str) -> None:
             "Unknown role: %s (choose %s, or all=<runtime>)"
             % (role, ", ".join(ROLES))
         )
-    allowed = ROLES[role]["runtimes"]
-    if runtime not in allowed and runtime != "fake":
+    if not role_accepts_runtime(role, runtime):
         raise SystemExit(
             "Role %s cannot use runtime %s (allowed: %s)"
-            % (role, runtime, ", ".join(allowed))
+            % (role, runtime, ", ".join(ROLES[role]["runtimes"]))
         )
     cfg.roles[role] = runtime
 
@@ -283,6 +417,34 @@ def _parse_assign(item: str) -> Tuple[str, str]:
         raise SystemExit("Assignment must be role=runtime, got %r" % item)
     role, runtime = item.split("=", 1)
     return role.strip(), runtime.strip()
+
+
+def _parse_effort(item: str) -> Tuple[str, str]:
+    if "=" not in item:
+        raise SystemExit("Effort must be role=level, got %r" % item)
+    role, level = item.split("=", 1)
+    return role.strip(), level.strip()
+
+
+def _apply_effort(cfg: Config, role: str, level: str) -> None:
+    """``all=xhigh`` sets every role. Later ``--effort implementer=medium`` wins."""
+    key = (role or "").strip().lower()
+    if key in ("all", "*", "every"):
+        value = normalize_effort(level)
+        for name in ROLES:
+            cfg.effort[name] = value
+        return
+    _set_effort(cfg, role, level)
+
+
+def _set_effort(cfg: Config, role: str, level: str) -> None:
+    name = (role or "").strip().lower().replace("_", "-")
+    if name not in ROLES:
+        raise SystemExit(
+            "Unknown role: %s (choose %s, or all=<level>)"
+            % (role, ", ".join(ROLES))
+        )
+    cfg.effort[name] = normalize_effort(level)
 
 
 _PATH_KEYS = ("code_root", "test_root", "test_command")
@@ -312,7 +474,7 @@ def config_path(repo: Path) -> Path:
 
 
 def resolve_config_key(name: str) -> Tuple[str, str, str]:
-    """Return (section, key, kind) for a file-backed option. kind is str|int|list|role."""
+    """Return (section, key, kind) for a file-backed option. kind is str|int|list|role|effort."""
     raw = (name or "").strip()
     if not raw:
         raise SystemExit("empty config key")
@@ -338,6 +500,10 @@ def resolve_config_key(name: str) -> Tuple[str, str, str]:
             role = rest.replace("_", "-")
             if role in ROLES:
                 return "roles", role, "role"
+        elif section == "effort":
+            role = rest.replace("_", "-")
+            if role in ROLES:
+                return "effort", role, "effort"
         raise SystemExit("Unknown config key %r" % name)
     role = raw.replace("_", "-")
     if role in ROLES:
@@ -346,7 +512,7 @@ def resolve_config_key(name: str) -> Tuple[str, str, str]:
     if alias in _CONFIG_ALIASES:
         return _CONFIG_ALIASES[alias]
     raise SystemExit(
-        "Unknown config key %r (paths, skip, phase_timeout, range_reviewer, or a role)"
+        "Unknown config key %r (paths, skip, phase_timeout, range_reviewer, effort.<role>, or a role)"
         % name
     )
 
@@ -399,6 +565,7 @@ def collect_config_edits(
     skip: Optional[Sequence[str]] = None,
     range_reviewer: Optional[str] = None,
     phase_timeout: Optional[int] = None,
+    effort: Sequence[str] = (),
 ) -> Tuple[List[TomlUpdate], List[TomlDelete]]:
     """Build validated file edits. Later inputs win (pairs last)."""
     updates: Dict[Tuple[str, str], Any] = {}
@@ -410,7 +577,7 @@ def collect_config_edits(
 
     def drop(section: str, key: str, kind: str) -> None:
         updates.pop((section, key), None)
-        if kind == "role":
+        if kind in ("role", "effort"):
             deletes.add((section, key))
             return
         updates[(section, key)] = unset_config_value(section, key, kind)
@@ -434,6 +601,9 @@ def collect_config_edits(
         put("review", "range_reviewer", "str", range_reviewer)
     if phase_timeout is not None:
         put("run", "phase_timeout", "int", phase_timeout)
+    for item in effort:
+        for section, key, value in updates_from_effort(item):
+            put(section, key, "effort", value)
     for pair in pairs:
         if "=" not in pair:
             raise SystemExit("expected KEY=VALUE, got %r" % pair)
@@ -451,11 +621,12 @@ def validate_config_update(section: str, key: str, kind: str, value: Any) -> Any
         probe = Config()
         _set_role(probe, key, str(value))
         return probe.roles[key]
+    if kind == "effort":
+        probe = Config()
+        _set_effort(probe, key, str(value))
+        return probe.effort[key]
     if section == "review" and key == "range_reviewer":
-        runtime = str(value).strip()
-        if runtime not in ("claude", "grok"):
-            raise SystemExit("review.range_reviewer must be claude or grok (one reviewer)")
-        return runtime
+        return normalize_reviewer(str(value), what="review.range_reviewer")
     if section == "run" and key == "phase_timeout":
         try:
             timeout = int(value)
@@ -481,9 +652,16 @@ def updates_from_assign(item: str) -> List[TomlUpdate]:
     for name in sorted(probe.role_overrides):
         out.append(("roles", name, probe.roles[name]))
     key = (role or "").strip().lower()
-    if key in ("all", "*", "every") and runtime in ("claude", "grok"):
+    if key in ("all", "*", "every") and runtime in REVIEWER_RUNTIMES:
         out.append(("review", "range_reviewer", runtime))
     return out
+
+
+def updates_from_effort(item: str) -> List[TomlUpdate]:
+    role, level = _parse_effort(item)
+    probe = Config()
+    _apply_effort(probe, role, level)
+    return [("effort", name, probe.effort[name]) for name in sorted(probe.effort)]
 
 
 def format_toml_value(value: Any) -> str:
@@ -707,9 +885,11 @@ def _parse_toml_value(val: str) -> Any:
 def _apply_toml(cfg: Config, data: Dict[str, Dict[str, Any]]) -> None:
     paths = data.get("paths") or {}
     if paths.get("code_root"):
-        cfg.code_root = str(paths["code_root"])
+        cfg.code_root = normalize_root(paths["code_root"])
+        cfg.lock_code_root = True
     if paths.get("test_root"):
-        cfg.test_root = str(paths["test_root"])
+        cfg.test_root = normalize_root(paths["test_root"])
+        cfg.lock_test_root = True
     if paths.get("test_command"):
         cfg.test_command = str(paths["test_command"])
     roles = data.get("roles") or {}
@@ -722,10 +902,15 @@ def _apply_toml(cfg: Config, data: Dict[str, Dict[str, Any]]) -> None:
         cfg.phase_timeout = int(run["phase_timeout"])
     review = data.get("review") or {}
     if review.get("range_reviewer"):
-        runtime = str(review["range_reviewer"]).strip()
-        if runtime not in ("claude", "grok"):
-            raise SystemExit("review.range_reviewer must be claude or grok (one reviewer)")
-        cfg.range_reviewer = runtime
+        cfg.range_reviewer = normalize_reviewer(
+            str(review["range_reviewer"]), what="review.range_reviewer"
+        )
+    effort = data.get("effort") or {}
+    for role, level in effort.items():
+        text = "" if level is None else str(level).strip()
+        if not text:
+            continue
+        _set_effort(cfg, str(role), text)
 
 
 def persona_path(role: str) -> Path:
@@ -744,28 +929,32 @@ def deepcopy_roles(roles: Dict[str, str]) -> Dict[str, str]:
     return deepcopy(roles)
 
 
-def apply_range_reviewer(cfg: Config, *, pr: bool, reviewer: str = "") -> None:
-    """PR uses both unless overridden. Past-commits uses one runtime (default grok).
+def normalize_reviewer(value: str, *, what: str) -> str:
+    runtime = (value or "").strip()
+    if runtime not in REVIEWER_RUNTIMES:
+        raise SystemExit(
+            "%s must be %s" % (what, ", ".join(REVIEWER_RUNTIMES))
+        )
+    return runtime
 
-    ``reviewer`` is ``team review --reviewer claude|grok``. Same effect as
-    ``--assign reviewer=…`` but sits on the review command.
+
+def apply_range_reviewer(cfg: Config, *, pr: bool, reviewer: str = "") -> None:
+    """PR defaults to both. Past-commits defaults to range_reviewer (grok).
+
+    ``reviewer`` is ``team review --reviewer`` plus a shipped coding
+    runtime or ``both``. Same effect as ``--assign reviewer=…``. ``both``
+    runs every name in ``CODING_RUNTIMES`` in parallel.
     """
     forced = (reviewer or "").strip()
     if forced:
-        if forced not in ("claude", "grok"):
-            raise SystemExit("review --reviewer must be claude or grok (one reviewer)")
-        cfg.roles["reviewer"] = forced
+        cfg.roles["reviewer"] = normalize_reviewer(
+            forced, what="review --reviewer"
+        )
         cfg.role_overrides.add("reviewer")
     if pr:
         if "reviewer" not in cfg.role_overrides:
             cfg.roles["reviewer"] = "both"
         return
     if "reviewer" in cfg.role_overrides:
-        runtime = cfg.roles.get("reviewer")
-        if runtime == "both":
-            raise SystemExit(
-                "past-commits review uses one reviewer; "
-                "use team review --reviewer claude (or grok)"
-            )
         return
     cfg.roles["reviewer"] = cfg.range_reviewer

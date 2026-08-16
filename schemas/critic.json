@@ -21,6 +21,10 @@
         }
       }
     },
-    "critic_markdown": { "type": "string" }
+    "critic_markdown": { "type": "string" },
+    "census_markdown": {
+      "type": "string",
+      "description": "Tree inventory if census.md is still missing. Do not recensus when it exists."
+    }
   }
 }

@@ -6,9 +6,18 @@ import subprocess
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from team.util import as_str, explicit_roots, extract_json, write_text
+from team.config import EFFORT_ALIASES, may_write
+from team.usage import Usage, parse_usage
+from team.util import (
+    as_str,
+    denied_write_code_roots,
+    denied_write_test_roots,
+    explicit_roots,
+    extract_json,
+    write_text,
+)
 
 
 @dataclass
@@ -19,10 +28,50 @@ class Result:
     raw: str
     error: str = ""
     num_turns: Optional[int] = None
+    usage: Optional[Usage] = None
 
 
 class RuntimeError_(RuntimeError):
     pass
+
+
+# Each runtime's own ladder, placed on the neutral 0..5 scale. This is the seam
+# where the vendor vocabulary lives; nothing upstream of argv knows these words.
+#
+# Verified against the CLIs themselves, not from memory:
+#   claude --effort bogus -> "Valid values: low, medium, high, xhigh, max."
+#   grok --effort bogus   -> "use one of: xhigh, high, medium, low"
+#
+# Claude has five rungs, Grok four. Grok has nothing at 5, so a run asking for
+# the maximum gets Grok's xhigh rather than silently losing the setting. Neither
+# has a rung at 0; both floor to "low", their lowest.
+CLAUDE_EFFORT_LADDER = {"low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5}
+GROK_EFFORT_LADDER = {"low": 1, "medium": 2, "high": 3, "xhigh": 4}
+
+
+def resolve_effort(level: Any, ladder: Dict[str, int]) -> str:
+    """Neutral 0..5 -> the nearest rung this runtime actually implements.
+
+    Claude *warns and ignores* an unknown --effort value and Grok exits non-zero,
+    so passing a level through unmapped either silently drops the setting or
+    kills the hop. Snapping is the only behaviour that is correct on both.
+
+    Ties break downward: when a request sits between two rungs, the cheaper one
+    is the safer reading of "closest".
+
+    Legacy names are accepted here as well as in the config layer. Callers reach
+    argv from more than one path, and the cost of a stray "xhigh" arriving as a
+    string is a silently unset effort -- the exact failure this function exists
+    to prevent. One alias table, imported from config.
+    """
+    if isinstance(level, str) and level.strip().lower() in EFFORT_ALIASES:
+        want = EFFORT_ALIASES[level.strip().lower()]
+    else:
+        try:
+            want = int(level)
+        except (TypeError, ValueError):
+            return ""
+    return min(ladder, key=lambda name: (abs(ladder[name] - want), ladder[name]))
 
 
 class Runtime:
@@ -56,8 +105,8 @@ def headless_env(base: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return env
 
 
-def describe_runtime_failure(result: Result) -> str:
-    """Short human line. Do not dump the Claude/Grok wrapper JSON."""
+def _failure_blob(result: Result) -> Tuple[Dict[str, Any], str]:
+    """(wrapper dict, raw text) for a failed result. Parses an embedded JSON tail."""
     blob: Any = result.output if isinstance(result.output, dict) else {}
     text = "\n".join(p for p in (result.error, result.raw) if p) or "unknown"
     if not blob:
@@ -70,7 +119,30 @@ def describe_runtime_failure(result: Result) -> str:
                 parsed = None
             if isinstance(parsed, dict):
                 blob = parsed
-    if isinstance(blob, dict):
+    return (blob if isinstance(blob, dict) else {}), text
+
+
+def is_quota_failure(result: Result) -> bool:
+    """True when the provider refused on quota, not on anything the hop did.
+
+    A hop that ran out of session budget is not a defective hop: its prompt,
+    schema, and tree are all still valid, and the same call succeeds after the
+    window resets. Callers must not treat it as a hop defect.
+    """
+    blob, _text = _failure_blob(result)
+    msg = as_str(blob.get("result") or blob.get("error") or "").lower()
+    return (
+        blob.get("api_error_status") == 429
+        or "session limit" in msg
+        or "rate limit" in msg
+        or "usage limit" in msg
+    )
+
+
+def describe_runtime_failure(result: Result) -> str:
+    """Short human line. Do not dump the Claude/Grok wrapper JSON."""
+    blob, text = _failure_blob(result)
+    if blob:
         status = blob.get("api_error_status")
         msg = as_str(blob.get("result") or blob.get("error") or "")
         if status == 429 or "session limit" in msg.lower():
@@ -86,10 +158,11 @@ def describe_runtime_failure(result: Result) -> str:
 
 
 def resolve_session(stored: str) -> Tuple[str, bool]:
-    """Return (session_id, resume).
+    """CLI helper: a stored vendor id cannot be created again.
 
-    Both CLIs reject ``--session-id`` for an ID that already exists.
-    If this role already has a thread, resume it. Never create with a used ID.
+    Not hop-identity authority. ``Pipeline.invoke`` always mints a new
+    ``session_id`` and passes ``resume=False``. This only documents the
+    vendor constraint that ``--session-id`` rejects an already-used id.
     """
     sid = stored or ""
     if sid:
@@ -116,47 +189,31 @@ def claude_cmd(
         cmd.extend(["--session-id", session_id])
     if schema:
         cmd.extend(["--json-schema", json.dumps(schema)])
-    if extra.get("effort"):
-        cmd.extend(["--effort", str(extra["effort"])])
-    if capability == "read-only":
-        cmd.extend(
-            [
-                "--permission-mode",
-                "acceptEdits",
-                "--allowedTools",
-                "Read,Grep,Glob,LS",
-                "--disallowedTools",
-                "Edit,Write,NotebookEdit",
-            ]
-        )
-    elif capability in ("write-tests", "write-code"):
+    effort = resolve_effort(extra.get("effort"), CLAUDE_EFFORT_LADDER)
+    if effort:
+        cmd.extend(["--effort", effort])
+    if may_write(capability):
         cmd.extend(["--permission-mode", "acceptEdits"])
-        extra = extra or {}
-        code_roots = explicit_roots(extra.get("code_root"))
-        test_roots = explicit_roots(extra.get("test_root"))
-        if capability == "write-tests":
-            for root in test_roots:
-                cmd.extend(["--allowedTools", "Edit(%s/**)" % root])
-            for root in code_roots:
-                if root not in test_roots:
-                    cmd.extend(["--disallowedTools", "Edit(%s/**)" % root])
-        else:
-            for root in code_roots:
-                cmd.extend(["--allowedTools", "Edit(%s/**)" % root])
-            for root in test_roots:
-                if root not in code_roots:
-                    cmd.extend(["--disallowedTools", "Edit(%s/**)" % root])
-    elif capability == "execute":
-        cmd.extend(
-            [
-                "--permission-mode",
-                "acceptEdits",
-                "--allowedTools",
-                "Read,Grep,Glob,LS,Bash",
-                "--disallowedTools",
-                "Edit,Write,NotebookEdit",
-            ]
-        )
+        allow, deny = write_tool_path_filters(capability, extra)
+        for glob in _write_tool_globs(allow):
+            cmd.extend(["--allowedTools", glob])
+        for glob in _write_tool_globs(deny):
+            cmd.extend(["--disallowedTools", glob])
+        return cmd
+    # Fail closed: unknown capabilities are inspect, not writers.
+    allowed = "Read,Grep,Glob,LS"
+    if capability == "execute":
+        allowed += ",Bash"
+    cmd.extend(
+        [
+            "--permission-mode",
+            "acceptEdits",
+            "--allowedTools",
+            allowed,
+            "--disallowedTools",
+            "Edit,Write,NotebookEdit",
+        ]
+    )
     return cmd
 
 
@@ -192,46 +249,116 @@ def grok_cmd(
         cmd.append("--no-memory")
     if schema:
         cmd.extend(["--json-schema", json.dumps(schema)])
-    if capability == "read-only":
-        cmd.extend(
-            [
-                "--tools",
-                "read_file,grep,list_dir",
-                "--disallowed-tools",
-                "search_replace",
-            ]
-        )
-    elif capability == "execute":
-        cmd.extend(
-            [
-                "--tools",
-                "read_file,grep,list_dir,run_terminal_cmd",
-                "--disallowed-tools",
-                "search_replace",
-                "--always-approve",
-            ]
-        )
-    elif capability in ("write-tests", "write-code"):
+    effort = resolve_effort(extra.get("effort"), GROK_EFFORT_LADDER)
+    if effort:
+        cmd.extend(["--effort", effort])
+    # --tools is an allowlist. search_replace requires Read
+    # (skip_read_before_edit=false); a write-only list fails session init.
+    if may_write(capability):
         cmd.append("--always-approve")
-        code_roots = explicit_roots(extra.get("code_root"))
-        test_roots = explicit_roots(extra.get("test_root"))
-        if capability == "write-tests":
-            for root in test_roots:
-                cmd.extend(["--allow", "Edit(%s/**)" % root])
-                cmd.extend(["--allow", "Write(%s/**)" % root])
-            for root in code_roots:
-                if root not in test_roots:
-                    cmd.extend(["--deny", "Edit(%s/**)" % root])
-                    cmd.extend(["--deny", "Write(%s/**)" % root])
-        if capability == "write-code":
-            for root in code_roots:
-                cmd.extend(["--allow", "Edit(%s/**)" % root])
-                cmd.extend(["--allow", "Write(%s/**)" % root])
-            for root in test_roots:
-                if root not in code_roots:
-                    cmd.extend(["--deny", "Edit(%s/**)" % root])
-                    cmd.extend(["--deny", "Write(%s/**)" % root])
+        cmd.extend(["--tools", _grok_tools("search_replace")])
+        allow, deny = write_tool_path_filters(capability, extra)
+        for glob in _grok_path_globs(allow):
+            cmd.extend(["--allow", glob])
+        for glob in _grok_path_globs(deny):
+            cmd.extend(["--deny", glob])
+        return cmd
+    extra_tools = ("run_terminal_cmd",) if capability == "execute" else ()
+    cmd.extend(
+        [
+            "--tools",
+            _grok_tools(*extra_tools),
+            "--disallowed-tools",
+            "search_replace",
+        ]
+    )
+    if capability == "execute":
+        cmd.append("--always-approve")
     return cmd
+
+
+_GROK_READ_TOOLS = ("read_file", "grep", "list_dir")
+
+
+def _grok_tools(*extra: str) -> str:
+    """Grok --tools allowlist. Read tools are always first."""
+    names = list(_GROK_READ_TOOLS)
+    for name in extra:
+        if name and name not in names:
+            names.append(name)
+    return ",".join(names)
+
+
+def write_tool_path_filters(
+    capability: str, extra: Optional[Dict[str, Any]]
+) -> Tuple[List[str], List[str]]:
+    """Relative roots to allow and deny for Edit/Write tool filters.
+
+    ``code_root='.'`` is not turned into ``Edit(./**)`` — that glob misses
+    repo-root files. Accept-edits / always-approve plus denied roots is the
+    repo-level write-code scope.
+    """
+    extra = extra or {}
+    code_roots = explicit_roots(extra.get("code_root"))
+    test_roots = explicit_roots(extra.get("test_root"))
+    raw_subs = extra.get("submodule_paths") or []
+    if isinstance(raw_subs, str):
+        subs = [raw_subs]
+    else:
+        subs = [str(s) for s in raw_subs]
+    allow: List[str] = []
+    deny: List[str] = []
+    if capability == "write-tests":
+        allow.extend(test_roots)
+        deny.extend(
+            denied_write_test_roots(
+                extra.get("code_root") or "",
+                extra.get("test_root") or "",
+                subs,
+            )
+        )
+    elif capability == "write-code":
+        for root in code_roots:
+            if root != ".":
+                allow.append(root)
+        deny.extend(
+            denied_write_code_roots(
+                extra.get("code_root") or "",
+                extra.get("test_root") or "",
+                subs,
+            )
+        )
+    return allow, deny
+
+
+_WRITE_TOOLS = ("Edit", "Write")
+
+
+def _write_tool_globs(roots: List[str]) -> List[str]:
+    """Edit and Write globs for the same allow/deny roots. Not a second list."""
+    from team.util import normalize_root
+
+    out: List[str] = []
+    for raw in roots:
+        root = normalize_root(raw)
+        if not root or root == ".":
+            continue
+        for tool in _WRITE_TOOLS:
+            out.append("%s(%s/**)" % (tool, root))
+    return out
+
+
+def _grok_path_globs(roots: List[str]) -> List[str]:
+    """Grok --allow/--deny path globs. Not Claude Edit/Write tool filters."""
+    from team.util import normalize_root
+
+    out: List[str] = []
+    for raw in roots:
+        root = normalize_root(raw)
+        if not root or root == ".":
+            continue
+        out.append("%s/**" % root)
+    return out
 
 
 class ClaudeRuntime(Runtime):
@@ -337,8 +464,16 @@ class FakeRuntime(Runtime):
         sid = session_id or "fake-%s" % phase
         write_text(work / "prompts" / ("%s.prompt.md" % phase), prompt)
         output = _fake_output(phase, extra)
-        _maybe_write_fake_files(phase, repo, extra)
-        return Result(success=True, output=output, session_id=sid, raw=json.dumps(output))
+        if capability in ("write-code", "write-tests"):
+            _maybe_write_fake_files(phase, repo, extra)
+        # Canned inspect already “ran”; missing turns would fail-closed.
+        return Result(
+            success=True,
+            output=output,
+            session_id=sid,
+            raw=json.dumps(output),
+            num_turns=2,
+        )
 
 
 _REGISTRY = {
@@ -347,9 +482,21 @@ _REGISTRY = {
     "fake": FakeRuntime,
 }
 
+_SHIPPED = frozenset(_REGISTRY)
+
 
 def register(name: str, factory: Any) -> None:
     _REGISTRY[name] = factory
+
+
+def unregister(name: str) -> None:
+    if name in _SHIPPED:
+        raise ValueError("cannot unregister shipped runtime %s" % name)
+    _REGISTRY.pop(name, None)
+
+
+def is_registered(name: str) -> bool:
+    return name in _REGISTRY
 
 
 def runtime_for(name: str) -> Runtime:
@@ -403,6 +550,7 @@ def _run(
         )
     raw = proc.stdout or ""
     wrapper = _envelope(raw)
+    usage = parse_usage(wrapper)
     parsed = extract_json(raw, schema=schema) if raw.strip() else {}
     if raw.strip() and parsed is None:
         return Result(
@@ -411,6 +559,7 @@ def _run(
             session_id=session_id,
             raw=raw + "\n" + (proc.stderr or ""),
             error="parse failure: unparseable stdout",
+            usage=usage,
         )
     if parsed is None:
         parsed = {}
@@ -423,6 +572,7 @@ def _run(
             session_id=session_id,
             raw=raw + "\n" + (proc.stderr or ""),
             error="exit %s: %s" % (proc.returncode, (proc.stderr or raw)[-2000:]),
+            usage=usage,
         )
     if parsed.get("is_error") or parsed.get("api_error_status"):
         failed = Result(
@@ -431,6 +581,7 @@ def _run(
             session_id=as_str(parsed.get("session_id") or parsed.get("sessionId") or session_id),
             raw=raw,
             error=as_str(parsed.get("result") or parsed.get("error") or "provider error"),
+            usage=usage,
         )
         failed.error = describe_runtime_failure(failed)
         return failed
@@ -449,6 +600,7 @@ def _run(
         raw=raw,
         error="",
         num_turns=_num_turns(wrapper),
+        usage=usage,
     )
 
 
@@ -472,18 +624,132 @@ def _num_turns(wrapper: Optional[Dict[str, Any]]) -> Optional[int]:
         return None
 
 
-def premature_inspect(*, role: str, runtime: str, result: Result) -> bool:
-    """True when a Grok inspect role emitted schema JSON without a tool loop.
+# Inspect-before-JSON: keyed by role, not runtime. Role→runtime is data.
+# Labeled approximation — not the read-only write fence.
+_INSPECT_ROLES = frozenset(
+    ("reviewer", "guardian", "scout", "critic", "debugger")
+)
 
-    ``--json-schema`` makes a first-turn ``{summary, findings: [...progress...]}``
-    a legal completion. One model turn means no tools ran.
+
+def inspect_turn_count(payload: Any) -> Optional[int]:
+    """Turn count persisted on an inspect-role result artifact.
+
+    Reads the same fields ``Pipeline.invoke`` writes (top-level ``num_turns``
+    and ``_meta.num_turns``). Missing or null is unfinished.
     """
-    if role not in ("reviewer", "guardian", "scout", "critic"):
+    if not isinstance(payload, dict):
+        return None
+    sources = [payload]
+    meta = payload.get("_meta")
+    if isinstance(meta, dict):
+        sources.append(meta)
+    for source in sources:
+        if "num_turns" not in source:
+            continue
+        raw = source.get("num_turns")
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+_WRITE_CAPS = frozenset(("write-code", "write-tests"))
+
+
+def unfinished_write(
+    *,
+    capability: str,
+    num_turns: Optional[int],
+    product_delta: Any,
+    output: Any,
+) -> bool:
+    """True when a write hop did not produce a product-tree delta.
+
+    A 1-turn schema dump with no file changes is not implementation.
+    Paths under ``.team/work`` are not a product delta.
+    """
+    if capability not in _WRITE_CAPS:
         return False
-    if runtime != "grok":
+    if inspect_progress_note(output):
+        return True
+    premature = num_turns is None or num_turns <= 1
+    if not premature:
         return False
-    turns = result.num_turns
-    return turns is not None and turns <= 1
+    return not list(product_delta or [])
+
+
+def unfinished_inspect(*, role: str, num_turns: Optional[int], output: Any) -> bool:
+    """Shared unfinished predicate for invoke and collect.
+
+    Progress notes are unfinished even with more turns. Inspect roles
+    fail closed on missing or ``<=1`` turns. Not derived from capability.
+    """
+    if inspect_progress_note(output):
+        return True
+    if role not in _INSPECT_ROLES:
+        return False
+    if num_turns is None or num_turns <= 1:
+        return True
+    return False
+
+
+_PROGRESS_MARKDOWN = frozenset(
+    (
+        "drafting",
+        "still reading",
+        "in progress",
+        "review in progress",
+        "wip",
+        "working",
+    )
+)
+_PROMISED_FINDINGS = (
+    "issues are below",
+    "findings below",
+    "highest-severity",
+)
+
+
+def inspect_progress_note(output: Any) -> bool:
+    """Schema-legal progress object — not a finished inspect artifact."""
+    if not isinstance(output, dict):
+        return False
+    summary = as_str(output.get("summary")).strip().lower()
+    if "reviewing the collected range first" in summary:
+        return True
+    markdown = (
+        as_str(output.get("review_markdown")).strip().lower()
+        or as_str(output.get("guardian_markdown")).strip().lower()
+        or as_str(output.get("diagnosis_markdown")).strip().lower()
+    )
+    if markdown in _PROGRESS_MARKDOWN:
+        return True
+    if markdown.startswith("starting read-only"):
+        return True
+    findings = [item for item in (output.get("findings") or []) if isinstance(item, dict)]
+    if not findings and any(token in summary for token in _PROMISED_FINDINGS):
+        return True
+    for item in findings:
+        if as_str(item.get("title")).strip().lower() == "review in progress":
+            return True
+    return False
+
+
+_FAKE_CENSUS = (
+    "# Census\n\n"
+    "## Layout\n- src/\n- tests/\n\n"
+    "## Missing layers\n- none in fake mode\n\n"
+    "## Verified facts\n- greet helper is the fake product surface\n"
+)
+
+
+def _with_census(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload)
+    out.setdefault("census_markdown", _FAKE_CENSUS)
+    return out
 
 
 def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
@@ -627,22 +893,49 @@ def _fake_output(phase: str, extra: Dict[str, Any]) -> Dict[str, Any]:
         },
     }
     if phase in canned:
-        return dict(canned[phase])
+        return _fake_payload(phase, dict(canned[phase]))
     if phase.startswith("seq-reviewer"):
-        return dict(canned["reviewer"])
+        return _fake_payload(phase, dict(canned["reviewer"]))
     if phase.startswith("seq-guardian"):
-        return dict(canned["guardian"])
+        return _fake_payload(phase, dict(canned["guardian"]))
     if phase.startswith("repair-test"):
         return dict(canned["test-writer"])
     if phase.startswith("repair-implementer"):
         return dict(canned["implementer"])
     if phase.startswith("consult"):
-        return dict(canned["answers"])
+        return _fake_payload(phase, dict(canned["answers"]))
     for key in sorted(canned, key=len, reverse=True):
         if phase.startswith(key + "-") or phase.startswith(key + ":"):
-            return dict(canned[key])
+            return _fake_payload(phase, dict(canned[key]))
     # default gate-like
     return {"ready": True, "consult": "none", "questions": [], "summary": "fake"}
+
+
+_FAKE_CENSUS_PHASES = frozenset(
+    (
+        "architect",
+        "critic",
+        "tdd-design",
+        "reviewer",
+        "guardian",
+        "replan",
+        "replan-questions",
+        "answers",
+        "scout",
+        "assess",
+        "debugger",
+    )
+)
+
+
+def _fake_payload(phase: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Inspect hops may seed census.md. Writers do not."""
+    key = phase.split(":")[0]
+    if key in _FAKE_CENSUS_PHASES or any(
+        phase.startswith(name + "-") for name in _FAKE_CENSUS_PHASES
+    ):
+        return _with_census(payload)
+    return payload
 
 
 def _maybe_write_fake_files(phase: str, repo: Path, extra: Dict[str, Any]) -> None:

@@ -16,10 +16,25 @@ import sys
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
-from team.config import PHASE_ORDER, schema_path
-from team.pipeline import PipelineError, start_feature
-from team.runners import FakeRuntime, _run, claude_cmd, grok_cmd, premature_inspect
+from team.config import PHASE_ORDER, ROLES, may_write, schema_path
+from team.pipeline import OptionalPhaseError, PipelineError, start_feature
+from team.runners import (
+    FakeRuntime,
+    _run,
+    _write_tool_globs,
+    claude_cmd,
+    grok_cmd,
+    unfinished_inspect,
+    write_tool_path_filters,
+)
 from team.util import extract_json, load_json
+from tests.support.grok_argv import (
+    GrokArgvNotGrokLanguage,
+    grok_flag_values,
+    grok_read_tools_enabled,
+    grok_search_replace_permitted,
+    path_glob_matches,
+)
 from tests.support.hostile import HostileRuntime, emit, register_runtime
 from tests.support.repo import init_repo
 
@@ -129,6 +144,17 @@ class RunExitContractTests(unittest.TestCase):
         self.assertEqual(len(result.output.get("findings") or []), 1)
         self.assertEqual(result.output["findings"][0]["title"], "F82 residual")
         self.assertEqual(result.num_turns, None)
+        # Missing turns is reject for inspect roles. The predicate takes no
+        # runtime: the rule is about tool-loop evidence, and a vendor gate would
+        # accept the same non-review from any other adapter.
+        for role in ("reviewer", "guardian", "scout", "critic"):
+            self.assertTrue(
+                unfinished_inspect(role=role, num_turns=result.num_turns, output=result.output),
+                "%s with num_turns=None must be unfinished" % role,
+            )
+        self.assertFalse(
+            unfinished_inspect(role="implementer", num_turns=result.num_turns, output=result.output)
+        )
 
     def test_grok_envelope_num_turns_is_preserved(self):
         envelope = {
@@ -151,13 +177,13 @@ class RunExitContractTests(unittest.TestCase):
         self.assertTrue(result.success)
         self.assertEqual(result.num_turns, 1)
         self.assertTrue(
-            premature_inspect(role="reviewer", runtime="grok", result=result)
+            unfinished_inspect(role="reviewer", num_turns=result.num_turns, output=result.output)
+        )
+        self.assertTrue(
+            unfinished_inspect(role="guardian", num_turns=result.num_turns, output=result.output)
         )
         self.assertFalse(
-            premature_inspect(role="reviewer", runtime="claude", result=result)
-        )
-        self.assertFalse(
-            premature_inspect(role="implementer", runtime="grok", result=result)
+            unfinished_inspect(role="implementer", num_turns=result.num_turns, output=result.output)
         )
 
 
@@ -230,6 +256,132 @@ class InvokeSchemaContractTests(unittest.TestCase):
         reviewer_calls = [c for c in hostile.calls if c["phase"] == "reviewer-grok"]
         self.assertEqual(len(reviewer_calls), 2)
 
+    def test_missing_num_turns_is_rejected_for_inspect_roles(self):
+        from team.config import load_config
+
+        progress = {
+            "summary": "Reviewing the collected range first.",
+            "findings": [
+                {
+                    "severity": "low",
+                    "title": "Review in progress",
+                    "evidence": "Starting with the orchestrator artifacts.",
+                    "kind": "note",
+                }
+            ],
+        }
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "missing-turns")
+        hostile = HostileRuntime(
+            [emit(progress)],
+            phases=("reviewer-fake",),
+            num_turns=None,
+        )
+        with register_runtime("fake", hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.invoke(
+                    "reviewer",
+                    "reviewer-fake",
+                    "inspect the tree",
+                    "review.json",
+                    runtime_name="fake",
+                )
+        self.assertIn("without inspecting", str(ctx.exception).lower())
+        self.assertGreaterEqual(
+            len([c for c in hostile.calls if c["phase"] == "reviewer-fake"]), 2
+        )
+
+        guardian_progress = {
+            "risks": [],
+            "chain": {
+                "r_to_a": {"ok": True, "note": "n"},
+                "a_to_t": {"ok": True, "note": "n"},
+                "t_to_i": {"ok": True, "note": "n"},
+                "i_to_r": {"ok": True, "note": "n"},
+            },
+            "guardian_markdown": "still reading",
+        }
+        g_hostile = HostileRuntime(
+            [emit(guardian_progress)],
+            phases=("guardian",),
+            num_turns=None,
+        )
+        with register_runtime("fake", g_hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.invoke(
+                    "guardian",
+                    "guardian",
+                    "inspect the tree",
+                    "guardian.json",
+                    runtime_name="fake",
+                )
+        self.assertIn("inspect", str(ctx.exception).lower())
+
+        finished = {
+            "summary": "Range is complete; findings below.",
+            "findings": [
+                {
+                    "severity": "low",
+                    "title": "Residual note on docs",
+                    "evidence": "README line 1",
+                    "kind": "note",
+                }
+            ],
+            "review_markdown": "Finished review of the collected range.",
+        }
+        finished_rt = HostileRuntime(
+            [emit(finished)],
+            phases=("reviewer-fake",),
+            num_turns=None,
+        )
+        with register_runtime("fake", finished_rt):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.invoke(
+                    "reviewer",
+                    "reviewer-fake",
+                    "inspect the tree",
+                    "review.json",
+                    runtime_name="fake",
+                )
+        self.assertIn("inspect", str(ctx.exception).lower())
+        self.assertGreaterEqual(
+            len([c for c in finished_rt.calls if c["phase"] == "reviewer-fake"]),
+            2,
+        )
+
+    def test_inspect_guard_is_role_not_grok_hardcode(self):
+        from team.config import load_config
+
+        progress = {
+            "summary": "Reviewing the collected range first.",
+            "findings": [
+                {
+                    "severity": "low",
+                    "title": "Review in progress",
+                    "evidence": "Starting with the orchestrator artifacts.",
+                    "kind": "note",
+                }
+            ],
+        }
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "role-not-grok")
+        for runtime_name, phase in (("fake", "reviewer-fake"), ("claude", "reviewer-claude")):
+            hostile = HostileRuntime(
+                [emit(progress)],
+                phases=(phase,),
+                num_turns=1,
+            )
+            with register_runtime(runtime_name, hostile):
+                with self.assertRaises(PipelineError) as ctx:
+                    pipe.invoke(
+                        "reviewer",
+                        phase,
+                        "inspect the tree",
+                        "review.json",
+                        runtime_name=runtime_name,
+                    )
+            self.assertIn("without inspecting", str(ctx.exception).lower())
+
     def test_failed_reviewer_does_not_look_like_a_clean_review(self):
         from team.config import load_config
 
@@ -246,6 +398,202 @@ class InvokeSchemaContractTests(unittest.TestCase):
         if review.is_file():
             text = review.read_text(encoding="utf-8")
             self.assertNotIn("Fake review", text)
+
+    def test_drafting_after_inspect_is_not_retried(self):
+        """A 32-turn stub is not a review. Retry would re-read the dump."""
+        from team.config import load_config
+
+        draft = {
+            "summary": "Highest-severity issues are below.",
+            "findings": [],
+            "review_markdown": "drafting",
+        }
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "draft-rev")
+        hostile = HostileRuntime(
+            [emit(draft)],
+            phases=("reviewer-fake",),
+            num_turns=2,
+        )
+        with register_runtime("fake", hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.invoke(
+                    "reviewer",
+                    "reviewer-fake",
+                    "inspect the tree",
+                    "review.json",
+                    runtime_name="fake",
+                )
+        self.assertIn("progress note", str(ctx.exception).lower())
+        self.assertEqual(
+            len([c for c in hostile.calls if c["phase"] == "reviewer-fake"]),
+            1,
+        )
+
+    def test_empty_findings_with_real_markdown_is_a_finished_review(self):
+        from team.config import load_config
+
+        clean = {
+            "summary": "Range is clean.",
+            "findings": [],
+            "review_markdown": "Inspected the collected commits. No findings.",
+            "census_markdown": "# Census\n\nlayout\n",
+        }
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "clean-rev")
+        hostile = HostileRuntime(
+            [emit(clean)],
+            phases=("reviewer-fake",),
+            num_turns=2,
+        )
+        with register_runtime("fake", hostile):
+            result = pipe.invoke(
+                "reviewer",
+                "reviewer-fake",
+                "inspect the tree",
+                "review.json",
+                runtime_name="fake",
+            )
+        self.assertTrue(result.success)
+        self.assertEqual(result.output.get("findings"), [])
+
+    def test_one_turn_implementer_with_no_delta_is_rejected(self):
+        from team.config import load_config
+
+        stub = {"summary": "Reading census, brief, review, and apply-plan.", "paths_touched": []}
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "stub-impl")
+        (self.repo / "src").mkdir(exist_ok=True)
+        (self.repo / "src" / "keep.py").write_text("keep\n", encoding="utf-8")
+        hostile = HostileRuntime(
+            [emit(stub)],
+            phases=("implementer-apply",),
+            num_turns=1,
+        )
+        with register_runtime("fake", hostile):
+            with self.assertRaises(PipelineError) as ctx:
+                pipe.invoke(
+                    "implementer",
+                    "implementer-apply",
+                    "patch",
+                    "write_summary.json",
+                    capability="write-code",
+                    runtime_name="fake",
+                )
+        self.assertIn("no product delta", str(ctx.exception).lower())
+        self.assertGreaterEqual(
+            len([c for c in hostile.calls if c["phase"] == "implementer-apply"]),
+            2,
+        )
+
+    def test_one_turn_debugger_is_rejected_after_retry(self):
+        from team.config import load_config
+
+        stub = {
+            "owner": "unknown",
+            "diagnosis_markdown": (
+                "Starting read-only diagnosis: loading census, contract, "
+                "baseline, and apply reports."
+            ),
+        }
+        cfg = load_config(self.repo, fake=True, force=True, code_root="src", test_root="tests")
+        pipe = start_feature(cfg, "brief", "draft-dbg")
+        pipe.state.final = {"status": "FAIL", "exit": 1}
+        hostile = HostileRuntime(
+            [emit(stub)],
+            phases=("debugger",),
+            num_turns=1,
+        )
+        with register_runtime("fake", hostile):
+            with self.assertRaises((PipelineError, OptionalPhaseError)) as ctx:
+                pipe.phase_debugger()
+        self.assertIn("inspect", str(ctx.exception).lower())
+        self.assertEqual(
+            len([c for c in hostile.calls if c["phase"] == "debugger"]),
+            2,
+        )
+
+
+class GrokArgvInterpreterTests(unittest.TestCase):
+    """The double is local. It must reject Claude spelling and honor Grok flags."""
+
+    def test_claude_edit_glob_is_not_grok_language(self):
+        argv = [
+            "grok",
+            "--always-approve",
+            "--allow",
+            "Edit(tests/**)",
+            "--deny",
+            "Write(src/team/**)",
+        ]
+        with self.assertRaises(GrokArgvNotGrokLanguage):
+            grok_search_replace_permitted(argv, "tests/foo.py")
+
+    def test_path_globs_scope_search_replace(self):
+        argv = [
+            "grok",
+            "--tools",
+            "search_replace",
+            "--allow",
+            "tests/**",
+            "--deny",
+            "src/team/**",
+        ]
+        self.assertTrue(grok_search_replace_permitted(argv, "tests/foo.py"))
+        self.assertFalse(grok_search_replace_permitted(argv, "src/team/x.py"))
+        self.assertTrue(path_glob_matches("tests/**", "tests/foo.py"))
+        self.assertFalse(path_glob_matches("tests", "src/team/x.py"))
+
+    def test_disallowed_tools_search_replace_denies_every_path(self):
+        argv = [
+            "grok",
+            "--tools",
+            "read_file,grep,list_dir",
+            "--disallowed-tools",
+            "search_replace",
+        ]
+        self.assertFalse(grok_search_replace_permitted(argv, "tests/foo.py"))
+        self.assertFalse(grok_search_replace_permitted(argv, "src/team/x.py"))
+
+    def test_dot_deny_roots_without_whole_repo_allow(self):
+        argv = [
+            "grok",
+            "--tools",
+            "search_replace",
+            "--deny",
+            "inferedge-phase1/tests/**",
+            "--deny",
+            "appliance-console/**",
+        ]
+        self.assertTrue(grok_search_replace_permitted(argv, "top.py"))
+        self.assertFalse(grok_search_replace_permitted(argv, "inferedge-phase1/tests/t.py"))
+        self.assertFalse(grok_search_replace_permitted(argv, "appliance-console/page.tsx"))
+
+    def test_write_only_tools_list_does_not_enable_read(self):
+        argv = ["grok", "--tools", "search_replace", "--allow", "tests/**"]
+        self.assertFalse(grok_read_tools_enabled(argv))
+        self.assertTrue(grok_search_replace_permitted(argv, "tests/foo.py"))
+
+    def test_read_plus_search_replace_enables_both(self):
+        argv = [
+            "grok",
+            "--tools",
+            "read_file,grep,list_dir,search_replace",
+            "--allow",
+            "tests/**",
+        ]
+        self.assertTrue(grok_read_tools_enabled(argv))
+        self.assertTrue(grok_search_replace_permitted(argv, "tests/foo.py"))
+
+    def test_disallowed_read_tool_fails_closed(self):
+        argv = [
+            "grok",
+            "--tools",
+            "read_file,grep,list_dir,search_replace",
+            "--disallowed-tools",
+            "read_file",
+        ]
+        self.assertFalse(grok_read_tools_enabled(argv))
 
 
 class PathScopeTests(unittest.TestCase):
@@ -279,31 +627,267 @@ class PathScopeTests(unittest.TestCase):
             "write-code must path-scope the code root: %s" % code_s,
         )
 
+    def _grok(self, capability, extra):
+        return grok_cmd(
+            prompt_path=Path("/tmp/p.md"),
+            schema=None,
+            capability=capability,
+            session_id="s",
+            resume=False,
+            repo=Path("/tmp/repo"),
+            extra=extra,
+        )
+
+    def _assert_search_replace(self, cmd, rel, allowed):
+        try:
+            got = grok_search_replace_permitted(cmd, rel)
+        except GrokArgvNotGrokLanguage as exc:
+            self.fail(
+                "grok_cmd is not Grok --tools/--allow/--deny language: %s\nargv=%s"
+                % (exc, cmd)
+            )
+        self.assertEqual(
+            got,
+            allowed,
+            "search_replace %s on %s; argv=%s" % ("allowed" if allowed else "denied", rel, cmd),
+        )
+
     def test_grok_write_capabilities_remain_path_scoped(self):
         extra = {"test_root": "tests", "code_root": "src/team"}
-        tests_cmd = grok_cmd(
-            prompt_path=Path("/tmp/p.md"),
-            schema=None,
-            capability="write-tests",
-            session_id="s",
-            resume=False,
-            repo=Path("/tmp/repo"),
-            extra=extra,
-        )
-        code_cmd = grok_cmd(
-            prompt_path=Path("/tmp/p.md"),
-            schema=None,
-            capability="write-code",
-            session_id="s",
-            resume=False,
-            repo=Path("/tmp/repo"),
-            extra=extra,
-        )
+        tests_cmd = self._grok("write-tests", extra)
+        code_cmd = self._grok("write-code", extra)
         tests_s = " ".join(str(x) for x in tests_cmd)
         code_s = " ".join(str(x) for x in code_cmd)
-        self.assertIn("Edit(tests/**)", tests_s)
-        self.assertIn("Edit(src/team/**)", code_s)
+        self.assertNotIn("Edit(", tests_s)
+        self.assertNotIn("Write(", tests_s)
+        self.assertNotIn("Edit(", code_s)
+        self.assertNotIn("Write(", code_s)
+        self.assertTrue(
+            "--allow" in tests_cmd
+            or "--deny" in tests_cmd
+            or "--tools" in tests_cmd
+            or "--disallowed-tools" in tests_cmd,
+            "write-tests must use Grok flags: %s" % tests_s,
+        )
+        self.assertIn("search_replace", tests_s)
+        self.assertIn("search_replace", code_s)
         self.assertNotEqual(tests_cmd, code_cmd)
+        self._assert_search_replace(tests_cmd, "tests/a.py", True)
+        self._assert_search_replace(tests_cmd, "src/team/a.py", False)
+        self._assert_search_replace(code_cmd, "src/team/a.py", True)
+        self._assert_search_replace(code_cmd, "tests/a.py", False)
+        self.assertTrue(
+            grok_read_tools_enabled(tests_cmd),
+            "write-tests --tools must keep read_file,grep,list_dir; got %s" % tests_s,
+        )
+        self.assertTrue(
+            grok_read_tools_enabled(code_cmd),
+            "write-code --tools must keep read_file,grep,list_dir; got %s" % code_s,
+        )
+
+    def test_grok_write_code_dot_denies_test_root_and_submodules_as_path_globs(self):
+        extra = {
+            "code_root": ".",
+            "test_root": "inferedge-phase1/tests",
+            "submodule_paths": ["appliance-console", "appliance-support"],
+        }
+        allow, deny = write_tool_path_filters("write-code", extra)
+        self.assertEqual(allow, [])
+        self.assertEqual(
+            deny,
+            [
+                "inferedge-phase1/tests",
+                "appliance-console",
+                "appliance-support",
+            ],
+        )
+        self.assertNotIn(".", deny)
+        cmd = self._grok("write-code", extra)
+        joined = " ".join(str(x) for x in cmd)
+        self.assertNotIn("Edit(", joined)
+        self.assertNotIn("Write(", joined)
+        self.assertNotIn("Edit(./**)", joined)
+        self.assertNotIn("./**", grok_flag_values(cmd, "--allow"))
+        deny_vals = grok_flag_values(cmd, "--deny")
+        self.assertTrue(deny_vals, "write-code code_root='.' must pass --deny path globs")
+        for root in (
+            "inferedge-phase1/tests",
+            "appliance-console",
+            "appliance-support",
+        ):
+            self.assertTrue(
+                any(
+                    v == root or v == root + "/**" or v.startswith(root + "/")
+                    for v in deny_vals
+                ),
+                "deny path globs must name %s (no Edit/Write wrappers), got %s"
+                % (root, deny_vals),
+            )
+        self._assert_search_replace(cmd, "top.py", True)
+        self._assert_search_replace(cmd, "inferedge-phase1/tests/t.py", False)
+        self._assert_search_replace(cmd, "appliance-console/page.tsx", False)
+        self._assert_search_replace(cmd, "appliance-support/lib.rs", False)
+
+    def test_grok_write_allow_deny_are_path_globs_that_scope_search_replace(self):
+        cases = [
+            ({"test_root": "tests/", "code_root": "src"}, "tests", "src"),
+            (
+                {"test_root": "inferedge-phase1/tests", "code_root": "src"},
+                "inferedge-phase1/tests",
+                "src",
+            ),
+            ({"test_root": "tests", "code_root": "src/team"}, "tests", "src/team"),
+        ]
+        for extra, test_root, code_root in cases:
+            with self.subTest(extra=extra):
+                for cap in ("write-tests", "write-code"):
+                    cmd = self._grok(cap, extra)
+                    joined = " ".join(str(x) for x in cmd)
+                    self.assertNotIn("Edit(", joined)
+                    self.assertNotIn("Write(", joined)
+                    self.assertIn("search_replace", joined)
+                    for flag in ("--allow", "--deny"):
+                        for value in grok_flag_values(cmd, flag):
+                            self.assertFalse(
+                                value.startswith("Edit(") or value.startswith("Write("),
+                                "%s value must be a path glob, got %r" % (flag, value),
+                            )
+                            self.assertNotIn("//", value, "double-slash glob: %r" % value)
+                    if extra["test_root"].endswith("/"):
+                        for value in grok_flag_values(cmd, "--allow") + grok_flag_values(
+                            cmd, "--deny"
+                        ):
+                            self.assertNotEqual(value, "tests/")
+                            self.assertFalse(value.startswith("tests//"))
+                    in_tests = test_root.rstrip("/") + "/foo.py"
+                    in_code = code_root.rstrip("/") + "/a.py"
+                    self._assert_search_replace(
+                        cmd, in_tests, cap == "write-tests"
+                    )
+                    self._assert_search_replace(
+                        cmd, in_code, cap == "write-code"
+                    )
+                self.assertNotEqual(
+                    self._grok("write-tests", extra),
+                    self._grok("write-code", extra),
+                )
+        ro = self._grok("read-only", {"test_root": "tests", "code_root": "src"})
+        ro_s = " ".join(str(x) for x in ro)
+        self.assertIn("--disallowed-tools", ro)
+        self.assertIn("search_replace", ro_s)
+        self.assertEqual(grok_flag_values(ro, "--allow"), [])
+        self._assert_search_replace(ro, "tests/foo.py", False)
+        self._assert_search_replace(ro, "src/a.py", False)
+        self.assertTrue(grok_read_tools_enabled(ro), ro_s)
+
+    def test_every_write_capability_keeps_read_tools(self):
+        """Converse of path-scoped search_replace: the hop can still read."""
+        extra = {"test_root": "tests", "code_root": "src"}
+        for cap in ("read-only", "execute", "write-tests", "write-code"):
+            cmd = self._grok(cap, extra)
+            joined = " ".join(str(x) for x in cmd)
+            self.assertTrue(
+                grok_read_tools_enabled(cmd),
+                "%s must enable read tools; argv=%s" % (cap, joined),
+            )
+            tools = ",".join(grok_flag_values(cmd, "--tools"))
+            self.assertIn("read_file", tools, cap)
+            if may_write(cap):
+                self.assertIn("search_replace", tools, cap)
+                self.assertNotIn("run_terminal_cmd", tools, cap)
+
+    def test_every_non_write_role_denies_write_tools(self):
+        """Personas without write-tests/write-code cannot Edit/search_replace."""
+        extra = {"test_root": "tests", "code_root": "src"}
+        seen = set()
+        for role, spec in ROLES.items():
+            cap = spec["capability"]
+            if may_write(cap) or cap in seen:
+                continue
+            seen.add(cap)
+            grok = self._grok(cap, extra)
+            claude = claude_cmd(
+                prompt="hi",
+                schema=None,
+                capability=cap,
+                session_id="s",
+                resume=False,
+                extra=extra,
+            )
+            self._assert_search_replace(grok, "src/a.py", False)
+            self._assert_search_replace(grok, "tests/a.py", False)
+            self.assertIn("search_replace", grok_flag_values(grok, "--disallowed-tools"))
+            disallowed = set()
+            items = [str(x) for x in claude]
+            for i, tok in enumerate(items):
+                if tok == "--disallowedTools" and i + 1 < len(items):
+                    disallowed.update(items[i + 1].split(","))
+            self.assertTrue(
+                {"Edit", "Write"}.issubset(disallowed),
+                "%s/%s Claude argv must disallow Edit/Write; got %s"
+                % (role, cap, disallowed),
+            )
+
+    def test_unknown_capability_is_non_write(self):
+        extra = {"test_root": "tests", "code_root": "src"}
+        grok = self._grok("future-inspect", extra)
+        claude = claude_cmd(
+            prompt="hi",
+            schema=None,
+            capability="future-inspect",
+            session_id="s",
+            resume=False,
+            extra=extra,
+        )
+        self._assert_search_replace(grok, "src/a.py", False)
+        joined = " ".join(str(x) for x in claude)
+        self.assertIn("Edit", joined)
+        self.assertIn("--disallowedTools", claude)
+
+    def test_grok_semantic_double_cannot_search_replace_denied_root(self):
+        extra = {"test_root": "tests", "code_root": "src/team"}
+        tests_cmd = self._grok("write-tests", extra)
+        code_cmd = self._grok("write-code", extra)
+        dot_cmd = self._grok(
+            "write-code",
+            {
+                "code_root": ".",
+                "test_root": "inferedge-phase1/tests",
+                "submodule_paths": ["appliance-console", "appliance-support"],
+            },
+        )
+        self._assert_search_replace(tests_cmd, "tests/foo.py", True)
+        self._assert_search_replace(tests_cmd, "src/team/x.py", False)
+        self._assert_search_replace(code_cmd, "src/team/x.py", True)
+        self._assert_search_replace(code_cmd, "tests/foo.py", False)
+        self._assert_search_replace(dot_cmd, "top.py", True)
+        self._assert_search_replace(dot_cmd, "inferedge-phase1/tests/t.py", False)
+        self._assert_search_replace(dot_cmd, "appliance-console/page.tsx", False)
+
+    def test_trailing_slash_test_root_is_one_glob(self):
+        extra = {"code_root": ".", "test_root": "tests/"}
+        allow, deny = write_tool_path_filters("write-code", extra)
+        self.assertEqual(allow, [])
+        self.assertEqual(deny, ["tests"])
+        globs = _write_tool_globs(deny)
+        self.assertIn("Edit(tests/**)", globs)
+        self.assertIn("Write(tests/**)", globs)
+        self.assertFalse(any("//" in g for g in globs), globs)
+
+    def test_write_tool_globs_normalizes_raw_slash(self):
+        """The glob builder is the last seam — callers may still pass tests/."""
+        globs = _write_tool_globs(["tests/", "./src/"])
+        self.assertEqual(
+            globs,
+            [
+                "Edit(tests/**)",
+                "Write(tests/**)",
+                "Edit(src/**)",
+                "Write(src/**)",
+            ],
+        )
+        self.assertFalse(any("//" in g for g in globs), globs)
+        self.assertEqual(_write_tool_globs(["."]), [])
 
 
 class FakeOutputSchemaSeamTests(unittest.TestCase):

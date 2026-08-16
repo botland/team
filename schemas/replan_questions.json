@@ -12,6 +12,10 @@
       "maxItems": 10,
       "items": { "type": "string" }
     },
-    "notes": { "type": "string" }
+    "notes": { "type": "string" },
+    "census_markdown": {
+      "type": "string",
+      "description": "Tree inventory if census.md is still missing. Do not recensus when it exists."
+    }
   }
 }

@@ -72,13 +72,40 @@ class RangeReviewTests(unittest.TestCase):
         log = (work / "git" / "log.txt").read_text(encoding="utf-8")
         self.assertIn("second", log)
         self.assertTrue((work / "review.md").is_file())
+        self.assertTrue((work / "census.md").is_file())
         self.assertTrue((work / "git" / "diff.patch").is_file())
 
     def test_review_whole_branch_without_tags(self):
-        rc = main(["--repo", str(self.repo), "--fake", "review", "--force"])
+        err = StringIO()
+        with mock.patch("sys.stderr", err):
+            rc = main(["--repo", str(self.repo), "--fake", "review", "--force"])
         self.assertEqual(rc, 0)
-        state = State.load(self.repo / ".team" / "work" / "review-since-tag")
+        work = self.repo / ".team" / "work" / "review-since-tag"
+        state = State.load(work)
         self.assertEqual(state.range_kind, "branch")
+        warning = err.getvalue()
+        self.assertIn("no reviewed-* tag", warning)
+        self.assertIn("whole branch from empty tree", warning)
+        self.assertIn("team review --mark HEAD", warning)
+        reviewer = (work / "prompts" / "reviewer-fake.prompt.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("git/names.txt", reviewer)
+        self.assertIn("commit set", reviewer)
+        self.assertIn("live dirty working tree", reviewer)
+        self.assertIn("git/diff.patch", reviewer)
+        self.assertIn("git/apply.patch", reviewer)
+        self.assertNotIn("Dirty AGENTS.md is not R", reviewer)
+        self.assertNotIn("too large to slurp", reviewer)
+        self.assertNotIn("Already inventoried", reviewer)
+        guardian = (work / "prompts" / "guardian.prompt.md").read_text(encoding="utf-8")
+        self.assertIn("git/names.txt", guardian)
+        self.assertIn("live dirty working tree", guardian)
+        self.assertIn("Do not restate", guardian)
+        self.assertIn("Do not recensus", guardian)
+        self.assertIn("git/diff.patch", guardian.split("Work directory:", 1)[-1])
+        self.assertIn("census.md", guardian)
+        self.assertIn("review.md", guardian)
 
     def test_stamp_creates_reviewed_tag(self):
         rc = main(
@@ -135,6 +162,17 @@ class RangeReviewTests(unittest.TestCase):
         self.assertEqual(state.stop_reason, "complete")
         self.assertIn("guardian", state.skipped)
 
+    def test_past_commits_uses_range_reviewer_both_from_config(self):
+        team = self.repo / ".team"
+        team.mkdir()
+        (team / "config.toml").write_text(
+            '[review]\nrange_reviewer = "both"\n', encoding="utf-8"
+        )
+        rc = main(["--repo", str(self.repo), "--fake", "review", "--force"])
+        self.assertEqual(rc, 0)
+        state = State.load(self.repo / ".team" / "work" / "review-since-tag")
+        self.assertEqual(state.assignment["reviewer"], "both")
+
     def test_past_commits_uses_one_grok_reviewer(self):
         rc = main(["--repo", str(self.repo), "--fake", "review", "--force"])
         self.assertEqual(rc, 0)
@@ -159,7 +197,7 @@ class RangeReviewTests(unittest.TestCase):
         state = State.load(self.repo / ".team" / "work" / "review-pr-3")
         self.assertEqual(state.assignment["reviewer"], "both")
 
-    def test_past_commits_rejects_both(self):
+    def test_past_commits_accepts_both(self):
         rc = main(
             [
                 "--repo",
@@ -171,7 +209,25 @@ class RangeReviewTests(unittest.TestCase):
                 "--force",
             ]
         )
-        self.assertEqual(rc, 2)
+        self.assertEqual(rc, 0)
+        state = State.load(self.repo / ".team" / "work" / "review-since-tag")
+        self.assertEqual(state.assignment["reviewer"], "both")
+
+    def test_past_commits_reviewer_flag_both(self):
+        rc = main(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "review",
+                "--reviewer",
+                "both",
+                "--force",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        state = State.load(self.repo / ".team" / "work" / "review-since-tag")
+        self.assertEqual(state.assignment["reviewer"], "both")
 
     def test_past_commits_reviewer_flag_claude(self):
         rc = main(
@@ -258,20 +314,15 @@ class RangeReviewTests(unittest.TestCase):
         self.assertIn("second", log)
 
     def test_help_on_each_command(self):
-        commands = [
-            [],
-            ["feature"],
-            ["resume"],
-            ["review"],
-            ["apply"],
-            ["replan"],
-            ["list"],
-            ["status"],
-            ["roles"],
-            ["init"],
-            ["config"],
-            ["audit"],
-        ]
+        from team.cli import _parser
+
+        parser = _parser()
+        commands = [[]]
+        for action in parser._actions:
+            if getattr(action, "choices", None) and action.dest == "cmd":
+                commands.extend([[name] for name in sorted(action.choices)])
+                break
+        self.assertIn(["costs"], commands)
         for argv in commands:
             buf = StringIO()
             err = StringIO()
@@ -286,7 +337,10 @@ class RangeReviewTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 main(["review", "--help"])
         self.assertEqual(ctx.exception.code, 0)
-        self.assertIn("--reviewer", buf.getvalue())
+        help_text = buf.getvalue()
+        self.assertIn("--reviewer", help_text)
+        self.assertIn("{claude,grok,both}", help_text)
+        self.assertNotIn("rejected on past-commits", help_text)
 
     def test_delete_refuses_non_reviewed_tag(self):
         _git(self.repo, "tag", "v0.1")

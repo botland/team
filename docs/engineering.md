@@ -9,6 +9,20 @@ A rule has one living place. Two copies held in step by good intentions is how
 they drift. If this text and the target's `AGENTS.md` disagree, say so and follow
 the target for product facts, this file for how to reason.
 
+## Who writes the tree
+
+Only these roles may edit the repository:
+
+- **implementer** — production under `code_root`. `.` includes README, AGENTS.md,
+  docs, schemas, and other repo-level product. That is implementer work, not a
+  new role.
+- **test-writer** and **adversarial** — files under `test_root` only.
+
+Everyone else is inspect: reviewer, guardian, architect, critic, tdd-design,
+debugger, scout, and consult answers. They emit schema artifacts through the
+orchestrator. They do not create, edit, delete, or move files. A finding is not
+a license to patch. `team apply` routes the finding to a writer.
+
 ## Enumerate the space, not the exceptions
 
 Name the whole space the rule is about — all paths, all encodings, all
@@ -68,6 +82,18 @@ When a second subsystem, encoding, process, or test-double appears, name the
 **pair that must agree**. Neither side owns the agreement. Prefer deriving one
 side from the other over testing that two hand lists match. Rank a multi-side
 rule at the **weakest crossing**, not the cleanest side.
+
+## Census is a map, not the evidence
+
+census.md answers where to look and what was already enumerated. It does not
+replace git/diff.patch, git/apply.patch, or the working-tree files. Later hops
+do not recensus the repository. They still inspect the listed diffs and the
+paths their task names.
+
+Review the live dirty working tree. A draft (`review_markdown: drafting`, empty
+findings that promise issues below) is not a review. A write hop with no
+product-tree delta is not implementation. A failed suite is not done until
+diagnose → repair → retest.
 
 ## One implementation
 

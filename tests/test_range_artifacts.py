@@ -177,14 +177,29 @@ class RangeArtifactTests(unittest.TestCase):
         self.assertEqual(commit_count(self.repo, ""), n_log)
 
     def test_rename_includes_both_old_and_new_path(self):
+        """names.txt is a superset of the patch: it keeps paths the range dropped.
+
+        The cumulative patch shows each surviving path once, so a file renamed
+        mid-range only appears under its new name. names.txt is a path list,
+        not hunks, so it carries the old name too rather than the patch paying
+        for a second full copy of the file.
+        """
         commit_file(self.repo, "old.txt", "same\n", "add old")
         git(self.repo, "mv", "old.txt", "new.txt")
         git(self.repo, "commit", "-m", "rename")
         self._collect()
         _work, _log, diff, names, _range_md = self._artifacts()
-        self.assertEqual(names, paths_from_patch(diff))
+        self.assertTrue(
+            set(paths_from_patch(diff)).issubset(set(names)),
+            "every path in the patch must be listed in names.txt",
+        )
         self.assertIn("old.txt", names)
         self.assertIn("new.txt", names)
+        self.assertNotIn(
+            "old.txt",
+            paths_from_patch(diff),
+            "a mid-range rename must not re-emit the file's hunks in the patch",
+        )
 
     def test_mode_only_change_still_lists_the_path(self):
         commit_file(self.repo, "script.sh", "#!/bin/sh\n", "add script")
@@ -224,6 +239,148 @@ class RangeArtifactTests(unittest.TestCase):
         self.assertEqual(pipe.state.stop_reason, "complete")
         self.assertTrue((pipe.work / "review.md").is_file())
 
+    def test_pr_log_txt_is_commit_list_not_gh_json(self):
+        import json
+        from io import StringIO
+        from unittest import mock
+
+        from team.cli import main
+
+        commit_file(self.repo, "lib.py", "x\n", "second")
+        commit_file(self.repo, "more.py", "y\n", "third")
+        shas = git(self.repo, "rev-list", "--reverse", "HEAD").strip().splitlines()
+        self.assertGreaterEqual(len(shas), 2)
+        commits = [
+            {"oid": shas[0], "messageHeadline": "first"},
+            {"oid": shas[1], "messageHeadline": "second"},
+        ]
+        view_json = json.dumps({"title": "PR 12", "commits": commits}, separators=(",", ":"))
+        self.assertNotIn("\n", view_json)
+        diff = "diff --git a/lib.py b/lib.py\n+++ b/lib.py\n+x\n"
+
+        real_run = __import__("subprocess").run
+
+        def fake_run(cmd, **kwargs):
+            argv = list(cmd)
+            if argv and argv[0] == "gh" and "view" in argv:
+                return __import__("subprocess").CompletedProcess(
+                    argv, 0, stdout=view_json, stderr=""
+                )
+            if argv and argv[0] == "gh" and "diff" in argv:
+                return __import__("subprocess").CompletedProcess(
+                    argv, 0, stdout=diff, stderr=""
+                )
+            return real_run(cmd, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=fake_run):
+            pipe = start_range_review(self._cfg(), slug="review-pr-12", pr="12")
+            work, log, got_diff, names, range_md = self._artifacts("review-pr-12")
+            buf = StringIO()
+            with mock.patch("sys.stdout", buf):
+                rc = main(
+                    [
+                        "--repo",
+                        str(self.repo),
+                        "--fake",
+                        "review",
+                        "--pr",
+                        "12",
+                        "--show-range",
+                    ]
+                )
+        self.assertEqual(rc, 0)
+        stripped = log.strip()
+        self.assertFalse(stripped.startswith("{"), log)
+        self.assertNotIn('"commits"', log.splitlines()[0] if log.strip() else "")
+        listed = log_shas(log)
+        self.assertEqual(len(listed), len(commits), log)
+        self.assertEqual(range_md_commits(range_md), len(commits))
+        self.assertEqual(pipe.state.range_kind, "pr")
+        self.assertEqual(pipe.state.range_source, "gh")
+        self.assertEqual(names, paths_from_patch(got_diff))
+        self.assertEqual(names, paths_from_patch(diff))
+        self.assertTrue(names, "how=gh must derive names.txt from the PR patch")
+        shown = buf.getvalue()
+        self.assertIn("commits: %d" % len(commits), shown)
+        for sha in listed:
+            self.assertTrue(
+                any(sha.startswith(c[:7]) or c.startswith(sha) for c in shas),
+                "log sha %s is not a PR commit" % sha,
+            )
+
+    def test_how_gh_without_commits_array_is_not_an_empty_commit_list(self):
+        """Converse of test_pr_log_txt_is_commit_list_not_gh_json.
+
+        gh pr diff succeeding is not how=gh. View failure, decode error,
+        missing oid, and unexpected shape must not publish how=gh with
+        (empty range) beside a real PR diff.
+        """
+        import json
+        from unittest import mock
+
+        commit_file(self.repo, "lib.py", "x\n", "second")
+        diff = "diff --git a/lib.py b/lib.py\n+++ b/lib.py\n+x\n"
+        real_run = __import__("subprocess").run
+        views = (
+            (1, ""),
+            (0, "not-json{"),
+            (0, json.dumps({"title": "PR", "commits": [{"messageHeadline": "x"}]})),
+            (0, json.dumps([{"oid": "deadbeef"}])),
+        )
+
+        for i, (code, stdout) in enumerate(views):
+            slug = "review-pr-how-%d" % i
+
+            def fake_run(cmd, view_code=code, view_out=stdout, **kwargs):
+                argv = list(cmd)
+                if argv and argv[0] == "gh" and "view" in argv:
+                    return __import__("subprocess").CompletedProcess(
+                        argv, view_code, stdout=view_out, stderr="view"
+                    )
+                if argv and argv[0] == "gh" and "diff" in argv:
+                    return __import__("subprocess").CompletedProcess(
+                        argv, 0, stdout=diff, stderr=""
+                    )
+                return real_run(cmd, **kwargs)
+
+            with self.subTest(view_code=code, stdout=stdout[:40]):
+                with mock.patch("subprocess.run", side_effect=fake_run):
+                    pipe = start_range_review(self._cfg(), slug=slug, pr="12")
+                work, log, got_diff, names, range_md = self._artifacts(slug)
+                how = str(pipe.state.range_source or "")
+                if how == "gh":
+                    self.assertFalse(is_empty_log(log), log)
+                    self.assertFalse(log.strip().startswith("{"), log)
+                    self.assertTrue(log_shas(log), log)
+                    self.assertGreater(range_md_commits(range_md), 0)
+                    self.assertTrue(got_diff.strip())
+                    self.assertNotEqual(got_diff.strip(), "(empty diff)")
+                    self.assertEqual(names, paths_from_patch(got_diff))
+                else:
+                    self.assertTrue(
+                        how == "branch-fallback" or how.startswith("merge-base:"),
+                        how,
+                    )
+                if is_empty_log(log):
+                    self.assertNotEqual(how, "gh")
+
+    def test_pr_fallback_oneline_log_still_matches_rev_list(self):
+        git(self.repo, "branch", "-m", "topic")
+        commit_file(self.repo, "lib.py", "x\n", "second")
+        pipe = self._collect(slug="review-pr-1", pr="1")
+        _work, log, _diff, _names, range_md = self._artifacts("review-pr-1")
+        n_log = len(log_shas(log))
+        self.assertGreater(n_log, 0, log)
+        self.assertEqual(range_md_commits(range_md), n_log)
+        self.assertEqual(commit_count(self.repo, ""), n_log)
+        self.assertTrue(all(len(s) >= 7 for s in log_shas(log)), log)
+        self.assertNotIn('"commits"', log)
+        how = str(pipe.state.range_source or "")
+        self.assertTrue(
+            how == "branch-fallback" or how.startswith("merge-base:"),
+            how,
+        )
+
     def test_range_diff_helper_includes_root_commit(self):
         diff = range_diff(self.repo, "")
         self.assertTrue(diff.strip(), "range_diff('', repo) must include the root commit")
@@ -236,6 +393,16 @@ class RangeArtifactTests(unittest.TestCase):
         self.assertTrue(log_shas(log))
         self.assertIn("README", names)
         self.assertEqual(names, paths_from_patch(range_diff(self.repo, "")))
+
+    def test_committed_agents_is_head_not_dirty_worktree(self):
+        commit_file(self.repo, "AGENTS.md", "committed law\n", "law")
+        (self.repo / "AGENTS.md").write_text("dirty living law\n", encoding="utf-8")
+        pipe = self._collect()
+        path = pipe.work / "git" / "committed-AGENTS.md"
+        self.assertTrue(path.is_file(), "range collection must pin product law at HEAD")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("committed law", text)
+        self.assertNotIn("dirty living", text)
 
 
 if __name__ == "__main__":

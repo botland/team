@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional
 import hashlib
 
 from team import style
-from team.util import as_list, as_str, dump_json, load_json
+from team.util import as_list, as_str, dump_json, load_json, normalize_root
 
 
 class FindingsError(RuntimeError):
@@ -131,10 +131,12 @@ def _findings_from_result_paths(paths: Iterable[Path]) -> List[Dict[str, Any]]:
     for path in paths:
         try:
             data = load_json(path)
-        except Exception:
-            continue
+        except Exception as exc:
+            raise FindingsError(
+                "unreadable review result %s: %s" % (path.name, exc)
+            ) from exc
         if not isinstance(data, dict):
-            continue
+            raise FindingsError("review result is not an object: %s" % path.name)
         for item in as_list(data.get("findings")):
             if not isinstance(item, dict):
                 continue
@@ -165,13 +167,58 @@ def _recorded_review_results(work: Path) -> Optional[List[Dict[str, Any]]]:
     return out or None
 
 
+def unrecorded_reviewer_results(work: Path, recorded: List[Dict[str, Any]]) -> List[str]:
+    names = {as_str(row.get("name")) for row in recorded if as_str(row.get("name"))}
+    prompts = work / "prompts"
+    if not prompts.is_dir():
+        return []
+    extras = []
+    for path in sorted(prompts.glob("reviewer-*.result.json")):
+        if path.name not in names:
+            extras.append(path.name)
+    return extras
+
+
+def recorded_inspect_unfinished(work: Path) -> bool:
+    """True when a pinned result is a progress note or recorded short turns."""
+    from team.runners import inspect_progress_note
+
+    try:
+        recorded = _recorded_review_results(work)
+    except FindingsError:
+        return False
+    if not recorded:
+        return False
+    prompts = work / "prompts"
+    for row in recorded:
+        turns = row.get("num_turns")
+        if turns is not None:
+            try:
+                if int(turns) <= 1:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        name = as_str(row.get("name"))
+        path = prompts / name if name else None
+        if path is None or not path.is_file():
+            continue
+        try:
+            data = load_json(path)
+        except Exception:
+            continue
+        if isinstance(data, dict) and inspect_progress_note(data):
+            return True
+    return False
+
+
 # Closed link enum (same set as the guardian persona). Valid link is the only
 # kind authority; missing/empty/unknown is unclassified, never architecture.
+# I→R is implementation vs brief — it does not take the replan rail.
 _GUARDIAN_LINK_KIND = {
     "r_to_a": "architecture",
     "a_to_t": "test",
     "t_to_i": "implementation",
-    "i_to_r": "architecture",
+    "i_to_r": "implementation",
     "invariant": "architecture",
 }
 
@@ -222,13 +269,23 @@ def collect_guardian_findings(work: Path) -> List[Dict[str, Any]]:
         return []
     try:
         data = load_json(path)
-    except Exception:
-        return []
+    except Exception as exc:
+        raise FindingsError(
+            "unreadable guardian result %s: %s" % (path.name, exc)
+        ) from exc
     if not isinstance(data, dict):
+        raise FindingsError("guardian result is not an object: %s" % path.name)
+    from team.runners import inspect_progress_note
+
+    # A progress note is not a review. Explicit risks on any other artifact
+    # are apply work — missing turn metadata must not drop them.
+    if inspect_progress_note(data):
+        return []
+    chain = data.get("chain")
+    if _chain_has_unjudged(chain):
         return []
     out: List[Dict[str, Any]] = []
     covered: set = set()
-    has_invariant = False
     for item in as_list(data.get("risks")):
         if not isinstance(item, dict):
             continue
@@ -240,15 +297,14 @@ def collect_guardian_findings(work: Path) -> List[Dict[str, Any]]:
             row["severity"] = "invariant"
         if link:
             row["title"] = "[%s] %s" % (link, row["title"])
-        if link == "invariant":
-            has_invariant = True
-        elif link in _GUARDIAN_LINK_KIND:
+        if link in _GUARDIAN_LINK_KIND and link != "invariant":
             covered.add(link)
         out.append(row)
     # Converse of "every risk has a link": every failed chain cell has a row.
-    # invariant covers all cells; a matching risk is the decision for that cell.
-    chain = data.get("chain")
-    if isinstance(chain, dict) and not has_invariant:
+    # invariant is one architecture claim; it does not cover other cells.
+    # Synthetics need finished-inspect evidence so an empty-risk inspecting
+    # payload does not become four queue rows.
+    if isinstance(chain, dict) and not _guardian_artifact_unfinished(data):
         for key in _CHAIN_KEYS:
             cell = chain.get(key)
             if not isinstance(cell, dict) or cell.get("ok") is not False:
@@ -269,6 +325,47 @@ def collect_guardian_findings(work: Path) -> List[Dict[str, Any]]:
     return out
 
 
+def _guardian_artifact_unfinished(data: Dict[str, Any]) -> bool:
+    from team.runners import inspect_turn_count, unfinished_inspect
+
+    meta = data.get("_meta") if isinstance(data.get("_meta"), dict) else {}
+    role = as_str(meta.get("role")) or "guardian"
+    return unfinished_inspect(
+        role=role,
+        num_turns=inspect_turn_count(data),
+        output=data,
+    )
+
+
+def _chain_cell_judged(cell: Any) -> bool:
+    """True when the cell is a finished judgment.
+
+    Boolean ``ok`` is judged. ``ok=null`` with a non-empty note is n/a
+    (missing layer on range/audit), not unjudged. Missing ``ok``, an
+    empty note on null, or a non-dict cell drops the whole artifact.
+    """
+    if not isinstance(cell, dict) or "ok" not in cell:
+        return False
+    ok = cell.get("ok")
+    if isinstance(ok, bool):
+        return True
+    if ok is None and as_str(cell.get("note")).strip():
+        return True
+    return False
+
+
+def _chain_has_unjudged(chain: Any) -> bool:
+    """True when a present cell was never judged (malformed or empty n/a)."""
+    if not isinstance(chain, dict):
+        return False
+    for key in _CHAIN_KEYS:
+        if key not in chain:
+            continue
+        if not _chain_cell_judged(chain.get(key)):
+            return True
+    return False
+
+
 def collect_all(work: Path) -> List[Dict[str, Any]]:
     return collect_review_findings(work) + collect_guardian_findings(work)
 
@@ -285,33 +382,20 @@ def kind_is_unclassified(value: Any) -> bool:
 
 
 def needs_classify(findings: Iterable[Dict[str, Any]], *, work: Optional[Path] = None) -> bool:
+    """Classify from the collected/pinned findings, not leftover extras.
+
+    ``findings`` is the attempt (pin when recorded). An unclassified extra
+    ``reviewer-*.result.json`` is not authority. Markdown-only review.md
+    with no result files still needs classify.
+    """
     rows = list(findings)
     if any(kind_is_unclassified(item.get("kind")) for item in rows):
-        return True
-    if work is not None and _unscoped_has_unclassified(work):
         return True
     if work is None:
         return False
     review_md = work / "review.md"
     if review_md.is_file() and not reviewer_result_present(work):
         return True
-    return False
-
-
-def _unscoped_has_unclassified(work: Path) -> bool:
-    prompts = work / "prompts"
-    if not prompts.is_dir():
-        return False
-    for path in prompts.glob("reviewer-*.result.json"):
-        try:
-            data = load_json(path)
-        except Exception:
-            continue
-        if not isinstance(data, dict):
-            continue
-        for item in as_list(data.get("findings")):
-            if isinstance(item, dict) and kind_is_unclassified(item.get("kind")):
-                return True
     return False
 
 
@@ -338,11 +422,27 @@ def actionable(findings: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [item for item in findings if (item.get("kind") or "") in ACTIONABLE]
 
 
+def finding_path(item: Dict[str, Any]) -> str:
+    """One path encoding for collect, seq-id, and related_guardian."""
+    return normalize_root(as_str(item.get("path")).strip())
+
+
+def finding_identity(item: Dict[str, Any]) -> tuple:
+    """Collect, seq-id, and related agree on this key.
+
+    Kind, normalized path, title, and evidence. Two rows that differ only
+    in evidence are two classes; ``./src/a.py`` and ``src/a.py`` are one path.
+    """
+    return (
+        normalize_kind(item.get("kind")),
+        finding_path(item),
+        as_str(item.get("title")).strip().lower(),
+        as_str(item.get("evidence")).strip(),
+    )
+
+
 def finding_id(item: Dict[str, Any]) -> str:
-    kind = normalize_kind(item.get("kind"))
-    path = as_str(item.get("path")).strip()
-    title = as_str(item.get("title")).strip().lower()
-    raw = "%s|%s|%s" % (kind, path, title)
+    raw = "%s|%s|%s|%s" % finding_identity(item)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 
@@ -467,10 +567,10 @@ def related_guardian(
     item: Dict[str, Any],
     guardian: Iterable[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-    path = as_str(item.get("path")).strip()
+    path = finding_path(item)
     if not path:
         return []
-    return [row for row in guardian if as_str(row.get("path")).strip() == path]
+    return [row for row in guardian if finding_path(row) == path]
 
 
 def mark_seq_step(
@@ -753,13 +853,10 @@ def render_followups(
 def render_seq_plan(
     queue: List[Dict[str, Any]],
     *,
-    reclassified: bool = False,
     failed: str = "",
 ) -> str:
     lines = [
         "# Apply --seq plan",
-        "",
-        "Re-reviewed to classify: %s" % ("yes" if reclassified else "no"),
         "",
         "One class at a time: architecture → test → implementation, then severity.",
         "Loop stops on the first class failure.",
@@ -855,15 +952,12 @@ def render_seq_log(seq: Dict[str, Any], *, slug: str = "") -> str:
 
 def render_plan(
     groups: Dict[str, List[Dict[str, Any]]],
-    *,
-    reclassified: bool = False,
 ) -> str:
     lines = [
         "# Apply plan",
         "",
-        "Re-reviewed to classify: %s" % ("yes" if reclassified else "no"),
-        "",
-        "Order: design (architecture) → contract + tests → implementation → suite → review.",
+        "Order: design (architecture) → contract + tests → implementation → suite.",
+        "Review and guardian run on team review, not apply.",
         "",
     ]
     for kind in KINDS:
@@ -891,16 +985,12 @@ def render_plan(
 def render_summary(
     groups: Dict[str, List[Dict[str, Any]]],
     *,
-    reclassified: bool,
     suite_status: str,
     hops: List[str],
-    rereviewed: bool,
 ) -> str:
     lines = [
         "# Apply",
         "",
-        "Re-reviewed to classify: %s" % ("yes" if reclassified else "no"),
-        "Closing review: %s" % ("yes" if rereviewed else "no"),
         "Suite: %s" % (suite_status or "UNVERIFIED"),
         "",
         "Counts: architecture=%d implementation=%d test=%d note=%d unclassified=%d"
@@ -928,22 +1018,18 @@ def _dedupe(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     extras: List[Dict[str, Any]] = []
     order: List[tuple] = []
     for item in items:
-        title = (item.get("title") or "").strip().lower()
-        path = (item.get("path") or "").strip()
-        kind = item.get("kind") or ""
+        key = finding_identity(item)
+        path, title = key[1], key[2]
         if not title and not path:
             extras.append(item)
             continue
-        evidence = (item.get("evidence") or "").strip()
-        key = (path, title, evidence)
         prev = by_key.get(key)
         if prev is None:
             by_key[key] = item
             order.append(key)
             continue
         prev_kind = prev.get("kind") or ""
+        kind = item.get("kind") or ""
         if not prev_kind and kind:
             by_key[key] = item
-        elif kind and prev_kind and kind != prev_kind:
-            extras.append(item)
     return [by_key[k] for k in order] + extras

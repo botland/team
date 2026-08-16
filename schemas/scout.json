@@ -1,26 +1,57 @@
 {
   "type": "object",
-  "required": ["components"],
+  "required": [
+    "components"
+  ],
   "properties": {
     "roots": {
       "type": "array",
       "maxItems": 20,
-      "items": { "type": "string" }
+      "items": {
+        "type": "string"
+      }
     },
     "components": {
       "type": "array",
       "maxItems": 40,
       "items": {
         "type": "object",
-        "required": ["name", "path", "state", "evidence"],
+        "required": [
+          "name",
+          "path",
+          "state",
+          "evidence"
+        ],
         "properties": {
-          "name": { "type": "string" },
-          "path": { "type": "string" },
-          "state": { "type": "string" },
-          "evidence": { "type": "string" }
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "done",
+              "wip",
+              "missing",
+              "external",
+              "broken"
+            ],
+            "description": "Closed set; same vocabulary as personas/scout.md."
+          },
+          "evidence": {
+            "type": "string"
+          }
         }
       }
     },
-    "notes": { "type": "string" }
+    "notes": {
+      "type": "string"
+    },
+    "census_markdown": {
+      "type": "string",
+      "description": "Tree inventory (layout, missing layers, verified path:line facts). Orchestrator writes census.md once. scout.md stays the audit inventory."
+    }
   }
 }

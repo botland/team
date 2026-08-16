@@ -16,6 +16,23 @@ def _check(
     if not isinstance(schema, dict):
         return
     expected = schema.get("type")
+    if isinstance(expected, list):
+        if obj is None:
+            if "null" in expected:
+                return
+            errors.append("%s: expected %s" % (path, " | ".join(str(t) for t in expected)))
+            return
+        for t in expected:
+            if t == "null":
+                continue
+            nested: List[str] = []
+            sub = dict(schema)
+            sub["type"] = t
+            _check(obj, sub, path, nested, enums=enums)
+            if not nested:
+                return
+        errors.append("%s: expected %s" % (path, " | ".join(str(t) for t in expected)))
+        return
     if expected == "object":
         if not isinstance(obj, dict):
             errors.append("%s: expected object" % path)

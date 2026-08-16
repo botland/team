@@ -24,6 +24,10 @@
           }
         }
       }
+    },
+    "census_markdown": {
+      "type": "string",
+      "description": "Tree inventory (layout, missing layers, verified path:line facts). Orchestrator writes census.md once. Not the contract."
     }
   }
 }

@@ -3,10 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional
 
 from team import findings as findings_mod
 from team import gitutil, style, testhost
@@ -16,6 +18,9 @@ from team.config import (
     RANGE_PHASE_ORDER,
     ROLES,
     Config,
+    expand_reviewer,
+    is_model_runtime,
+    may_write,
     persona_path,
     schema_path,
 )
@@ -24,20 +29,26 @@ from team.runners import (
     Result,
     Runtime,
     describe_runtime_failure,
-    premature_inspect,
-    resolve_session,
+    is_quota_failure,
+    inspect_progress_note,
     runtime_for,
+    unfinished_inspect,
+    unfinished_write,
 )
 from team.schemas import validate as validate_schema
 from team.state import State, work_dir
+from team import usage as usage_mod
 from team.util import (
     as_bool,
     as_list,
     as_str,
+    denied_write_code_roots,
+    denied_write_test_roots,
     dump_json,
     engine_root,
     explicit_roots,
     load_json,
+    normalize_root,
     write_text,
 )
 
@@ -46,8 +57,66 @@ class PipelineError(RuntimeError):
     pass
 
 
+# Shared tree inventory. First inspect hop that emits census_markdown writes it;
+# later hops read it so they do not recensus. Census is a map, not evidence.
+# Diffs and working-tree files remain required reading.
+CENSUS_ARTIFACT = "census.md"
+
+# HEAD copies of product law, for comparison. Live AGENTS.md is still R.
+RANGE_HEAD_LAW = (
+    ("AGENTS.md", "git/committed-AGENTS.md"),
+    ("docs/protocol.md", "git/committed-docs-protocol.md"),
+)
+
+
 class OptionalPhaseError(PipelineError):
     """Optional role (guardian, critic, …) could not run. Skip, do not abort."""
+
+
+class QuotaExhausted(PipelineError):
+    """Provider refused on quota. The run is suspended, not failed.
+
+    Everything already paid for stays on disk and the phase is unchanged, so
+    ``team resume <slug>`` picks up at the same hop once the window resets.
+    Required roles only — an optional role that hits the same wall still takes
+    the ordinary skip, so a quota blip cannot discard a review already bought.
+    """
+
+
+def merge_design_delta(prior: str, delta: str) -> str:
+    """Living design = prior kept (minus Removed) plus the delta copy."""
+    prior = prior or ""
+    delta = delta or ""
+    if not prior.strip():
+        return delta
+    if not delta.strip():
+        return prior
+    removed = set()
+    in_removed = False
+    for raw in delta.splitlines():
+        if raw.startswith("#"):
+            in_removed = raw.lstrip("#").strip().lower() == "removed acceptance criteria"
+            continue
+        if not in_removed:
+            continue
+        text = raw.strip()
+        if text.startswith("-"):
+            text = text[1:].strip()
+        if not text or text.lower() in ("none", "- none"):
+            continue
+        removed.add(text)
+    kept = []
+    for raw in prior.splitlines():
+        text = raw.strip()
+        item = text[1:].strip() if text.startswith("-") else ""
+        if item and item in removed:
+            continue
+        kept.append(raw)
+    body = "\n".join(kept).rstrip()
+    extra = delta.strip()
+    if body and extra:
+        return body + "\n\n" + extra + "\n"
+    return (body or extra) + ("\n" if (body or extra) else "")
 
 
 class Pipeline:
@@ -57,6 +126,12 @@ class Pipeline:
         self.work = work
         self.repo = Path(state.repo)
         self.log_lines: List[str] = []
+        # reviewer="both" runs two invokes on this one Pipeline. Every mutation
+        # of self.state, and every save() that serialises it, is under this lock:
+        # asdict() walking state.sessions while the other thread assigns into it
+        # raises "dictionary changed size during iteration", and two unsynchronised
+        # read-modify-writes of last_review drop one reviewer's recording.
+        self._state_lock = threading.RLock()
 
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
@@ -84,6 +159,8 @@ class Pipeline:
             self.log(line)
 
     def save(self) -> None:
+        self.cfg.code_root = normalize_root(self.cfg.code_root)
+        self.cfg.test_root = normalize_root(self.cfg.test_root)
         self.state.code_root = self.cfg.code_root
         self.state.test_root = self.cfg.test_root
         self.state.test_command = self.cfg.test_command
@@ -113,6 +190,20 @@ class Pipeline:
     def should_skip(self, phase: str) -> bool:
         return phase in self.cfg.skip
 
+    def _apply_repairs(self, *, repair: bool) -> bool:
+        """Debug + repair on the apply rail is opt-in (team apply --repair).
+
+        The diagnose/repair loop is the most expensive stretch of a hop and is
+        headed for its own rail. Off by default, apply stops at needs-repair
+        and leaves the failing suite for the caller.
+        """
+        return bool(repair) and not self.should_skip("debugger")
+
+    def _repair_off_hint(self) -> str:
+        if self.should_skip("debugger"):
+            return "debug/repair skipped (requested); suite left failing"
+        return "debug/repair off (opt in with team apply --repair); suite left failing"
+
     def done(self, phase: str) -> bool:
         return phase in self.state.phases_done
 
@@ -124,9 +215,9 @@ class Pipeline:
         schema_name: str,
         *,
         capability: Optional[str] = None,
-        resume: bool = False,
         extra: Optional[Dict[str, Any]] = None,
         runtime_name: Optional[str] = None,
+        write_verify: Optional[Callable[[Any], None]] = None,
     ) -> Result:
         runtime_name = runtime_name or self.cfg.assignment(role)
         if runtime_name == "host":
@@ -137,49 +228,94 @@ class Pipeline:
         self._require_write_scope(role, cap)
         rt: Runtime = runtime_for(runtime_name)
         session_key = "%s:%s" % (role, runtime_name)
-        # Replan consults tdd-design, then apply invokes it again. Passing the
-        # stored id as a *new* --session-id fails: "Session ID is already in use."
-        sid, do_resume = resolve_session(self.state.sessions.get(session_key, ""))
+        # Files are the handoff. A stored session is a log id, not a thread.
+        # Always mint a new --session-id; never --resume / -r.
+        sid = str(uuid.uuid4())
         extra = dict(extra or {})
-        extra.setdefault("code_root", self.cfg.code_root)
-        extra.setdefault("test_root", self.cfg.test_root)
-        if role in ("architect", "critic", "reviewer", "guardian", "tdd-design"):
-            extra.setdefault("effort", "high")
-        result = rt.complete(
-            role=role,
-            phase=phase,
-            prompt=prompt,
-            schema=self.schema(schema_name),
-            capability=cap,
-            session_id=sid,
-            resume=do_resume,
-            work=self.work,
-            repo=self.repo,
-            timeout=self.cfg.phase_timeout,
-            extra=extra,
-        )
-        if result.session_id:
-            self.state.sessions[session_key] = result.session_id
-        output = dict(result.output) if isinstance(result.output, dict) else {"value": result.output}
-        output["_meta"] = {
-            "slug": self.state.slug,
-            "attempt": (self.state.last_review or {}).get("attempt") or 0,
-            "phase": phase,
-            "role": role,
-            "runtime": runtime_name,
-            "head": gitutil.head(self.repo) if gitutil.is_git_repo(self.repo) else "",
-            "range_base": self.state.range_base,
-        }
-        result_path = write_text(
-            self.work / "prompts" / ("%s.result.json" % phase),
-            json.dumps(output, indent=2)[:200000],
-        )
-        if str(phase) in ("reviewer-claude", "reviewer-grok", "reviewer-fake"):
-            self._record_review_result(result_path)
+        extra.setdefault("code_root", normalize_root(self.cfg.code_root))
+        extra.setdefault("test_root", normalize_root(self.cfg.test_root))
+        extra.setdefault("submodule_paths", self._submodule_paths())
+        level = self.cfg.effort_for(role)
+        if level:
+            extra.setdefault("effort", level)
+        before = self._snapshot_for_restore()
+        complete_err: Optional[BaseException] = None
+        result: Optional[Result] = None
+        # Fence wraps complete: schema/runtime failure still verifies and restores.
+        try:
+            result = rt.complete(
+                role=role,
+                phase=phase,
+                prompt=prompt,
+                schema=self.schema(schema_name),
+                capability=cap,
+                session_id=sid,
+                resume=False,
+                work=self.work,
+                repo=self.repo,
+                timeout=self.cfg.phase_timeout,
+                extra=extra,
+            )
+        except BaseException as exc:
+            complete_err = exc
+        if result is not None:
+            # Reads of state here have to be inside the lock too: _meta.attempt
+            # is read from last_review while the sibling reviewer thread may be
+            # rewriting it.
+            with self._state_lock:
+                if result.session_id:
+                    self.state.sessions[session_key] = result.session_id
+                attempt = (self.state.last_review or {}).get("attempt") or 0
+                slug = self.state.slug
+                range_base = self.state.range_base
+            output = (
+                dict(result.output)
+                if isinstance(result.output, dict)
+                else {"value": result.output}
+            )
+            output["_meta"] = {
+                "slug": slug,
+                "attempt": attempt,
+                "phase": phase,
+                "role": role,
+                "runtime": runtime_name,
+                "head": gitutil.head(self.repo) if gitutil.is_git_repo(self.repo) else "",
+                "range_base": range_base,
+                "num_turns": result.num_turns,
+            }
+            if result.usage is not None:
+                output["_meta"]["usage"] = result.usage.to_dict()
+            if result.num_turns is not None:
+                output["num_turns"] = result.num_turns
+            result_path = write_text(
+                self.work / "prompts" / ("%s.result.json" % phase),
+                json.dumps(output, indent=2),
+            )
+            if str(phase).startswith("reviewer-"):
+                self._record_review_result(result_path, num_turns=result.num_turns)
+            self._record_usage(role, phase, runtime_name, result)
+        if before is not None:
+            self._fence_after_invoke(cap, phase, before, write_verify)
+        if complete_err is not None:
+            raise complete_err
+        if result is None:
+            raise PipelineError("%s/%s failed: runtime returned no result" % (role, phase))
         if not result.success:
             err = describe_runtime_failure(result)
+            # Optional roles keep their existing skip, quota or not: the run
+            # already paid for the reviewer, and dropping that artifact because
+            # guardian ran out of budget costs more than the missing guardian.
             if ROLES.get(role, {}).get("optional"):
                 raise OptionalPhaseError("%s: %s" % (phase, err))
+            if is_quota_failure(result):
+                with self._state_lock:
+                    self.state.stop_reason = "quota"
+                    self.save()
+                raise QuotaExhausted(
+                    "%s/%s suspended: %s\n"
+                    "Nothing is lost. Resume when the window resets:\n"
+                    "  team resume %s" % (role, phase, err, self.state.slug)
+                )
             raise PipelineError("%s/%s failed: %s" % (role, phase, err))
         errors = validate_schema(result.output, self.schema(schema_name), enums=False)
         if errors:
@@ -195,12 +331,23 @@ class Pipeline:
             if ROLES.get(role, {}).get("optional"):
                 raise OptionalPhaseError(msg)
             raise PipelineError(msg)
-        if premature_inspect(role=role, runtime=runtime_name, result=result):
-            if extra.get("_inspect_retry"):
-                msg = (
-                    "%s/%s failed: finished in %s model turn(s) without inspecting the tree"
-                    % (role, phase, result.num_turns)
-                )
+        if unfinished_inspect(role=role, num_turns=result.num_turns, output=result.output):
+            turns = result.num_turns
+            premature = turns is None or turns <= 1
+            progress = inspect_progress_note(result.output)
+            # A 32-turn "drafting" already inspected. Retry is a new session
+            # and doubles the bill. Only the 1-turn schema dump is retried.
+            if extra.get("_inspect_retry") or (progress and not premature):
+                if progress and not premature:
+                    msg = (
+                        "%s/%s failed: progress note after %s model turn(s) is not a review"
+                        % (role, phase, turns)
+                    )
+                else:
+                    msg = (
+                        "%s/%s failed: finished in %s model turn(s) without inspecting the tree"
+                        % (role, phase, turns)
+                    )
                 if ROLES.get(role, {}).get("optional"):
                     raise OptionalPhaseError(msg)
                 raise PipelineError(msg)
@@ -218,10 +365,47 @@ class Pipeline:
                 "emit the final JSON only after you have inspected the tree.",
                 schema_name,
                 capability=capability,
-                resume=True,
                 extra=extra,
                 runtime_name=runtime_name,
+                write_verify=write_verify,
             )
+        after = self._snapshot() if before is not None else None
+        delta = (
+            gitutil.product_paths(gitutil.changed_paths(self.repo, before, after))
+            if before is not None and after is not None
+            else []
+        )
+        if unfinished_write(
+            capability=cap,
+            num_turns=result.num_turns,
+            product_delta=delta,
+            output=result.output,
+        ):
+            turns = result.num_turns
+            if extra.get("_write_retry"):
+                raise PipelineError(
+                    "%s/%s failed: no product delta after %s model turn(s)"
+                    % (role, phase, turns)
+                )
+            extra["_write_retry"] = True
+            self.log(
+                "%s wrote no product files in %s turn(s); retrying"
+                % (phase, turns)
+            )
+            return self.invoke(
+                role,
+                phase,
+                prompt
+                + "\n\nPREVIOUS OUTPUT REJECTED: a write hop with no product-tree "
+                "delta is not finished. Edit the files this role owns, then emit "
+                "the summary.",
+                schema_name,
+                capability=capability,
+                extra=extra,
+                runtime_name=runtime_name,
+                write_verify=write_verify,
+            )
+        self._adopt_census(result.output)
         return result
 
     def _require_write_scope(self, role: str, capability: str) -> None:
@@ -237,48 +421,71 @@ class Pipeline:
             )
 
     def _begin_review_attempt(self) -> None:
-        prev = self.state.last_review if isinstance(self.state.last_review, dict) else {}
-        attempt = int(prev.get("attempt") or 0) + 1
-        self.state.last_review = {"attempt": attempt, "results": []}
-        self.save()
+        with self._state_lock:
+            prev = self.state.last_review if isinstance(self.state.last_review, dict) else {}
+            attempt = int(prev.get("attempt") or 0) + 1
+            self.state.last_review = {"attempt": attempt, "results": []}
+            self.save()
 
-    def _record_review_result(self, path: Path) -> None:
-        rec = self.state.last_review if isinstance(self.state.last_review, dict) else {}
-        results = [row for row in as_list(rec.get("results")) if isinstance(row, dict)]
-        results = [row for row in results if row.get("name") != path.name]
-        results.append(
-            {
+    def _record_usage(self, role: str, phase: str, runtime: str, result: Result) -> None:
+        """Persist provider spend for this hop. Missing $ is logged, not dropped."""
+        rec = usage_mod.hop_record(
+            slug=self.state.slug,
+            phase=phase,
+            role=role,
+            runtime=runtime,
+            session_id=result.session_id,
+            success=result.success,
+            num_turns=result.num_turns,
+            usage=result.usage,
+        )
+        usage_mod.record_hop(self.work, rec)
+        self.log(usage_mod.format_hop_console(rec))
+        hops = usage_mod.load_hops(self.work)
+        if hops:
+            self.log(usage_mod.format_summary_line(usage_mod.summarize(hops)))
+
+    def _record_review_result(self, path: Path, *, num_turns: Optional[int] = None) -> None:
+        with self._state_lock:
+            rec = self.state.last_review if isinstance(self.state.last_review, dict) else {}
+            results = [row for row in as_list(rec.get("results")) if isinstance(row, dict)]
+            results = [row for row in results if row.get("name") != path.name]
+            row = {
                 "name": path.name,
                 "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
-        )
-        rec = dict(rec)
-        rec["results"] = results
-        rec.setdefault("attempt", 1)
-        self.state.last_review = rec
-        self.save()
+            if num_turns is not None:
+                row["num_turns"] = num_turns
+            results.append(row)
+            rec = dict(rec)
+            rec["results"] = results
+            rec.setdefault("attempt", 1)
+            self.state.last_review = rec
+            self.save()
 
     def _refresh_recorded_review_digests(self) -> None:
-        rec = self.state.last_review if isinstance(self.state.last_review, dict) else {}
-        rows = [row for row in as_list(rec.get("results")) if isinstance(row, dict)]
-        prompts = self.work / "prompts"
-        updated = []
-        for row in rows:
-            name = as_str(row.get("name"))
-            path = prompts / name
-            if not name or not path.is_file():
-                continue
-            updated.append(
-                {
-                    "name": name,
-                    "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
-                }
-            )
-        rec = dict(rec)
-        rec["results"] = updated
-        rec.setdefault("attempt", 1)
-        self.state.last_review = rec
-        self.save()
+        with self._state_lock:
+            rec = self.state.last_review if isinstance(self.state.last_review, dict) else {}
+            rows = [row for row in as_list(rec.get("results")) if isinstance(row, dict)]
+            prompts = self.work / "prompts"
+            updated = []
+            for row in rows:
+                name = as_str(row.get("name"))
+                path = prompts / name
+                if not name or not path.is_file():
+                    continue
+                updated.append(
+                    {
+                        "name": name,
+                        "digest": hashlib.sha256(path.read_bytes()).hexdigest(),
+                        **({"num_turns": row.get("num_turns")} if row.get("num_turns") is not None else {}),
+                    }
+                )
+            rec = dict(rec)
+            rec["results"] = updated
+            rec.setdefault("attempt", 1)
+            self.state.last_review = rec
+            self.save()
 
     def consult(self, target: str, questions: List[str], from_role: str) -> str:
         target = {
@@ -306,10 +513,20 @@ class Pipeline:
             target,
             [
                 "You are answering consult questions from the **%s**." % from_role,
-                "Do not edit files.",
+                *self._inspect_only_lines(),
+                self._listed_artifacts(
+                    [
+                        "brief.md",
+                        "design.md",
+                        "review.md",
+                        "guardian.md",
+                        "test-contract.md",
+                    ]
+                ),
                 "Questions (max 10):",
                 json.dumps(questions[:10], indent=2),
-                "Read the work artifacts and the repo, then answer.",
+                "Answer from the questions and listed artifacts. "
+                "Do not recensus the repository.",
             ],
         )
         result = self.invoke(
@@ -318,7 +535,6 @@ class Pipeline:
             prompt,
             "answers.json",
             capability="read-only",
-            resume=True,
         )
         answers = as_str(result.output.get("answers_markdown")) or "(empty consult answers)"
         write_text(
@@ -328,32 +544,152 @@ class Pipeline:
         return answers
 
     def _layout_blurb(self) -> str:
+        code = (self.cfg.code_root or "").strip()
+        extra = (
+            "code_root='.' is the repository except test_root and git submodules. "
+            if code == "."
+            else "write-code also excludes test_root and git submodules that are not themselves code_root. "
+        )
+        if (self.cfg.test_root or "").strip() == ".":
+            extra += (
+                "test_root='.' is the repository except code_root and git submodules. "
+            )
         return (
             "FOLDER FLEXIBILITY: Do not assume src/ or tests/ always exist. "
             "Discover the real repo layout. "
             "code_root=%r test_root=%r. "
+            "%s"
             "If a root is missing, use an empty string and work with the actual tree. "
             "Never force creating both roots if the stack only needs one."
-            % (self.cfg.code_root, self.cfg.test_root)
+            % (self.cfg.code_root, self.cfg.test_root, extra)
         )
 
+    def _submodule_paths(self) -> List[str]:
+        if not gitutil.is_git_repo(self.repo):
+            return []
+        return gitutil.submodule_paths(self.repo)
+
+    def _denied_write_code(self) -> List[str]:
+        return denied_write_code_roots(
+            self.cfg.code_root, self.cfg.test_root, self._submodule_paths()
+        )
+
+    def _denied_write_tests(self) -> List[str]:
+        return denied_write_test_roots(
+            self.cfg.code_root, self.cfg.test_root, self._submodule_paths()
+        )
+
+    def _code_write_lines(self) -> List[str]:
+        lines = [
+            "Edit ONLY under code_root=%r." % self.cfg.code_root,
+            "NEVER edit tests (test_root=%r). Never weaken/skip/delete tests."
+            % self.cfg.test_root,
+        ]
+        if (self.cfg.code_root or "").strip() == ".":
+            lines.append(
+                "code_root='.' is the repository except test_root and git submodules."
+            )
+        denied = self._denied_write_code()
+        if denied:
+            lines.append("Excluded write-code roots: %s." % ", ".join(denied))
+        return lines
+
+    def _architect_root_lines(self) -> List[str]:
+        return [
+            "code_root is the implementer write fence, not the package directory.",
+            "Use '.' unless the work must be confined to one tree.",
+            "'.' means the repository except test_root and git submodules.",
+            "Name packages in structural_touchpoints, not as code_root.",
+        ]
+
+    def _adopt_design_roots(self, out: Dict[str, Any]) -> None:
+        """Apply schema code_root/test_root unless project config locked them.
+
+        state.json is a cache, not a second fence. A replan that names '.'
+        must replace a leftover package path from an earlier hop.
+        """
+        code = normalize_root(as_str(out.get("code_root")))
+        test = normalize_root(as_str(out.get("test_root")))
+        if code and not self.cfg.lock_code_root:
+            self.cfg.code_root = code
+            self.state.code_root = code
+        if test and not self.cfg.lock_test_root:
+            self.cfg.test_root = test
+            self.state.test_root = test
+
     def _listed_artifacts(self, names: List[str]) -> str:
-        lines = ["Work directory: %s" % self.work, "Read these files with tools before answering:"]
-        for name in names:
+        seen = set()
+        ordered: List[str] = []
+        for name in [CENSUS_ARTIFACT, *names]:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            ordered.append(name)
+        present: List[str] = []
+        missing: List[str] = []
+        for name in ordered:
             path = self.artifact(name)
-            status = "present" if path.is_file() else "MISSING"
-            lines.append("- %s (%s)" % (path, status))
+            if path.is_file():
+                present.append("- %s" % path)
+            else:
+                missing.append("- %s" % name)
+        lines = ["Work directory: %s" % self.work]
+        if present:
+            lines.append("Read these files with tools before answering:")
+            lines.extend(present)
+        if missing:
+            lines.append("Missing (n/a — do not open, do not invent):")
+            lines.extend(missing)
+        if self.artifact(CENSUS_ARTIFACT).is_file():
+            lines.append(
+                "census.md is a map (layout, where to look). "
+                "It does not replace git/diff.patch, git/apply.patch, or the files. "
+                "Do not recensus. Do inspect the listed diffs and the paths your task names."
+            )
+        else:
+            lines.append(
+                "census.md is missing. After you inspect, emit census_markdown: "
+                "layout, missing layers, and verified path:line facts. "
+                "Judgments stay in your role artifact. "
+                "The orchestrator writes census.md once."
+            )
         lines.append(
-            "Use tools to inspect the repository. "
-            "An empty or thin answer is valid only after you have inspected the tree."
+            "Use tools on the listed present files and the paths your task names. "
+            "An empty or thin answer is valid only after that inspect."
         )
         return "\n".join(lines)
+
+    def _adopt_census(self, output: Any) -> None:
+        """First inspect hop to emit census_markdown writes census.md. Later hops read it."""
+        if not isinstance(output, dict):
+            return
+        text = as_str(output.get("census_markdown")).strip()
+        if not text:
+            return
+        path = self.artifact(CENSUS_ARTIFACT)
+        if path.is_file():
+            return
+        self.write_artifact(CENSUS_ARTIFACT, text)
+        self.log("census written")
 
     def _engineering_rules(self) -> str:
         path = engine_root() / "docs" / "engineering.md"
         if path.is_file():
             return path.read_text(encoding="utf-8")
         return ""
+
+    def _findings_prompt_lines(
+        self,
+        items: List[Dict[str, Any]],
+        related: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[str]:
+        lines = ["Findings:\n" + json.dumps(items, indent=2)]
+        if related:
+            lines.append(
+                "Related guardian (context only; do not apply):\n"
+                + json.dumps(list(related), indent=2)
+            )
+        return lines
 
     def _prompt(self, role: str, body: List[str]) -> str:
         parts = [
@@ -368,9 +704,15 @@ class Pipeline:
         return "\n".join(parts)
 
     def _snapshot(self) -> dict:
-        if not gitutil.is_git_repo(self.repo):
-            return {"head": "", "paths": [], "entries": {}}
         return gitutil.snapshot(self.repo)
+
+    def _snapshot_for_restore(self) -> dict:
+        """Hop-start tree plus extra-worktree watch. Fence + restore share this."""
+        snap = dict(self._snapshot())
+        snap["blobs"] = gitutil.worktree_blobs(self.repo)
+        snap["outside"] = gitutil.outside_snapshot(self.repo)
+        snap["outside_blobs"] = gitutil.outside_blobs(self.repo)
+        return snap
 
     def _run_start_entries(self, phase_before: dict) -> dict:
         """Content ids dirty when this run began. Missing start falls back to hop start."""
@@ -379,28 +721,14 @@ class Pipeline:
             return dict(start.get("entries") or {})
         return dict(phase_before.get("entries") or {})
 
-    def _fence_error(
+    def _verify_write(
         self,
         phase: str,
-        roots: List[str],
-        bad: Sequence[str],
-        dirty: Sequence[str],
-    ) -> str:
-        dirty_set = set(dirty)
-        outside = [p for p in bad if p not in dirty_set]
-        parts = []
-        if outside:
-            parts.append(
-                "%s wrote outside allowed roots %s: %s" % (phase, roots, ", ".join(outside))
-            )
-        if dirty:
-            parts.append(
-                "%s mutated already-dirty paths (dirty since run start): %s"
-                % (phase, ", ".join(dirty))
-            )
-        return "; ".join(parts) or ("%s write fence violation" % phase)
-
-    def _verify_write(self, phase: str, allowed: List[str], before: Any) -> None:
+        allowed: List[str],
+        before: Any,
+        *,
+        denied: Optional[List[str]] = None,
+    ) -> None:
         if isinstance(before, dict):
             before_snap = before
         else:
@@ -409,25 +737,34 @@ class Pipeline:
         delta = gitutil.changed_paths(self.repo, before_snap, after)
         work_root = ".team/work/%s" % self.state.slug
         roots = explicit_roots(allowed)
+        denied_roots = explicit_roots(denied or [])
         ok, bad = gitutil.verify_delta(
             delta,
             roots,
             always_allowed=[work_root, ".team/work"],
+            denied_roots=denied_roots,
         )
-        b_entries = dict(before_snap.get("entries") or {})
-        a_entries = dict(after.get("entries") or {})
+        # Extra-worktree is a different space than in-repo membership.
+        # under_root('.', p) is total for relative paths — do not route
+        # ../vibe.rc through allowed '.'. Any extra-worktree mutation is bad.
+        outside_delta: List[str] = []
+        if "outside" in before_snap:
+            outside_delta = gitutil.outside_changed(
+                before_snap.get("outside") or {},
+                gitutil.outside_snapshot(self.repo),
+            )
+            for path in outside_delta:
+                if path not in delta:
+                    delta.append(path)
+                if path not in bad:
+                    bad.append(path)
         dirty = gitutil.already_dirty_mutations(
             delta,
             self._run_start_entries(before_snap),
-            b_entries,
-            a_entries,
+            dict(before_snap.get("entries") or {}),
+            dict(after.get("entries") or {}),
             exempt_roots=(work_root, ".team/work"),
         )
-        for path in dirty:
-            if path not in bad:
-                bad.append(path)
-            if path in ok:
-                ok.remove(path)
         gitutil.write_path_list(self.work / "git" / ("after-%s.txt" % phase), delta)
         report = gitutil.describe_verify(
             phase,
@@ -437,6 +774,7 @@ class Pipeline:
             head_before=str(before_snap.get("head") or ""),
             head_after=str(after.get("head") or ""),
             already_dirty=dirty,
+            denied_roots=denied_roots,
         )
         write_text(self.work / "git" / ("verify-%s.md" % phase), report)
         head_changed = bool(
@@ -444,11 +782,26 @@ class Pipeline:
             and after.get("head")
             and before_snap.get("head") != after.get("head")
         )
-        if not roots:
+        if not roots and not outside_delta:
             self.log("git verify %s: no root set, advisory only (%d paths)" % (phase, len(delta)))
             return
         if bad:
-            raise PipelineError(self._fence_error(phase, roots, bad, dirty))
+            if denied_roots:
+                msg = (
+                    "%s wrote outside allowed roots %s (denied %s): %s"
+                    % (phase, roots, denied_roots, ", ".join(bad))
+                )
+            else:
+                msg = (
+                    "%s wrote outside allowed roots %s: %s"
+                    % (phase, roots, ", ".join(bad))
+                )
+            try:
+                gitutil.revert_product(self.repo, before_snap)
+                gitutil.revert_outside(self.repo, before_snap)
+            except gitutil.GitError as exc:
+                raise PipelineError("%s (restore failed: %s)" % (msg, exc)) from exc
+            raise PipelineError(msg)
         if head_changed:
             self.log(
                 "git verify %s: HEAD changed %s -> %s"
@@ -458,6 +811,22 @@ class Pipeline:
             self.log("git verify %s: no new paths (continuing)" % phase)
         else:
             self.log("git verify %s: %d path(s) ok" % (phase, len(ok)))
+
+    def _verify_write_code(self, phase: str, before: Any) -> None:
+        self._verify_write(
+            phase,
+            [self.cfg.code_root],
+            before,
+            denied=self._denied_write_code(),
+        )
+
+    def _verify_write_tests(self, phase: str, before: Any) -> None:
+        self._verify_write(
+            phase,
+            [self.cfg.test_root],
+            before,
+            denied=self._denied_write_tests(),
+        )
 
     def run(self, start: Optional[str] = None) -> State:
         if start:
@@ -538,6 +907,22 @@ class Pipeline:
     def _tests_passed(self) -> bool:
         return (self.state.final.get("status") or "") == "PASS"
 
+    def _no_suite_evidence(self) -> str:
+        """Reason the diagnose/repair rail has nothing to work from, or ''.
+
+        PASS, FAIL and UNVERIFIED are three outcomes, not two. Skipping the rail
+        only on PASS routes UNVERIFIED -- no test command discovered, collection
+        death, a timeout -- into the debugger, which then names an owner, which
+        un-skips repair, and an implementer rewrites production to fix a failure
+        the host never observed. Only a proved product FAIL is evidence.
+        """
+        status = as_str((self.state.final or {}).get("status")) or "UNVERIFIED"
+        if testhost.is_product_fail(self.state.final):
+            return ""
+        if status == "PASS":
+            return ""
+        return "suite %s (no failure observed)" % status
+
     def _skip_reason(self, phase: str) -> str:
         user_skip = {
             "critic",
@@ -550,11 +935,18 @@ class Pipeline:
         }
         if self.should_skip(phase) and phase in user_skip:
             return "requested"
-        if phase == "debugger" and self._tests_passed():
-            return "tests passed"
+        if phase == "debugger":
+            if self._tests_passed():
+                return "tests passed"
+            unverified = self._no_suite_evidence()
+            if unverified:
+                return unverified
         if phase == "repair":
             if self._tests_passed():
                 return "tests passed"
+            unverified = self._no_suite_evidence()
+            if unverified:
+                return unverified
             if "debugger" in self.state.skipped:
                 return "no diagnosis"
             owner = self.state.diagnosis_owner
@@ -573,6 +965,7 @@ class Pipeline:
             [
                 self._listed_artifacts(["brief.md"]),
                 "Feature brief is in brief.md. Map the real code structure, then design.",
+                *self._architect_root_lines(),
                 "Return design_markdown plus code_root, test_root, acceptance_criteria,",
                 "structural_touchpoints, and invariants. No function bodies.",
             ],
@@ -581,10 +974,7 @@ class Pipeline:
         out = result.output
         design = as_str(out.get("design_markdown")) or "(empty design)"
         self.write_artifact("design.md", design)
-        if not self.cfg.code_root:
-            self.cfg.code_root = as_str(out.get("code_root"))
-        if not self.cfg.test_root:
-            self.cfg.test_root = as_str(out.get("test_root"))
+        self._adopt_design_roots(out)
         self.log("design written; code_root=%s test_root=%s" % (self.cfg.code_root, self.cfg.test_root))
 
     def phase_critic(self) -> None:
@@ -624,14 +1014,11 @@ class Pipeline:
                 "Revise design_markdown. Stay structure-level. No function bodies.",
             ],
         )
-        result = self.invoke("architect", "architect-revise", prompt, "design.json", resume=True)
+        result = self.invoke("architect", "architect-revise", prompt, "design.json")
         out = result.output
         design = as_str(out.get("design_markdown")) or self.read_artifact("design.md")
         self.write_artifact("design.md", design)
-        if not self.cfg.code_root:
-            self.cfg.code_root = as_str(out.get("code_root"))
-        if not self.cfg.test_root:
-            self.cfg.test_root = as_str(out.get("test_root"))
+        self._adopt_design_roots(out)
 
     def phase_tdd_design(self) -> None:
         prompt = self._prompt(
@@ -656,7 +1043,7 @@ class Pipeline:
                 ],
             )
             result = self.invoke(
-                "tdd-design", "tdd-design-write", prompt, "tdd_design.json", resume=True
+                "tdd-design", "tdd-design-write", prompt, "tdd_design.json"
             )
             out = result.output
         contract = as_str(out.get("test_contract_markdown")) or "(empty test contract)"
@@ -664,7 +1051,6 @@ class Pipeline:
         self.log("test contract written")
 
     def phase_test_writer(self) -> None:
-        before = self._snapshot()
         prompt = self._prompt(
             "test-writer",
             [
@@ -673,7 +1059,8 @@ class Pipeline:
                 ),
                 "CONSULT GATE ONLY. Do not write files yet.",
                 "If clear enough, ready=true, consult=\"none\", questions=[].",
-                "If blocked, ready=false, consult one of tdd-design|architect, max 10 questions.",
+                "If blocked, ready=false, consult one of implementer|tdd-design|architect,",
+                "max 10 questions.",
             ],
         )
         gate = self.invoke(
@@ -707,22 +1094,87 @@ class Pipeline:
             prompt,
             "write_summary.json",
             capability="write-tests",
-            resume=True,
+            write_verify=lambda before: self._verify_write_tests(
+                "test-writer", before
+            ),
         )
         summary = as_str(result.output.get("summary")) or "(no tdd summary)"
         self.write_artifact("tdd-summary.md", summary)
-        self._verify_write("test-writer", [self.cfg.test_root], before)
 
     def phase_baseline(self) -> None:
-        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+        cmd = testhost.discover_test_command(
+            self.repo, self.cfg.test_command, test_root=self.cfg.test_root
+        )
         self.cfg.test_command = cmd
         run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
         self.state.baseline = run
         self.write_artifact("baseline-report.md", testhost.render_report("Baseline test run", run))
         self.log("baseline %s (exit=%s)" % (run["status"], run["exit"]))
 
+    def _apply_record_baseline(self) -> None:
+        """This-apply pre-writer suite. Drops a stale prior-apply ``final``."""
+        self.state.final = {}
+        self.phase_baseline()
+
+    def _run_apply_suite(self) -> Dict[str, Any]:
+        cmd = testhost.discover_test_command(
+            self.repo, self.cfg.test_command, test_root=self.cfg.test_root
+        )
+        self.cfg.test_command = cmd
+        self._begin_hop("tester", "apply: host suite")
+        run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
+        comparison = testhost.compare(self.state.final or self.state.baseline, run)
+        run = dict(run)
+        run["comparison"] = comparison
+        self.state.final = run
+        self.write_artifact(
+            "apply-test-report.md",
+            testhost.render_report("Apply test run", run, comparison),
+        )
+        return run
+
+    def _present_artifacts(self, names: List[str]) -> List[str]:
+        return [name for name in names if self.artifact(name).is_file()]
+
+    def _apply_surface_artifacts(self) -> List[str]:
+        return self._present_artifacts(
+            [
+                "git/apply.patch",
+                "git/apply-names.txt",
+                "apply-test-report.md",
+                "apply-impl-summary.md",
+                "apply-tdd-summary.md",
+                "design-replan.md",
+                "baseline-report.md",
+            ]
+        )
+
+    def _write_apply_surface(self) -> None:
+        """Uncommitted product delta vs HEAD. Range review includes this dirty tree."""
+        if not gitutil.is_git_repo(self.repo):
+            self.write_artifact("git/apply.patch", "(empty apply tree)\n")
+            gitutil.write_path_list(self.work / "git" / "apply-names.txt", [])
+            return
+        dirty = gitutil.porcelain_paths(self.repo)
+        patch = gitutil.worktree_diff(self.repo, dirty)
+        self.write_artifact("git/apply.patch", patch or "(empty apply tree)\n")
+        names = gitutil.paths_from_diff(patch) or gitutil.product_paths(dirty)
+        gitutil.write_path_list(self.work / "git" / "apply-names.txt", names)
+        range_md = self.read_artifact("range.md")
+        if range_md and "## Apply working tree" not in range_md:
+            extra = [
+                "",
+                "## Apply working tree",
+                "",
+                "%d product path(s) dirty vs HEAD. Empty tag..HEAD does not mean apply changed nothing."
+                % len(names),
+                "",
+                "See `git/apply.patch` (authoritative for uncommitted apply work).",
+                "",
+            ]
+            self.write_artifact("range.md", range_md.rstrip() + "\n" + "\n".join(extra))
+
     def phase_implementer(self) -> None:
-        before = self._snapshot()
         prompt = self._prompt(
             "implementer",
             [
@@ -762,8 +1214,8 @@ class Pipeline:
                 self._listed_artifacts(
                     ["brief.md", "design.md", "test-contract.md", "tdd-summary.md"]
                 ),
-                "WRITE PRODUCTION CODE NOW. Edit ONLY under code_root=%r." % self.cfg.code_root,
-                "NEVER edit tests (test_root=%r). Never weaken/skip/delete tests." % self.cfg.test_root,
+                "WRITE PRODUCTION CODE NOW.",
+                *self._code_write_lines(),
                 "Consult answers:\n" + answers,
                 "Stay inside the design invariants. Return summary and paths_touched.",
             ],
@@ -774,14 +1226,15 @@ class Pipeline:
             prompt,
             "write_summary.json",
             capability="write-code",
-            resume=True,
+            write_verify=lambda before: self._verify_write_code("implementer", before),
         )
         summary = as_str(result.output.get("summary")) or "(no impl summary)"
         self.write_artifact("impl-summary.md", summary)
-        self._verify_write("implementer", [self.cfg.code_root], before)
 
     def phase_final_test(self) -> None:
-        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+        cmd = testhost.discover_test_command(
+            self.repo, self.cfg.test_command, test_root=self.cfg.test_root
+        )
         self.cfg.test_command = cmd
         run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
         comparison = testhost.compare(self.state.baseline, run)
@@ -794,7 +1247,7 @@ class Pipeline:
         self.log("final %s verdict=%s" % (run["status"], comparison["verdict"]))
 
     def _maybe_tester_agent(self, host_md: str, cmd: str, run: Dict[str, Any], phase: str) -> str:
-        if self.cfg.assignment("tester") not in ("claude", "grok", "fake"):
+        if not is_model_runtime(self.cfg.assignment("tester")):
             return host_md
         prompt = self._prompt(
             "tester",
@@ -817,7 +1270,12 @@ class Pipeline:
             return host_md
         return host_md.rstrip() + "\n\n## Tester agent\n\n" + extra.rstrip() + "\n"
 
-    def phase_debugger(self, *, seq_applied: Optional[List[Dict[str, Any]]] = None) -> None:
+    def phase_debugger(
+        self,
+        *,
+        seq_applied: Optional[List[Dict[str, Any]]] = None,
+        rail: str = "feature",
+    ) -> None:
         if self.state.final.get("status") == "PASS":
             return
         extra_prompt = ""
@@ -829,19 +1287,16 @@ class Pipeline:
                 "Do not reopen yourself. Applied classes:\n"
                 + json.dumps(seq_applied, indent=2)
             )
+        impl = "apply-impl-summary.md" if rail == "apply" else "impl-summary.md"
+        suite = [self._host_suite_report(rail), impl]
         prompt = self._prompt(
             "debugger",
             [
                 self._listed_artifacts(
-                    [
-                        "design.md",
-                        "test-contract.md",
-                        "baseline-report.md",
-                        "test-report.md",
-                        "impl-summary.md",
-                    ]
+                    ["design.md", "test-contract.md", "baseline-report.md"] + suite
                 ),
-                "Tests failed. Diagnose root cause. Do not edit files.",
+                "Tests failed. Diagnose root cause.",
+                *self._inspect_only_lines(),
                 "owner must be one of implementer|test-writer|architect|unknown.",
                 extra_prompt,
             ],
@@ -869,15 +1324,15 @@ class Pipeline:
             ]
         )
 
-    def phase_repair(self) -> None:
+    def phase_repair(self, *, rail: str = "feature") -> None:
         owner = self.state.diagnosis_owner or "implementer"
-        before = self._snapshot()
+        suite = self._host_suite_report(rail)
         if owner == "test-writer":
             prompt = self._prompt(
                 "test-writer",
                 [
                     self._listed_artifacts(
-                        ["design.md", "test-contract.md", "diagnosis.md", "test-report.md"]
+                        ["design.md", "test-contract.md", "diagnosis.md", suite]
                     ),
                     "REPAIR. Diagnosis says the tests are wrong. Fix tests only.",
                     "Edit ONLY under test_root=%r. NEVER edit production." % self.cfg.test_root,
@@ -890,22 +1345,23 @@ class Pipeline:
                 prompt,
                 "write_summary.json",
                 capability="write-tests",
-                resume=True,
+                write_verify=lambda before: self._verify_write_tests(
+                    "repair", before
+                ),
             )
             self.write_artifact(
                 "repair-summary.md",
                 as_str(result.output.get("summary")) or "(no repair summary)",
             )
-            self._verify_write("repair", [self.cfg.test_root], before)
         else:
             prompt = self._prompt(
                 "implementer",
                 [
                     self._listed_artifacts(
-                        ["design.md", "test-contract.md", "diagnosis.md", "test-report.md"]
+                        ["design.md", "test-contract.md", "diagnosis.md", suite]
                     ),
                     "REPAIR. Diagnosis says production is wrong. Fix production only.",
-                    "Edit ONLY under code_root=%r. NEVER edit tests." % self.cfg.code_root,
+                    *self._code_write_lines(),
                     "Return summary and paths_touched.",
                 ],
             )
@@ -915,17 +1371,22 @@ class Pipeline:
                 prompt,
                 "write_summary.json",
                 capability="write-code",
-                resume=True,
+                write_verify=lambda before: self._verify_write_code("repair", before),
             )
             self.write_artifact(
                 "repair-summary.md",
                 as_str(result.output.get("summary")) or "(no repair summary)",
             )
-            self._verify_write("repair", [self.cfg.code_root], before)
         self.log("repair via %s" % owner)
 
-    def phase_verify_test(self) -> None:
-        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+    def _host_suite_report(self, rail: str) -> str:
+        """Living host-suite name. Feature and apply are different artifacts."""
+        return "apply-test-report.md" if rail == "apply" else "test-report.md"
+
+    def phase_verify_test(self, *, rail: str = "feature") -> None:
+        cmd = testhost.discover_test_command(
+            self.repo, self.cfg.test_command, test_root=self.cfg.test_root
+        )
         self.cfg.test_command = cmd
         run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
         comparison = testhost.compare(self.state.baseline, run)
@@ -935,11 +1396,10 @@ class Pipeline:
         md = testhost.render_report("Verify test run (after repair)", run, comparison)
         md = self._maybe_tester_agent(md, cmd, run, "tester-verify")
         self.write_artifact("verify-test-report.md", md)
-        self.write_artifact("test-report.md", md)
+        self.write_artifact(self._host_suite_report(rail), md)
         self.log("verify %s verdict=%s" % (run["status"], comparison["verdict"]))
 
     def phase_adversarial(self) -> None:
-        before = self._snapshot()
         prompt = self._prompt(
             "adversarial",
             [
@@ -965,12 +1425,14 @@ class Pipeline:
             prompt,
             "adversarial.json",
             capability="write-tests",
+            write_verify=lambda before: self._verify_write_tests(
+                "adversarial", before
+            ),
         )
         md = as_str(result.output.get("adversarial_markdown")) or json.dumps(
             result.output, indent=2
         )
         self.write_artifact("adversarial.md", md)
-        self._verify_write("adversarial", [self.cfg.test_root], before)
         vectors = as_list(result.output.get("vectors"))
         self.log("adversarial %d vector(s)" % len(vectors))
         self._log_items(
@@ -988,7 +1450,9 @@ class Pipeline:
         )
 
     def phase_adversarial_test(self) -> None:
-        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
+        cmd = testhost.discover_test_command(
+            self.repo, self.cfg.test_command, test_root=self.cfg.test_root
+        )
         self.cfg.test_command = cmd
         run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
         comparison = testhost.compare(self.state.final or self.state.baseline, run)
@@ -1007,11 +1471,7 @@ class Pipeline:
             self.phase_range_reviewer()
             return
         self._begin_review_attempt()
-        assignment = self.cfg.assignment("reviewer")
-        if assignment == "both":
-            runtimes = ["claude", "grok"]
-        else:
-            runtimes = [assignment]
+        runtimes = expand_reviewer(self.cfg.assignment("reviewer"))
         artifacts = [
             "brief.md",
             "design.md",
@@ -1024,14 +1484,25 @@ class Pipeline:
             "adversarial.md",
             "diagnosis.md",
         ]
+        apply_files = self._apply_surface_artifacts()
+        artifacts.extend(apply_files)
 
         def one(runtime: str) -> Result:
             prompt = self._prompt(
                 "reviewer",
                 [
                     self._listed_artifacts(artifacts),
-                    "READ-ONLY. Inspect the actual files and git status.",
+                    *self._inspect_only_lines(),
+                    "Inspect the actual files and git status.",
                     "Summaries are claims, not evidence.",
+                    *(
+                        [
+                            "git/apply.patch is the uncommitted apply delta.",
+                            "An empty commit range does not mean nothing changed.",
+                        ]
+                        if apply_files
+                        else []
+                    ),
                     self._reviewer_finding_rules(),
                     "You are the %s reviewer. Do not assume another reviewer exists."
                     % runtime,
@@ -1050,7 +1521,7 @@ class Pipeline:
             ordered = runtimes
             results = [one(runtimes[0])]
         else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=len(runtimes)) as pool:
                 futs = [(rt, pool.submit(one, rt)) for rt in runtimes]
                 ordered = [rt for rt, _ in futs]
                 results = [fut.result() for _, fut in futs]
@@ -1063,11 +1534,53 @@ class Pipeline:
         self.log("review written (%s)" % ", ".join(runtimes))
         self._log_items(findings_mod.collect_review_findings(self.work))
 
-    def _verify_readonly(self, phase: str, before: Any) -> None:
-        if not gitutil.is_git_repo(self.repo):
-            self.log("git verify %s: skipped (not a git repo)" % phase)
+    def _fence_after_invoke(
+        self,
+        cap: str,
+        phase: str,
+        before: Any,
+        write_verify: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        """Verify+restore for one invoke. invoke() is the only caller."""
+        if not may_write(cap):
+            self._fence_readonly(phase, before)
             return
-        self._verify_write(phase, [".team/work"], before)
+        if write_verify is not None:
+            write_verify(before)
+            return
+        if cap == "write-tests":
+            self._verify_write_tests(phase, before)
+            return
+        self._verify_write_code(phase, before)
+
+    def _fence_readonly(self, phase: str, before: Any) -> None:
+        """Verify+restore for one read-only invoke. invoke() is the only caller."""
+        after = self._snapshot()
+        head_changed = bool(
+            before.get("head")
+            and after.get("head")
+            and before.get("head") != after.get("head")
+        )
+        try:
+            self._verify_write(phase, [".team/work"], before)
+            if head_changed:
+                raise PipelineError(
+                    "%s changed HEAD %s -> %s (read-only hop must not commit)"
+                    % (phase, before.get("head"), after.get("head"))
+                )
+        except PipelineError:
+            self._restore_inspect_product(before)
+            raise
+
+    def _restore_inspect_product(self, before: Any) -> None:
+        """Revert product-tree and extra-worktree writes. Skip .team/work."""
+        if not isinstance(before, dict):
+            before = {"head": "", "paths": list(before or []), "entries": {}, "blobs": {}}
+        try:
+            gitutil.revert_product(self.repo, before)
+            gitutil.revert_outside(self.repo, before)
+        except gitutil.GitError as exc:
+            raise PipelineError("inspect restore failed: %s" % exc) from exc
 
     def _write_audit_report(self) -> None:
         status = self.read_artifact("status.md") or "(no status)"
@@ -1076,7 +1589,6 @@ class Pipeline:
         self.write_artifact("report.md", combined)
 
     def phase_scout(self) -> None:
-        before = self._snapshot()
         prompt = self._prompt(
             "scout",
             [
@@ -1090,7 +1602,7 @@ class Pipeline:
                 "Return components[] with name, path, state (done|wip|missing|external|broken), evidence.",
                 "roots[] are top-level areas you inspected. notes is optional.",
                 "An empty components list is valid only after you actually listed the tree.",
-                "Do not edit files. Do not implement anything.",
+                *self._inspect_only_lines(),
             ],
         )
         result = self.invoke("scout", "scout", prompt, "scout.json")
@@ -1114,11 +1626,9 @@ class Pipeline:
         if notes:
             lines.extend(["", "## Notes", notes])
         self.write_artifact("scout.md", "\n".join(lines) + "\n")
-        self._verify_readonly("scout", before)
         self.log("scout %d component(s)" % len(components))
 
     def phase_assess(self) -> None:
-        before = self._snapshot()
         scout_blob = self.read_artifact("scout.json") or self.read_artifact("scout.md")
         prompt = self._prompt(
             "architect",
@@ -1139,16 +1649,11 @@ class Pipeline:
         summary = as_str(result.output.get("summary")) or ""
         body = status if not summary else "%s\n\n%s" % (summary, status)
         self.write_artifact("status.md", body)
-        self._verify_readonly("assess", before)
         self.log("status written")
 
     def phase_status_reviewer(self) -> None:
         self._begin_review_attempt()
-        assignment = self.cfg.assignment("reviewer")
-        if assignment == "both":
-            runtimes = ["claude", "grok"]
-        else:
-            runtimes = [assignment]
+        runtimes = expand_reviewer(self.cfg.assignment("reviewer"))
         artifacts = ["brief.md", "scout.md", "scout.json", "status.md"]
 
         def one(runtime: str) -> Result:
@@ -1156,7 +1661,8 @@ class Pipeline:
                 "reviewer",
                 [
                     self._listed_artifacts(artifacts),
-                    "You are the adversarial reviewer on a STATUS audit. READ-ONLY.",
+                    "You are the adversarial reviewer on a STATUS audit.",
+                    *self._inspect_only_lines(),
                     "Your report is what the user consumes.",
                     "Query: %s" % json.dumps(self.state.brief),
                     "Repo: %s" % json.dumps(str(self.repo)),
@@ -1175,13 +1681,12 @@ class Pipeline:
                 runtime_name=runtime,
             )
 
-        before = self._snapshot()
         parts = []
         if len(runtimes) == 1:
             ordered = runtimes
             results = [one(runtimes[0])]
         else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=len(runtimes)) as pool:
                 futs = [(rt, pool.submit(one, rt)) for rt in runtimes]
                 ordered = [rt for rt, _ in futs]
                 results = [fut.result() for _, fut in futs]
@@ -1192,28 +1697,48 @@ class Pipeline:
         merged = merge_reviews(parts)
         self.write_artifact("review.md", merged)
         self._write_audit_report()
-        self._verify_readonly("reviewer", before)
         self.log("audit review written (%s)" % ", ".join(runtimes))
         self._log_items(findings_mod.collect_review_findings(self.work))
 
     def phase_range_reviewer(self) -> None:
         self._begin_review_attempt()
-        assignment = self.cfg.assignment("reviewer")
-        if assignment == "both":
-            runtimes = ["claude", "grok"]
+        runtimes = expand_reviewer(self.cfg.assignment("reviewer"))
+        artifacts = [
+            "brief.md",
+            "range.md",
+            "git/log.txt",
+            "git/names.txt",
+            "git/diff.patch",
+            *[dest for _src, dest in RANGE_HEAD_LAW],
+        ]
+        apply_files = self._apply_surface_artifacts()
+        artifacts.extend(apply_files)
+        if apply_files:
+            scope = [
+                "RANGE REVIEW of the live dirty working tree, plus the collected commits.",
+                "R is brief.md plus the live target AGENTS.md. git/committed-AGENTS.md is HEAD for comparison.",
+                "census.md is a map. Still read git/diff.patch and git/apply.patch and the files.",
+                "git/log.txt and git/names.txt are the commit set. git/apply.patch is uncommitted work vs HEAD.",
+                "An empty git/diff.patch does not mean nothing changed.",
+                "Summaries are claims.",
+            ]
         else:
-            runtimes = [assignment]
-        artifacts = ["brief.md", "range.md", "git/log.txt", "git/diff.patch"]
+            scope = [
+                "RANGE REVIEW of the live dirty working tree, plus the collected commits.",
+                "R is brief.md plus the live target AGENTS.md. git/committed-AGENTS.md is HEAD for comparison.",
+                "census.md is a map (where to look). Still read git/diff.patch and the files. Do not recensus.",
+                "git/log.txt and git/names.txt are the commit set. Do not invent commits.",
+                "This is not a PR-only review: the range may be 'since the last reviewed-* tag'.",
+                "Inspect the listed diffs and the actual files in the working tree.",
+            ]
 
         def one(runtime: str) -> Result:
             prompt = self._prompt(
                 "reviewer",
                 [
                     self._listed_artifacts(artifacts),
-                    "RANGE REVIEW. The orchestrator already collected the commit range.",
-                    "git/log.txt and git/diff.patch are authoritative. Do not invent commits.",
-                    "This is not a PR-only review: the range may be 'since the last reviewed-* tag'.",
-                    "READ-ONLY. Inspect the actual files those commits touched.",
+                    *self._inspect_only_lines(),
+                    *scope,
                     self._reviewer_finding_rules(),
                     "You are the %s reviewer. Do not assume another reviewer exists."
                     % runtime,
@@ -1227,13 +1752,12 @@ class Pipeline:
                 runtime_name=runtime,
             )
 
-        before = self._snapshot()
         parts = []
         if len(runtimes) == 1:
             ordered = runtimes
             results = [one(runtimes[0])]
         else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=len(runtimes)) as pool:
                 futs = [(rt, pool.submit(one, rt)) for rt in runtimes]
                 ordered = [rt for rt, _ in futs]
                 results = [fut.result() for _, fut in futs]
@@ -1243,34 +1767,69 @@ class Pipeline:
             parts.append((rt, result.output, md))
         merged = merge_reviews(parts)
         self.write_artifact("review.md", merged)
-        self._verify_readonly("reviewer", before)
         self.log("range review written (%s)" % ", ".join(runtimes))
         self._log_items(findings_mod.collect_review_findings(self.work))
+        if not self.artifact(CENSUS_ARTIFACT).is_file():
+            raise PipelineError(
+                "range reviewer did not emit census_markdown; later hops would recensus"
+            )
 
     def phase_guardian(self) -> None:
+        listed = [
+            "brief.md",
+            "design.md",
+            "critic.md",
+            "test-contract.md",
+            "tdd-summary.md",
+            "impl-summary.md",
+            "baseline-report.md",
+            "test-report.md",
+            "adversarial-test-report.md",
+            "apply-test-report.md",
+            "review.md",
+            "range.md",
+        ]
+        if self.state.mode == "range":
+            listed.extend(
+                [
+                    "git/log.txt",
+                    "git/names.txt",
+                    *[dest for _src, dest in RANGE_HEAD_LAW],
+                ]
+            )
+            identity = [
+                "I is the live dirty working tree plus the collected commits.",
+                "R is brief.md plus the live target AGENTS.md. "
+                "git/committed-AGENTS.md is HEAD for comparison, not a substitute for the live file.",
+                # The reviewer already read both patches end to end and wrote
+                # census.md and review.md from them. Re-reading them here buys
+                # the same bytes a second time; the guardian judges arrows, not
+                # hunks. Named on demand, not listed for a mandatory full read.
+                "census.md + review.md + git/names.txt are your map of the delta. "
+                "git/diff.patch and git/apply.patch are on disk if a specific claim needs a hunk — "
+                "open the paths you need, not the whole patch.",
+                "Do not recensus. Do not restate a class already in review.md.",
+            ]
+            r_line = (
+                "R = brief.md + live AGENTS.md. A = design.md. T = test-contract.md."
+            )
+        else:
+            listed.append("git/apply.patch")
+            identity = [
+                "I = the tree. V = test/apply reports.",
+                "review.md + census.md are the inspect when present. "
+                "Do not recensus. Do not restate a class already in review.md.",
+            ]
+            r_line = "R = brief.md + target AGENTS.md. A = design.md. T = test-contract.md."
         prompt = self._prompt(
             "guardian",
             [
-                self._listed_artifacts(
-                    [
-                        "brief.md",
-                        "design.md",
-                        "critic.md",
-                        "test-contract.md",
-                        "tdd-summary.md",
-                        "impl-summary.md",
-                        "baseline-report.md",
-                        "test-report.md",
-                        "adversarial-test-report.md",
-                        "apply-test-report.md",
-                        "review.md",
-                        "range.md",
-                    ]
-                ),
-                "R = brief.md + target AGENTS.md. A = design.md. T = test-contract.md.",
-                "I = the tree. V = test/apply reports.",
+                self._listed_artifacts(listed),
+                r_line,
+                *identity,
                 "Evaluate R→A, A→T, T→I, and I→R. The last arrow is required.",
-                "A green suite does not prove I→R. Do not edit files.",
+                "A green suite does not prove I→R.",
+                *self._inspect_only_lines(),
             ],
         )
         result = self.invoke("guardian", "guardian", prompt, "guardian.json")
@@ -1286,7 +1845,10 @@ class Pipeline:
                 ),
             )
         )
-        self._log_items(findings_mod.collect_guardian_findings(self.work))
+        try:
+            self._log_items(findings_mod.collect_guardian_findings(self.work))
+        except findings_mod.FindingsError as exc:
+            raise PipelineError(str(exc)) from exc
 
     def replan(self) -> None:
         review = self.read_artifact("review.md")
@@ -1324,29 +1886,53 @@ class Pipeline:
             ],
         )
         self._begin_hop("architect", "apply: architect replan")
-        result = self.invoke("architect", "replan", prompt, "design.json", resume=True)
+        result = self.invoke("architect", "replan", prompt, "design.json")
         md = as_str(result.output.get("design_markdown")) or "(empty replan)"
         self.write_artifact("design-replan.md", md)
-        if not self.cfg.code_root:
-            self.cfg.code_root = as_str(result.output.get("code_root"))
-        if not self.cfg.test_root:
-            self.cfg.test_root = as_str(result.output.get("test_root"))
+        self._adopt_design_roots(result.output)
+        self.log("apply fence: code_root=%s test_root=%s" % (self.cfg.code_root, self.cfg.test_root))
         self.state.mark("replan")
         self.state.stop_reason = "replan"
         self.save()
         self.log("replan written to design-replan.md")
 
+    def _apply_design_delta(self) -> str:
+        delta = self.read_artifact("design-replan.md")
+        if not delta:
+            return ""
+        living = merge_design_delta(self.read_artifact("design.md"), delta)
+        self.write_artifact("design.md", living)
+        # Fence follows the replan schema, not leftover state.json / layout.
+        path = self.work / "prompts" / "replan.result.json"
+        if path.is_file():
+            try:
+                data = load_json(path)
+            except Exception:
+                data = None
+            if isinstance(data, dict):
+                self._adopt_design_roots(data)
+                self.save()
+        return living
+
     def apply_replan(self) -> None:
         delta = self.read_artifact("design-replan.md")
         if not delta:
             raise PipelineError("apply-replan needs design-replan.md (run team replan first)")
-        self.write_artifact("design.md", delta)
+        self._apply_design_delta()
         order = _phase_order(self.state)
         self.state.rewind_to("tdd-design", order)
         self.state.stop_reason = ""
         self.save()
         self.log("applied design-replan.md → design.md; resuming at tdd-design")
         self.run(start="tdd-design")
+
+    def _inspect_only_lines(self) -> List[str]:
+        return [
+            "INSPECT ONLY. Do not create, edit, delete, or move any file.",
+            "That includes AGENTS.md, README, docs, plans, tests, and production.",
+            "Read/grep/list only. A write is a failed hop. Emit a finding instead.",
+            "team apply owns the tree. Implementer owns repo docs when code_root is '.'",
+        ]
 
     def _reviewer_finding_rules(self) -> str:
         return (
@@ -1356,79 +1942,93 @@ class Pipeline:
             "- test: missing/wrong tests or contract — tdd-design + test-writer\n"
             "- note: open class or non-actionable; listed only\n"
             "At most 10 findings (severity, title, evidence, path, kind).\n"
+            "A finding is not a patch. Do not edit the tree to close a class.\n"
             "Do not emit the JSON object until tools have read the listed artifacts "
             "and you have inspected the files in scope. A progress finding is not a review."
         )
 
     def _write_followups(self, *, seq: Optional[Dict[str, Any]] = None) -> None:
-        items = findings_mod.collect_all(self.work)
+        try:
+            items = findings_mod.collect_all(self.work)
+        except findings_mod.FindingsError as exc:
+            raise PipelineError(str(exc)) from exc
         self.write_artifact(
             "followups.md",
             findings_mod.render_followups(items, seq=seq),
         )
 
+    def _collect_apply_review_findings(self) -> List[Dict[str, Any]]:
+        recorded = findings_mod._recorded_review_results(self.work)
+        try:
+            findings = findings_mod.collect_review_findings(self.work)
+        except findings_mod.FindingsError as exc:
+            extras = (
+                findings_mod.unrecorded_reviewer_results(self.work, recorded)
+                if recorded
+                else []
+            )
+            msg = str(exc).lower()
+            in_place = recorded and "digest mismatch" in msg and not extras
+            if in_place:
+                self._refresh_recorded_review_digests()
+                try:
+                    findings = findings_mod.collect_review_findings(self.work)
+                except findings_mod.FindingsError as exc2:
+                    raise PipelineError(str(exc2)) from exc2
+            else:
+                raise PipelineError(str(exc)) from exc
+        if findings_mod.recorded_inspect_unfinished(self.work):
+            raise PipelineError("recorded review is not a finished inspect")
+        return findings
+
     def apply_review(
         self,
         *,
         dry_run: bool = False,
-        rereview: bool = True,
         seq: bool = False,
         skip_failed: bool = False,
         reopen: str = "",
+        repair: bool = False,
     ) -> None:
         if self.state.mode == "audit":
             raise PipelineError("audit is read-only; apply needs a feature or range work slug")
         if not self.read_artifact("review.md"):
             raise PipelineError("apply needs review.md (run team review first)")
 
-        reclassified = False
-        try:
-            findings = findings_mod.collect_review_findings(self.work)
-        except findings_mod.FindingsError as exc:
-            self.log("review results unusable (%s); refreshing recorded digests" % exc)
-            self._refresh_recorded_review_digests()
-            findings = findings_mod.collect_review_findings(self.work)
-        if findings_mod.needs_classify(findings, work=self.work):
-            self.log("review findings lack kind=; re-running reviewer")
-            self.phase_reviewer()
-            self.state.mark("reviewer")
-            if self.state.mode != "audit" and "guardian" not in self.cfg.skip:
-                try:
-                    self.phase_guardian()
-                    self.state.mark("guardian")
-                except OptionalPhaseError as exc:
-                    self._skip("guardian", str(exc))
-            findings = findings_mod.collect_review_findings(self.work)
-            reclassified = True
-            self.save()
-
+        findings = self._collect_apply_review_findings()
         findings = findings_mod.fill_missing_kinds(findings)
-        guardian = findings_mod.collect_guardian_findings(self.work)
+        try:
+            guardian = findings_mod.collect_guardian_findings(self.work)
+        except findings_mod.FindingsError as exc:
+            raise PipelineError(str(exc)) from exc
         items = findings + guardian
         seq_state = findings_mod.load_seq_state(self.work)
         findings_mod.write_findings(self.work, items, seq=seq_state)
         self._write_followups(seq=seq_state)
         groups = findings_mod.group_by_kind(items)
-        self.write_artifact(
-            "apply-plan.md",
-            findings_mod.render_plan(groups, reclassified=reclassified),
-        )
-        if groups.get("unclassified"):
+        self.write_artifact("apply-plan.md", findings_mod.render_plan(groups))
+        if findings_mod.needs_classify(findings, work=self.work) or groups.get(
+            "unclassified"
+        ):
             self.state.stop_reason = "needs-classification"
             self.save()
-            self.log("apply: unclassified findings remain; needs-classification")
+            self.log("apply: unclassified findings remain; run team review")
             return
         if seq:
             if reopen:
-                self._seq_reopen(reopen, review_findings=findings, guardian=guardian)
+                self._seq_reopen(
+                    reopen,
+                    review_findings=findings,
+                    guardian=guardian,
+                    dry_run=dry_run,
+                )
                 return
             self._apply_seq(
                 review_findings=findings,
                 guardian=guardian,
-                reclassified=reclassified,
                 dry_run=dry_run,
-                rereview=rereview,
                 skip_failed=skip_failed,
+                repair=repair,
             )
             return
         self.log(
@@ -1454,10 +2054,8 @@ class Pipeline:
                 "apply-summary.md",
                 findings_mod.render_summary(
                     groups,
-                    reclassified=reclassified,
                     suite_status="",
                     hops=[],
-                    rereviewed=False,
                 ),
             )
             self.state.stop_reason = "applied"
@@ -1465,74 +2063,76 @@ class Pipeline:
             self.log("apply: nothing actionable")
             return
 
+        self._apply_record_baseline()
+        # A red baseline is not a reason to refuse: applying a fix for a bug
+        # that fails the suite is the ordinary case. testhost.compare splits the
+        # post-apply run into new vs preexisting failures against exactly this
+        # record, so "what did the writer break" stays answerable. The run stops
+        # later, at needs-repair, if the writers did not close it.
+        hops.append(
+            "baseline %s"
+            % ((self.state.baseline or {}).get("status") or "UNVERIFIED")
+        )
+
         if groups["architecture"]:
             self.replan()
-            delta = self.read_artifact("design-replan.md")
-            if delta:
-                self.write_artifact("design.md", delta)
+            if self._apply_design_delta():
                 hops.append("architect replan → design.md")
                 self.log("applied design-replan.md → design.md")
 
         if groups["architecture"] or groups["test"]:
-            self._apply_tdd_design(items)
+            kinds = ("architecture", "test") if groups["architecture"] else ("test",)
+            self._apply_tdd_design(self._apply_items_for(items, *kinds))
             hops.append("tdd-design contract")
-            self._apply_test_writer(items)
+            self._apply_test_writer(self._apply_items_for(items, "test"))
             hops.append("test-writer")
 
         if groups["architecture"] or groups["implementation"]:
-            self._apply_implementer(items)
+            impl_kinds = (
+                ("architecture", "implementation")
+                if groups["architecture"]
+                else ("implementation",)
+            )
+            self._apply_implementer(self._apply_items_for(items, *impl_kinds))
             hops.append("implementer")
 
-        cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
-        self.cfg.test_command = cmd
-        self._begin_hop("tester", "apply: host suite")
-        run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
-        comparison = testhost.compare(self.state.final or self.state.baseline, run)
-        run = dict(run)
-        run["comparison"] = comparison
-        self.state.final = run
-        self.write_artifact(
-            "apply-test-report.md",
-            testhost.render_report("Apply test run", run, comparison),
-        )
+        run = self._run_apply_suite()
         hops.append("suite %s" % run.get("status"))
         self.log("apply-test %s" % run.get("status"))
 
-        if run.get("status") != "PASS" and not self.should_skip("debugger"):
-            try:
-                self.phase_debugger()
-                hops.append("debugger owner=%s" % (self.state.diagnosis_owner or "?"))
-                if self.state.diagnosis_owner in ("implementer", "test-writer"):
-                    self.phase_repair()
-                    self.phase_verify_test()
-                    hops.append("repair + verify")
-            except OptionalPhaseError as exc:
-                self._skip("debugger", str(exc))
-                hops.append("debugger skipped (%s)" % exc)
-
-        if rereview:
-            self.phase_reviewer()
-            if self.state.mode != "audit" and "guardian" not in self.cfg.skip:
+        if testhost.needs_repair(run):
+            if self._apply_repairs(repair=repair):
                 try:
-                    self.phase_guardian()
+                    self.phase_debugger(rail="apply")
+                    hops.append("debugger owner=%s" % (self.state.diagnosis_owner or "?"))
+                    if self.state.diagnosis_owner in ("implementer", "test-writer"):
+                        self.phase_repair(rail="apply")
+                        self.phase_verify_test(rail="apply")
+                        hops.append("repair + verify")
+                        run = self.state.final or run
                 except OptionalPhaseError as exc:
-                    self._skip("guardian", str(exc))
-            self._write_followups()
-            hops.append("closing review")
+                    self._skip("debugger", str(exc))
+                    hops.append("debugger skipped (%s)" % exc)
+            else:
+                hops.append("debug/repair off")
+                self.log(self._repair_off_hint())
 
+        if testhost.needs_repair(run):
+            self.state.stop_reason = "needs-repair"
+        else:
+            self.state.stop_reason = "applied"
+
+        self._write_apply_surface()
         self.write_artifact(
             "apply-summary.md",
             findings_mod.render_summary(
                 groups,
-                reclassified=reclassified,
                 suite_status=str(run.get("status") or ""),
                 hops=hops,
-                rereviewed=rereview,
             ),
         )
-        self.state.stop_reason = "applied"
         self.save()
-        self.log("apply complete")
+        self.log("apply complete" if self.state.stop_reason == "applied" else "apply stopped: needs-repair")
         self._log_items(
             findings_mod.collect_all(self.work), sort=True, more_hint="followups.md"
         )
@@ -1543,12 +2143,35 @@ class Pipeline:
         *,
         review_findings: List[Dict[str, Any]],
         guardian: List[Dict[str, Any]],
+        dry_run: bool = False,
     ) -> None:
         seq = findings_mod.load_seq_state(self.work)
         try:
             seq = findings_mod.reopen_prefix(seq, fid)
         except findings_mod.FindingsError as exc:
             raise PipelineError(str(exc))
+        if dry_run:
+            # --dry-run means "do not change what the next run will do". The
+            # product tree is not the only such state: the seq queue is what the
+            # next --seq consumes, and marking a suffix stale is a real edit to
+            # it. Validate the reopen (reopen_prefix above refuses a bad id),
+            # report it, change nothing.
+            later = [
+                row["id"]
+                for row in findings_mod.latest_seq_rows(seq)
+                if row.get("status") == "stale"
+            ]
+            self.state.stop_reason = "dry_run"
+            self.save()
+            self.log(
+                "dry-run: would reopen %s; %d later class(es) would go stale%s"
+                % (
+                    fid,
+                    len(later),
+                    (" (%s)" % ", ".join(later)) if later else "",
+                )
+            )
+            return
         findings_mod.write_findings(self.work, review_findings + guardian, seq=seq)
         self._write_followups(seq=seq)
         later = [
@@ -1579,10 +2202,9 @@ class Pipeline:
         *,
         review_findings: List[Dict[str, Any]],
         guardian: List[Dict[str, Any]],
-        reclassified: bool,
         dry_run: bool,
-        rereview: bool,
         skip_failed: bool,
+        repair: bool = False,
     ) -> None:
         seq = findings_mod.load_seq_state(self.work)
         pool = list(review_findings) + list(guardian)
@@ -1611,9 +2233,7 @@ class Pipeline:
             nxt = findings_mod.pick_next_seq(pool, probe)
         self.write_artifact(
             "apply-plan.md",
-            findings_mod.render_seq_plan(
-                ranked, reclassified=reclassified, failed=seq.get("failed") or ""
-            ),
+            findings_mod.render_seq_plan(ranked, failed=seq.get("failed") or ""),
         )
         self.log("seq plan: %d class(es) remaining" % len(ranked))
         self._log_items(ranked, more_hint="apply-plan.md")
@@ -1633,6 +2253,14 @@ class Pipeline:
             self.save()
             return
 
+        applied_already = [
+            row
+            for row in findings_mod.latest_seq_rows(seq)
+            if row.get("status") == "applied"
+        ]
+        if not applied_already:
+            self._apply_record_baseline()
+
         while True:
             item = findings_mod.pick_next_seq(pool, seq)
             if item is None:
@@ -1644,13 +2272,14 @@ class Pipeline:
                     for row in related
                     if findings_mod.finding_id(row) != findings_mod.finding_id(item)
                 ]
-            ok = self._apply_one_seq(item, related, seq, rereview=rereview)
+            ok = self._apply_one_seq(item, related, seq, repair=repair)
             seq = findings_mod.load_seq_state(self.work)
             if not ok:
                 self._write_followups(seq=seq)
                 self.write_artifact(
                     "apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug)
                 )
+                self._write_apply_surface()
                 self.state.stop_reason = "seq-failed"
                 self.save()
                 self.log("apply --seq stopped: class %s failed" % item.get("id"))
@@ -1658,6 +2287,7 @@ class Pipeline:
         seq = findings_mod.load_seq_state(self.work)
         self._write_followups(seq=seq)
         self.write_artifact("apply-seq.md", findings_mod.render_seq_log(seq, slug=self.state.slug))
+        self._write_apply_surface()
         if findings_mod.seq_apply_complete(pool, seq):
             self.state.stop_reason = "applied"
             self.log("apply --seq complete")
@@ -1670,17 +2300,22 @@ class Pipeline:
         item: Dict[str, Any],
         related: List[Dict[str, Any]],
         seq: Dict[str, Any],
-        *,
-        rereview: bool,
+        repair: bool = False,
     ) -> bool:
         fid = item.get("id") or findings_mod.finding_id(item)
         item = dict(item)
         item["id"] = fid
         seq_dir = self.work / "seq" / fid
         (seq_dir / "prompts").mkdir(parents=True, exist_ok=True)
-        bundle = [item] + list(related)
-        dump = json.dumps(bundle, indent=2)
-        write_text(seq_dir / "finding.json", dump)
+        work_items = [item]
+        write_text(seq_dir / "finding.json", json.dumps(work_items, indent=2))
+        if related:
+            related_rows = []
+            for row in related:
+                rec = dict(row)
+                rec["id"] = findings_mod.finding_id(rec)
+                related_rows.append(rec)
+            write_text(seq_dir / "related.json", json.dumps(related_rows, indent=2))
         self.write_artifact(
             "apply-plan.md",
             findings_mod.render_seq_plan([item], failed=""),
@@ -1700,61 +2335,56 @@ class Pipeline:
         kind = item.get("kind")
         try:
             if kind == "architecture":
-                self._apply_replan_seq(bundle)
+                self._apply_replan_seq(work_items, related=related)
                 hops.append("architect replan → design.md")
-                self._apply_tdd_design(bundle, thin=True)
+                self._apply_tdd_design(work_items, thin=True, related=related)
                 hops.append("tdd-design contract")
-                self._apply_test_writer(bundle, thin=True)
+                self._apply_test_writer(work_items, thin=True, related=related)
                 hops.append("test-writer")
-                self._apply_implementer(bundle, thin=True)
+                self._apply_implementer(work_items, thin=True, related=related)
                 hops.append("implementer")
             elif kind == "test":
-                self._apply_tdd_design(bundle, thin=True)
+                self._apply_tdd_design(work_items, thin=True, related=related)
                 hops.append("tdd-design contract")
-                self._apply_test_writer(bundle, thin=True)
+                self._apply_test_writer(work_items, thin=True, related=related)
                 hops.append("test-writer")
             else:
-                self._apply_implementer(bundle, thin=True)
+                self._apply_implementer(work_items, thin=True, related=related)
                 hops.append("implementer")
 
-            cmd = testhost.discover_test_command(self.repo, self.cfg.test_command)
-            self.cfg.test_command = cmd
-            self._begin_hop("tester", "apply: host suite")
-            run = testhost.run_suite(self.repo, cmd, timeout=self.cfg.phase_timeout)
-            comparison = testhost.compare(self.state.final or self.state.baseline, run)
-            run = dict(run)
-            run["comparison"] = comparison
-            self.state.final = run
-            self.write_artifact(
-                "apply-test-report.md",
-                testhost.render_report("Apply test run", run, comparison),
-            )
+            run = self._run_apply_suite()
             hops.append("suite %s" % run.get("status"))
             self.log("seq-test %s" % run.get("status"))
 
-            if run.get("status") != "PASS" and not self.should_skip("debugger"):
-                try:
-                    applied_rows = [
-                        row
-                        for row in findings_mod.latest_seq_rows(seq)
-                        if row.get("status") == "applied"
-                    ]
-                    self.phase_debugger(seq_applied=applied_rows)
-                    hops.append("debugger owner=%s" % (self.state.diagnosis_owner or "?"))
-                    self._log_seq_disposition(seq, item)
-                    if self.state.diagnosis_owner in ("implementer", "test-writer"):
-                        self.phase_repair()
-                        self.phase_verify_test()
-                        hops.append("repair + verify")
-                        run = dict(self.state.final or run)
-                except OptionalPhaseError as exc:
-                    self._skip("debugger", str(exc))
-                    hops.append("debugger skipped (%s)" % exc)
+            if testhost.needs_repair(run):
+                if self._apply_repairs(repair=repair):
+                    try:
+                        applied_rows = [
+                            row
+                            for row in findings_mod.latest_seq_rows(seq)
+                            if row.get("status") == "applied"
+                        ]
+                        self.phase_debugger(seq_applied=applied_rows, rail="apply")
+                        hops.append(
+                            "debugger owner=%s" % (self.state.diagnosis_owner or "?")
+                        )
+                        self._log_seq_disposition(seq, item)
+                        if self.state.diagnosis_owner in ("implementer", "test-writer"):
+                            self.phase_repair(rail="apply")
+                            self.phase_verify_test(rail="apply")
+                            hops.append("repair + verify")
+                            run = dict(self.state.final or run)
+                    except OptionalPhaseError as exc:
+                        self._skip("debugger", str(exc))
+                        hops.append("debugger skipped (%s)" % exc)
+                else:
+                    hops.append("debug/repair off")
+                    self.log(self._repair_off_hint())
 
             suite = str((self.state.final or run).get("status") or run.get("status") or "")
             self._write_seq_checkpoint(seq_dir, item, start=start, hops=hops, suite=suite)
             self._seq_copy_artifacts(seq_dir)
-            if suite != "PASS":
+            if testhost.is_product_fail(status=suite):
                 seq = findings_mod.mark_seq_step(
                     seq, item, status="failed", hops=hops, suite=suite
                 )
@@ -1768,11 +2398,6 @@ class Pipeline:
                     findings_mod.render_seq_log(seq, slug=self.state.slug),
                 )
                 return False
-
-            if rereview:
-                self._begin_hop("reviewer", "seq: class review")
-                self.phase_seq_review(seq_dir, bundle)
-                hops.append("class review")
 
             seq = findings_mod.mark_seq_step(
                 seq, item, status="applied", hops=hops, suite=suite
@@ -1835,7 +2460,8 @@ class Pipeline:
                 "kind": item.get("kind") or "",
                 "title": item.get("title") or "",
                 "path": item.get("path") or "",
-                "status": status or ("failed" if suite != "PASS" else "applied"),
+                "status": status
+                or ("failed" if testhost.is_product_fail(status=suite) else "applied"),
                 "head_before": start.get("head") or "",
                 "head_after": end.get("head") or "",
                 "start": start,
@@ -1901,14 +2527,14 @@ class Pipeline:
             if src.is_file():
                 shutil.copyfile(src, seq_dir / name)
 
-    def _apply_replan_seq(self, items: List[Dict[str, Any]]) -> None:
+    def _apply_replan_seq(self, items: List[Dict[str, Any]], related: Optional[List[Dict[str, Any]]] = None) -> None:
         self._begin_hop("architect", "apply: architect questions")
         prompt = self._prompt(
             "architect",
             [
                 self._listed_artifacts(["brief.md", "design.md", "apply-plan.md"]),
                 "SEQ APPLY. Replan only this class. Do not read review.md.",
-                "Findings:\n" + json.dumps(items, indent=2),
+                *self._findings_prompt_lines(items, related),
                 "Produce questions_for_tdd and questions_for_implementer",
                 "(each max 10, empty if none). Do not rewrite the design yet.",
             ],
@@ -1926,6 +2552,7 @@ class Pipeline:
             [
                 self._listed_artifacts(["brief.md", "design.md", "apply-plan.md"]),
                 "Consult answers:\n" + ("\n\n".join(blob) or "(no consults)"),
+                *self._findings_prompt_lines(items, related),
                 "SEQ APPLY. Write a DELTA design for this class only. Required headings:",
                 "- Unchanged assumptions",
                 "- Changed assumptions",
@@ -1936,22 +2563,18 @@ class Pipeline:
             ],
         )
         self._begin_hop("architect", "apply: architect replan")
-        result = self.invoke("architect", "replan", prompt, "design.json", resume=True)
+        result = self.invoke("architect", "replan", prompt, "design.json")
         md = as_str(result.output.get("design_markdown")) or "(empty replan)"
         self.write_artifact("design-replan.md", md)
-        self.write_artifact("design.md", md)
-        if not self.cfg.code_root:
-            self.cfg.code_root = as_str(result.output.get("code_root"))
-        if not self.cfg.test_root:
-            self.cfg.test_root = as_str(result.output.get("test_root"))
-        self.log("seq: applied design-replan.md → design.md")
+        self._apply_design_delta()
+        self._adopt_design_roots(result.output)
+        self.log(
+            "seq: applied design-replan.md → design.md; fence code_root=%s test_root=%s"
+            % (self.cfg.code_root, self.cfg.test_root)
+        )
 
     def phase_seq_review(self, seq_dir: Path, items: List[Dict[str, Any]]) -> None:
-        assignment = self.cfg.assignment("reviewer")
-        if assignment == "both":
-            runtimes = ["claude", "grok"]
-        else:
-            runtimes = [assignment]
+        runtimes = expand_reviewer(self.cfg.assignment("reviewer"))
         artifacts = [
             "brief.md",
             "design.md",
@@ -1969,7 +2592,8 @@ class Pipeline:
                     self._listed_artifacts(artifacts),
                     "CLASS REVIEW. Review only the class that apply --seq just closed.",
                     "The original review.md is out of scope. Do not rewrite it.",
-                    "READ-ONLY. Inspect the actual files and git status.",
+                    *self._inspect_only_lines(),
+                    "Inspect the actual files and git status.",
                     self._reviewer_finding_rules(),
                     "Class:\n" + json.dumps(items, indent=2),
                     "You are the %s reviewer. Do not assume another reviewer exists."
@@ -1989,7 +2613,7 @@ class Pipeline:
             ordered = runtimes
             results = [one(runtimes[0])]
         else:
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=len(runtimes)) as pool:
                 futs = [(rt, pool.submit(one, rt)) for rt in runtimes]
                 ordered = [rt for rt, _ in futs]
                 results = [fut.result() for _, fut in futs]
@@ -2026,7 +2650,8 @@ class Pipeline:
                     ]
                 ),
                 "CLASS GUARDIAN. Evaluate only this applied class.",
-                "Do not edit files. Do not write guardian.md at the slug root.",
+                *self._inspect_only_lines(),
+                "Do not write guardian.md at the slug root.",
                 "Class:\n" + json.dumps(items, indent=2),
                 "Evaluate R→A, A→T, T→I, and I→R.",
             ],
@@ -2040,7 +2665,13 @@ class Pipeline:
         if src.is_file():
             shutil.copyfile(src, seq_dir / "prompts" / src.name)
 
-    def _apply_tdd_design(self, items: List[Dict[str, Any]], *, thin: bool = False) -> None:
+    def _apply_tdd_design(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        thin: bool = False,
+        related: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         listed = ["brief.md", "design.md", "test-contract.md", "apply-plan.md"]
         if not thin:
             listed.insert(3, "review.md")
@@ -2050,14 +2681,14 @@ class Pipeline:
                 self._listed_artifacts(listed),
                 "APPLY REVIEW. Update the test contract so kind=test findings and any",
                 "applied design delta are encoded. Do not write test or production files.",
-                "Findings:\n" + json.dumps(items, indent=2),
+                *self._findings_prompt_lines(items, related),
                 "If a contract exists, write a revised full contract, not a fragment.",
                 "ready must be true unless you have at most 10 questions for the architect.",
             ],
         )
         self._begin_hop("tdd-design", "apply: tdd-design")
         result = self.invoke(
-            "tdd-design", "tdd-design-apply", prompt, "tdd_design.json", resume=True
+            "tdd-design", "tdd-design-apply", prompt, "tdd_design.json"
         )
         out = result.output
         if not as_bool(out.get("ready"), False) and as_list(out.get("questions")):
@@ -2071,7 +2702,7 @@ class Pipeline:
                 ],
             )
             result = self.invoke(
-                "tdd-design", "tdd-design-apply-write", prompt, "tdd_design.json", resume=True
+                "tdd-design", "tdd-design-apply-write", prompt, "tdd_design.json"
             )
             out = result.output
         contract = as_str(out.get("test_contract_markdown")) or self.read_artifact(
@@ -2081,8 +2712,19 @@ class Pipeline:
             self.write_artifact("test-contract.md", contract)
         self.log("apply: test contract updated")
 
-    def _apply_test_writer(self, items: List[Dict[str, Any]], *, thin: bool = False) -> None:
-        before = self._snapshot()
+    def _apply_items_for(
+        self, items: List[Dict[str, Any]], *kinds: str
+    ) -> List[Dict[str, Any]]:
+        wanted = set(kinds)
+        return [row for row in items if (row.get("kind") or "") in wanted]
+
+    def _apply_test_writer(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        thin: bool = False,
+        related: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         listed = ["brief.md", "design.md", "test-contract.md", "apply-plan.md"]
         if not thin:
             listed.insert(3, "review.md")
@@ -2090,10 +2732,41 @@ class Pipeline:
             "test-writer",
             [
                 self._listed_artifacts(listed),
+                "APPLY REVIEW. CONSULT GATE ONLY. Do not write files yet.",
+                "Encode kind=test findings as tests. Production is the implementer's.",
+                "If you need the production shape or a seam the implementer will own,",
+                "ready=false, consult=\"implementer\".",
+                "If the contract is unclear, consult tdd-design or architect.",
+                "If clear, ready=true, consult=\"none\", questions=[].",
+                *self._findings_prompt_lines(items, related),
+            ],
+        )
+        self._begin_hop("test-writer", "apply: test-writer gate")
+        gate = self.invoke(
+            "test-writer",
+            "test-writer-gate",
+            prompt,
+            "gate.json",
+            capability="read-only",
+        )
+        answers = "(no consult; test-writer ready)"
+        gout = gate.output
+        if not as_bool(gout.get("ready"), False) and as_list(gout.get("questions")):
+            answers = self.consult(
+                as_str(gout.get("consult")) or "implementer",
+                as_list(gout.get("questions")),
+                "test-writer",
+            )
+        prompt = self._prompt(
+            "test-writer",
+            [
+                self._listed_artifacts(listed),
                 "APPLY REVIEW. Encode kind=test findings (and the current contract).",
                 "Edit ONLY under test_root=%r. NEVER edit production (code_root=%r)."
                 % (self.cfg.test_root, self.cfg.code_root),
-                "Findings:\n" + json.dumps(items, indent=2),
+                "Implementation findings are out of scope. Do not patch code_root.",
+                *self._findings_prompt_lines(items, related),
+                "Consult answers:\n" + answers,
                 "Return summary and paths_touched (test paths only).",
             ],
         )
@@ -2104,17 +2777,23 @@ class Pipeline:
             prompt,
             "write_summary.json",
             capability="write-tests",
-            resume=True,
+            write_verify=lambda before: self._verify_write_tests(
+                "apply-test-writer", before
+            ),
         )
         self.write_artifact(
             "apply-tdd-summary.md",
             as_str(result.output.get("summary")) or "(no apply test summary)",
         )
-        self._verify_write("apply-test-writer", [self.cfg.test_root], before)
         self.log("apply: tests")
 
-    def _apply_implementer(self, items: List[Dict[str, Any]], *, thin: bool = False) -> None:
-        before = self._snapshot()
+    def _apply_implementer(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        thin: bool = False,
+        related: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         listed = ["brief.md", "design.md", "test-contract.md", "apply-plan.md"]
         if not thin:
             listed.insert(3, "review.md")
@@ -2123,10 +2802,9 @@ class Pipeline:
             [
                 self._listed_artifacts(listed),
                 "APPLY REVIEW. Patch kind=implementation findings and realize any",
-                "applied design delta. Edit ONLY under code_root=%r." % self.cfg.code_root,
-                "NEVER edit tests (test_root=%r). Never weaken/skip/delete tests."
-                % self.cfg.test_root,
-                "Findings:\n" + json.dumps(items, indent=2),
+                "applied design delta.",
+                *self._code_write_lines(),
+                *self._findings_prompt_lines(items, related),
                 "Return summary and paths_touched.",
             ],
         )
@@ -2137,13 +2815,14 @@ class Pipeline:
             prompt,
             "write_summary.json",
             capability="write-code",
-            resume=True,
+            write_verify=lambda before: self._verify_write_code(
+                "apply-implementer", before
+            ),
         )
         self.write_artifact(
             "apply-impl-summary.md",
             as_str(result.output.get("summary")) or "(no apply impl summary)",
         )
-        self._verify_write("apply-implementer", [self.cfg.code_root], before)
         self.log("apply: implementation")
 
 
@@ -2232,7 +2911,7 @@ def start_audit(cfg: Config, query: str, slug: str) -> Pipeline:
     (work / "git").mkdir(exist_ok=True)
     (work / "prompts").mkdir(exist_ok=True)
     write_text(work / "brief.md", query.strip() + "\n")
-    snap = gitutil.snapshot(repo) if gitutil.is_git_repo(repo) else {"head": "", "paths": []}
+    snap = gitutil.snapshot(repo)
     gitutil.write_path_list(work / "git" / "start.txt", snap["paths"])
     state = State(
         slug=slug,
@@ -2271,7 +2950,7 @@ def start_range_review(
     if pr:
         log, diff, how = gitutil.pr_bundle(repo, pr)
         base, kind = pr, "pr"
-        count = len([ln for ln in log.splitlines() if ln.strip()])
+        count = gitutil.oneline_commit_count(log)
         desc = gitutil.describe_range(pr, "pr", count) + " [%s]" % how
     else:
         base, kind = gitutil.resolve_review_base(repo, since)
@@ -2284,8 +2963,15 @@ def start_range_review(
     write_text(work / "range.md", "# Range\n\n%s\n\n- base: `%s`\n- kind: %s\n- commits: %d\n" % (desc, base or "(root)", kind, count))
     write_text(work / "git" / "log.txt", log or "(empty range)\n")
     write_text(work / "git" / "diff.patch", diff or "(empty diff)\n")
-    names = gitutil.paths_from_diff(diff)
+    # Superset of the patch's paths: names.txt is the cheap map, so it carries
+    # paths the deduped cumulative patch no longer shows (a file renamed or
+    # deleted mid-range). One derivation, in gitutil.
+    names = gitutil.range_name_only(repo, base) if not pr else gitutil.paths_from_diff(diff)
     gitutil.write_path_list(work / "git" / "names.txt", names)
+    for src, dest in RANGE_HEAD_LAW:
+        blob = gitutil.committed_blob(repo, src)
+        if blob.strip():
+            write_text(work / dest, blob)
     snap = gitutil.snapshot(repo)
     gitutil.write_path_list(work / "git" / "start.txt", snap["paths"])
     state = State(
@@ -2303,7 +2989,9 @@ def start_range_review(
         range_source=how,
     )
     state.save(work)
-    return Pipeline(cfg, state, work)
+    pipe = Pipeline(cfg, state, work)
+    pipe._write_apply_surface()
+    return pipe
 
 
 def load_pipeline(cfg: Config, slug: str) -> Pipeline:
@@ -2312,9 +3000,13 @@ def load_pipeline(cfg: Config, slug: str) -> Pipeline:
         raise PipelineError("no run at %s" % work)
     state = State.load(work)
     if not cfg.code_root:
-        cfg.code_root = state.code_root
+        cfg.code_root = normalize_root(state.code_root)
+    else:
+        cfg.code_root = normalize_root(cfg.code_root)
     if not cfg.test_root:
-        cfg.test_root = state.test_root
+        cfg.test_root = normalize_root(state.test_root)
+    else:
+        cfg.test_root = normalize_root(cfg.test_root)
     if not cfg.test_command:
         cfg.test_command = state.test_command
     if state.depth:

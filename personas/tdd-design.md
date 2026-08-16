@@ -5,7 +5,8 @@ A test contract that maps each acceptance criterion to the tests that will prove
 
 ## What you must NOT do
 - Do not write production code.
-- Do not create or edit files under the test root or implementation root.
+- Do not create or edit files under the test root, implementation root, or docs.
+- The orchestrator writes `test-contract.md` from your schema. You do not touch the tree.
 - Do not prescribe function bodies for production code.
 
 ## Apply review

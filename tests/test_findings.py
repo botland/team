@@ -8,6 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from team import style
 from team.findings import (
     FindingsError,
+    actionable,
+    collect_all,
     collect_guardian_findings,
     collect_review_findings,
     empty_seq_state,
@@ -28,7 +30,7 @@ from team.findings import (
     seq_status_for,
     take_important,
 )
-from team.util import dump_json
+from team.util import dump_json, load_json
 
 
 # Closed guardian link → kind map from the apply contract (not imported from impl).
@@ -36,7 +38,7 @@ _LINK_KIND = {
     "r_to_a": "architecture",
     "a_to_t": "test",
     "t_to_i": "implementation",
-    "i_to_r": "architecture",
+    "i_to_r": "implementation",
     "invariant": "architecture",
 }
 _CHAIN_KEYS = ("r_to_a", "a_to_t", "t_to_i", "i_to_r")
@@ -65,11 +67,32 @@ def _chain(*failed):
     }
 
 
-def _write_guardian(work: Path, risks=None, chain=None):
+def _finished_inspect_meta(num_turns=2, role="guardian"):
+    return {"role": role, "phase": "guardian", "num_turns": num_turns}
+
+
+def _write_guardian(
+    work: Path,
+    risks=None,
+    chain=None,
+    *,
+    finished=True,
+    num_turns=2,
+    guardian_markdown="ok",
+    extra=None,
+):
     (work / "prompts").mkdir(exist_ok=True)
-    payload = {"risks": list(risks or [])}
+    payload = {
+        "risks": list(risks or []),
+        "guardian_markdown": guardian_markdown,
+    }
     if chain is not None:
         payload["chain"] = chain
+    if finished:
+        payload["_meta"] = _finished_inspect_meta(num_turns=num_turns)
+        payload["num_turns"] = num_turns
+    if extra:
+        payload.update(extra)
     dump_json(work / "prompts" / "guardian.result.json", payload)
 
 
@@ -122,6 +145,121 @@ class FindingsTests(unittest.TestCase):
             (work / "prompts").mkdir()
             dump_json(work / "prompts" / "reviewer-grok.result.json", {"findings": []})
             self.assertFalse(needs_classify([], work=work))
+
+    def test_needs_classify_ignores_unclassified_extra_when_pin_is_classified(self):
+        import hashlib
+
+        from team.findings import collect_review_findings
+        from team.util import dump_json as _dump
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            prompts = work / "prompts"
+            prompts.mkdir()
+            pin = {
+                "summary": "pinned",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "title": "real",
+                        "evidence": "e",
+                        "path": "src/a.py",
+                        "kind": "implementation",
+                    }
+                ],
+            }
+            extra = {
+                "summary": "stale extra",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "title": "leftover",
+                        "evidence": "e",
+                        "path": "src/b.py",
+                        "kind": "security",
+                    }
+                ],
+            }
+            _dump(prompts / "reviewer-fake.result.json", pin)
+            _dump(prompts / "reviewer-stale.result.json", extra)
+            digest = hashlib.sha256(
+                (prompts / "reviewer-fake.result.json").read_bytes()
+            ).hexdigest()
+            _dump(
+                work / "state.json",
+                {
+                    "slug": "s",
+                    "brief": "b",
+                    "repo": str(work),
+                    "engine_root": str(work),
+                    "last_review": {
+                        "attempt": 1,
+                        "results": [
+                            {"name": "reviewer-fake.result.json", "digest": digest}
+                        ],
+                    },
+                },
+            )
+            found = collect_review_findings(work)
+            self.assertEqual([item["title"] for item in found], ["real"])
+            self.assertFalse(needs_classify(found, work=work))
+
+    def test_needs_classify_true_when_recorded_finding_is_unclassified(self):
+        import hashlib
+
+        from team.findings import collect_review_findings
+        from team.util import dump_json as _dump
+
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            prompts = work / "prompts"
+            prompts.mkdir()
+            pin = {
+                "summary": "pinned",
+                "findings": [
+                    {
+                        "severity": "high",
+                        "title": "mystery",
+                        "evidence": "e",
+                        "path": "src/a.py",
+                        "kind": "security",
+                    }
+                ],
+            }
+            extra = {
+                "summary": "clean extra",
+                "findings": [
+                    {
+                        "severity": "low",
+                        "title": "note",
+                        "evidence": "e",
+                        "path": "src/b.py",
+                        "kind": "note",
+                    }
+                ],
+            }
+            _dump(prompts / "reviewer-fake.result.json", pin)
+            _dump(prompts / "reviewer-stale.result.json", extra)
+            digest = hashlib.sha256(
+                (prompts / "reviewer-fake.result.json").read_bytes()
+            ).hexdigest()
+            _dump(
+                work / "state.json",
+                {
+                    "slug": "s",
+                    "brief": "b",
+                    "repo": str(work),
+                    "engine_root": str(work),
+                    "last_review": {
+                        "attempt": 1,
+                        "results": [
+                            {"name": "reviewer-fake.result.json", "digest": digest}
+                        ],
+                    },
+                },
+            )
+            found = collect_review_findings(work)
+            self.assertTrue(needs_classify(found, work=work))
 
     def test_group_and_followups(self):
         rows = [
@@ -228,13 +366,17 @@ class FindingsTests(unittest.TestCase):
                             "path": "tests/t.py",
                             "link": "a_to_t",
                         },
-                    ]
+                    ],
+                    "guardian_markdown": "ok",
+                    "num_turns": 2,
+                    "_meta": _finished_inspect_meta(),
                 },
             )
             rows = collect_guardian_findings(work)
             kinds = {r["kind"] for r in rows}
-            self.assertIn("architecture", kinds)
+            self.assertIn("implementation", kinds)
             self.assertIn("test", kinds)
+            self.assertNotIn("architecture", kinds)
             self.assertTrue(any("i_to_r" in r["title"] for r in rows))
             by_link = {}
             for row in rows:
@@ -242,7 +384,7 @@ class FindingsTests(unittest.TestCase):
                     if link in row["title"]:
                         by_link[link] = row
                         self.assertEqual(row["kind"], kind)
-            self.assertEqual(by_link["i_to_r"]["kind"], "architecture")
+            self.assertEqual(by_link["i_to_r"]["kind"], "implementation")
             self.assertEqual(by_link["a_to_t"]["kind"], "test")
 
     def test_seq_picks_arch_before_impl_even_if_impl_is_higher_severity(self):
@@ -606,13 +748,27 @@ class FindingsTests(unittest.TestCase):
                 chain=_chain("t_to_i", "i_to_r"),
             )
             invariant_rows = collect_guardian_findings(work)
-            self.assertTrue(any(row["kind"] == "architecture" for row in invariant_rows))
-            self.assertFalse(
+            self.assertTrue(
                 any(
-                    "t_to_i" in row["title"] and row["kind"] == "implementation"
+                    row["kind"] == "architecture" and "invariant" in row["title"]
                     for row in invariant_rows
                 )
             )
+            impl = [
+                row
+                for row in invariant_rows
+                if "t_to_i" in row["title"] and row["kind"] == "implementation"
+            ]
+            self.assertEqual(len(impl), 1, impl)
+            self.assertIn("[t_to_i] failed chain cell", impl[0]["title"])
+            self.assertEqual(impl[0]["source"], "guardian")
+            i_to_r = [
+                row
+                for row in invariant_rows
+                if "i_to_r" in row["title"] and row["kind"] == "implementation"
+            ]
+            self.assertEqual(len(i_to_r), 1, i_to_r)
+            self.assertIn("[i_to_r] failed chain cell", i_to_r[0]["title"])
 
             _write_guardian(
                 work,
@@ -671,7 +827,7 @@ class FindingsTests(unittest.TestCase):
                         "link": "T_TO_I",
                     },
                     {
-                        "title": "i_to_r stays architecture",
+                        "title": "i_to_r is implementation",
                         "evidence": "not implementer-only",
                         "path": "src/f.py",
                         "link": "i_to_r",
@@ -703,10 +859,10 @@ class FindingsTests(unittest.TestCase):
                 by_evidence["T_TO_I lowercases to t_to_i"]["kind"], "implementation"
             )
             self.assertEqual(
-                by_evidence["not implementer-only"]["kind"], "architecture"
+                by_evidence["not implementer-only"]["kind"], "implementation"
             )
             self.assertNotEqual(
-                by_evidence["not implementer-only"]["kind"], "implementation"
+                by_evidence["not implementer-only"]["kind"], "architecture"
             )
             cands = {row["id"] for row in seq_candidates(rows, empty_seq_state())}
             for row in rows:
@@ -714,6 +870,363 @@ class FindingsTests(unittest.TestCase):
                     self.assertNotIn(finding_id(row), cands)
             self.assertIn(finding_id(by_evidence["kind must not win"]), cands)
             self.assertIn(finding_id(by_evidence["not implementer-only"]), cands)
+
+    def test_invariant_plus_failed_cell_still_emits_that_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            invariant = {
+                "title": "tree missed the brief",
+                "evidence": "invariant",
+                "path": "src/a.py",
+                "link": "invariant",
+            }
+            for key in _CHAIN_KEYS:
+                _write_guardian(
+                    work,
+                    risks=[invariant],
+                    chain=_chain(key),
+                )
+                rows = collect_guardian_findings(work)
+                inv = [row for row in rows if row["kind"] == "architecture" and "invariant" in row["title"]]
+                self.assertTrue(inv, key)
+                matching = [
+                    row
+                    for row in rows
+                    if key in row["title"] and row["kind"] == _LINK_KIND[key]
+                ]
+                self.assertEqual(len(matching), 1, (key, rows))
+                if key != "invariant":
+                    self.assertIn("[%s] failed chain cell" % key, matching[0]["title"])
+                self.assertEqual(matching[0]["source"], "guardian")
+                self.assertGreaterEqual(len(rows), 2, "has_invariant must not yield only the invariant row")
+
+    def test_matching_link_risk_is_the_only_decision_for_that_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            risk = {
+                "title": "slash still taught as legal",
+                "evidence": "error names slash",
+                "path": "README",
+                "link": "t_to_i",
+            }
+            _write_guardian(work, risks=[risk], chain=_chain("t_to_i"))
+            rows = collect_guardian_findings(work)
+            t_to_i = [row for row in rows if "t_to_i" in row["title"]]
+            self.assertEqual(len(t_to_i), 1)
+            self.assertEqual(t_to_i[0]["kind"], "implementation")
+            self.assertIn("slash still taught as legal", t_to_i[0]["title"])
+            self.assertFalse(any(row["title"] == "[t_to_i] failed chain cell" for row in rows))
+
+    def test_unknown_or_empty_link_does_not_cover_a_failed_cell(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            for link in ("", "t2i", None):
+                risk = {
+                    "title": "unknown cover",
+                    "evidence": "not a closed link",
+                    "path": "src/a.py",
+                }
+                if link is not None:
+                    risk["link"] = link
+                _write_guardian(work, risks=[risk], chain=_chain("t_to_i"))
+                rows = collect_guardian_findings(work)
+                unknown = [row for row in rows if "unknown cover" in row["title"]]
+                self.assertEqual(len(unknown), 1, link)
+                self.assertEqual(unknown[0]["kind"], "unclassified")
+                self.assertNotEqual(unknown[0]["kind"], "architecture")
+                syn = [
+                    row
+                    for row in rows
+                    if row["title"] == "[t_to_i] failed chain cell"
+                    and row["kind"] == "implementation"
+                ]
+                self.assertEqual(len(syn), 1, (link, rows))
+
+    def test_finished_empty_risk_four_false_synthesizes_four(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            _write_guardian(
+                work,
+                risks=[],
+                chain=_chain(*_CHAIN_KEYS),
+                guardian_markdown="note: inspecting is not the unfinished law",
+            )
+            # Cell notes may say inspecting; finished-inspect evidence is the law.
+            payload = {
+                "risks": [],
+                "guardian_markdown": "evaluated",
+                "chain": {
+                    key: {"ok": False, "note": "inspecting"} for key in _CHAIN_KEYS
+                },
+                "num_turns": 2,
+                "_meta": _finished_inspect_meta(),
+            }
+            dump_json(work / "prompts" / "guardian.result.json", payload)
+            rows = collect_guardian_findings(work)
+            self.assertEqual(len(rows), 4, rows)
+            for key in _CHAIN_KEYS:
+                matching = [row for row in rows if row["title"] == "[%s] failed chain cell" % key]
+                self.assertEqual(len(matching), 1, key)
+                self.assertEqual(matching[0]["kind"], _LINK_KIND[key])
+                self.assertEqual(matching[0]["severity"], "invariant")
+                self.assertEqual(matching[0]["source"], "guardian")
+                self.assertFalse(matching[0].get("path"))
+
+    def test_ok_true_or_non_false_yields_no_synthetic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            _write_guardian(work, risks=[], chain=_chain())
+            self.assertEqual(collect_guardian_findings(work), [])
+            _write_guardian(work, risks=[], chain=_chain("t_to_i"))
+            rows = collect_guardian_findings(work)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "implementation")
+            self.assertIn("t_to_i", rows[0]["title"])
+            self.assertFalse(any(key in rows[0]["title"] for key in ("r_to_a", "a_to_t", "i_to_r")))
+
+    def test_missing_turns_keeps_explicit_risks_not_synthetics(self):
+        """Turn count is inspect evidence, not the apply-queue membership set.
+
+        OwnEdge shape: reviewer medium notes + guardian invariant risks, no
+        persisted num_turns. Apply must still see the explicit risks.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            _write_guardian(
+                work,
+                risks=[
+                    {
+                        "title": "explicit risk",
+                        "evidence": "e",
+                        "path": "src/a.py",
+                        "link": "t_to_i",
+                    }
+                ],
+                chain=_chain(*_CHAIN_KEYS),
+                finished=False,
+            )
+            rows = collect_guardian_findings(work)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["kind"], "implementation")
+            self.assertIn("explicit risk", rows[0]["title"])
+            self.assertFalse(
+                any("failed chain cell" in row["title"] for row in rows),
+                rows,
+            )
+            self.assertEqual(len(actionable(collect_all(work))), 1)
+
+    def test_short_turns_keeps_explicit_risks_progress_note_does_not(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            _write_guardian(
+                work,
+                risks=[{"title": "r", "evidence": "e", "path": "src/a.py", "link": "t_to_i"}],
+                chain=_chain("t_to_i"),
+                finished=True,
+                num_turns=1,
+            )
+            rows = collect_guardian_findings(work)
+            self.assertEqual(len(rows), 1, rows)
+            self.assertEqual(rows[0]["kind"], "implementation")
+            self.assertFalse(any("failed chain cell" in row["title"] for row in rows))
+            _write_guardian(
+                work,
+                risks=[{"title": "r", "evidence": "e", "path": "src/a.py", "link": "invariant"}],
+                chain=_chain(*_CHAIN_KEYS),
+                finished=True,
+                num_turns=4,
+                guardian_markdown="still reading",
+            )
+            self.assertEqual(collect_guardian_findings(work), [])
+
+    def test_this_slug_inspecting_payload_is_not_actionable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            dump_json(
+                work / "prompts" / "guardian.result.json",
+                {
+                    "guardian_markdown": (
+                        "Inspecting brief, review artifacts, product law, and the tree "
+                        "before judging the chain."
+                    ),
+                    "chain": {
+                        key: {"ok": False, "note": "inspecting"} for key in _CHAIN_KEYS
+                    },
+                    "risks": [],
+                    "_meta": {
+                        "slug": "review-since-tag",
+                        "attempt": 1,
+                        "phase": "guardian",
+                        "role": "guardian",
+                        "runtime": "grok",
+                        "head": "fd3021f4c4abb679ef6bfef1b0fbc834afb65aa4",
+                        "range_base": "",
+                    },
+                },
+            )
+            rows = collect_guardian_findings(work)
+            self.assertEqual(rows, [])
+            titles = [row["title"] for row in collect_all(work)]
+            for key in _CHAIN_KEYS:
+                self.assertNotIn("[%s] failed chain cell" % key, titles)
+            self.assertEqual(actionable(collect_all(work)), [])
+
+    def test_null_ok_with_note_is_na_not_unjudged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            risk = {
+                "title": "slash still taught as legal",
+                "evidence": "error names slash",
+                "path": "README",
+                "link": "t_to_i",
+            }
+            chain = _chain("t_to_i", "i_to_r")
+            chain["a_to_t"] = {"ok": None, "note": "n/a — no test-contract.md"}
+            _write_guardian(work, risks=[risk], chain=chain)
+            rows = collect_guardian_findings(work)
+            self.assertTrue(rows, "n/a cells must not drop I→R / explicit risks")
+            self.assertTrue(
+                any("slash still taught as legal" in row["title"] for row in rows)
+            )
+            self.assertTrue(
+                any("i_to_r" in row["title"] and row["kind"] == "implementation" for row in rows)
+            )
+
+    def test_missing_ok_or_empty_na_note_suppresses_all_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            risk = {
+                "title": "slash still taught as legal",
+                "evidence": "error names slash",
+                "path": "README",
+                "link": "t_to_i",
+            }
+            chain = _chain("t_to_i")
+            chain["r_to_a"] = {"note": "ok omitted"}
+            _write_guardian(work, risks=[risk], chain=chain)
+            self.assertEqual(collect_guardian_findings(work), [])
+
+            chain = _chain("t_to_i")
+            chain["a_to_t"] = {"ok": None, "note": "   "}
+            _write_guardian(work, risks=[risk], chain=chain)
+            self.assertEqual(collect_guardian_findings(work), [])
+
+    def test_invoke_and_collect_share_unfinished_predicate(self):
+        """On-disk turn field is the apply seam. Phrase denylist is not this law."""
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            (work / "prompts").mkdir()
+            finished_chain = _chain(*_CHAIN_KEYS)
+            _write_guardian(work, risks=[], chain=finished_chain, finished=True, num_turns=2)
+            finished_rows = collect_guardian_findings(work)
+            self.assertEqual(len(finished_rows), 4, finished_rows)
+
+            payload = load_json(work / "prompts" / "guardian.result.json")
+            payload.pop("num_turns", None)
+            meta = dict(payload.get("_meta") or {})
+            meta.pop("num_turns", None)
+            payload["_meta"] = meta
+            dump_json(work / "prompts" / "guardian.result.json", payload)
+            self.assertEqual(
+                collect_guardian_findings(work),
+                [],
+                "missing turns still suppress synthetics on an empty-risk artifact",
+            )
+
+
+class FindingIdentityTests(unittest.TestCase):
+    """Collect, seq id, and related_guardian share one identity.
+
+    Dedupe of the same (path, title) alone is not this property.
+    """
+
+    def test_evidence_distinct_rows_stay_two_seq_classes(self):
+        first = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "leak",
+            "path": "src/a.py",
+            "evidence": "missing guard",
+            "source": "reviewer-fake",
+        }
+        second = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "leak",
+            "path": "src/a.py",
+            "evidence": "null deref",
+            "source": "reviewer-fake",
+        }
+        self.assertNotEqual(finding_id(first), finding_id(second))
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            prompts = work / "prompts"
+            prompts.mkdir()
+            dump_json(
+                prompts / "reviewer-fake.result.json",
+                {"findings": [first, second]},
+            )
+            found = collect_review_findings(work)
+            titles = [(row["title"], row.get("evidence")) for row in found]
+            self.assertEqual(len(found), 2, titles)
+            ids = {finding_id(row) for row in found}
+            self.assertEqual(ids, {finding_id(first), finding_id(second)})
+            seq = mark_seq_step(
+                empty_seq_state(),
+                _with_id(first),
+                status="applied",
+            )
+            cands = _candidate_ids(found, seq)
+            self.assertNotIn(finding_id(first), cands)
+            self.assertIn(finding_id(second), cands)
+            self.assertNotIn(finding_id(second), seq["applied"])
+
+    def test_path_spellings_are_one_finding_and_one_related_path(self):
+        dotted = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "Leak",
+            "path": "./src/a.py",
+            "evidence": "same hole",
+            "source": "reviewer-claude",
+        }
+        plain = {
+            "kind": "implementation",
+            "severity": "high",
+            "title": "leak",
+            "path": "src/a.py",
+            "evidence": "same hole",
+            "source": "reviewer-grok",
+        }
+        self.assertEqual(finding_id(dotted), finding_id(plain))
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            prompts = work / "prompts"
+            prompts.mkdir()
+            dump_json(prompts / "reviewer-claude.result.json", {"findings": [dotted]})
+            dump_json(prompts / "reviewer-grok.result.json", {"findings": [plain]})
+            found = collect_review_findings(work)
+            self.assertEqual(len(found), 1, found)
+            self.assertEqual(finding_id(found[0]), finding_id(plain))
+        review = {
+            "path": "./src/a.py",
+            "title": "x",
+            "kind": "test",
+            "source": "reviewer-fake",
+        }
+        guardian = {
+            "path": "src/a.py",
+            "title": "[t_to_i] same hole",
+            "kind": "implementation",
+            "source": "guardian",
+            "evidence": "e",
+        }
+        related = related_guardian(review, [guardian])
+        self.assertEqual([row["title"] for row in related], ["[t_to_i] same hole"])
+        self.assertEqual(
+            related_guardian({"path": "src/a.py", "title": "x"}, [guardian]),
+            related,
+        )
 
 
 if __name__ == "__main__":

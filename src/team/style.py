@@ -102,6 +102,17 @@ def path(text: str, *, enabled: Optional[bool] = None) -> str:
     return paint(text, DIM, CYAN, enabled=enabled)
 
 
+def tokens(text: str, *, enabled: Optional[bool] = None) -> str:
+    return paint(text, CYAN, enabled=enabled)
+
+
+def usd(text: str, *, complete: bool = True, enabled: Optional[bool] = None) -> str:
+    """Known complete $ is green. Missing or partial $ is yellow, never quiet."""
+    if not complete:
+        return paint(text, YELLOW, enabled=enabled)
+    return paint(text, BRIGHT_GREEN, enabled=enabled)
+
+
 def severity(text: str, *, enabled: Optional[bool] = None) -> str:
     key = (text or "").strip().lower()
     return paint(text, *_SEVERITY.get(key, ()), enabled=enabled)

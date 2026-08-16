@@ -47,6 +47,9 @@ class StyleTests(unittest.TestCase):
         self.assertEqual(len(style.strip_ansi(cell)), 10)
         self.assertEqual(style.tag_pair("high", "test", enabled=False), "high/test")
         self.assertEqual(style.tag_pair("?", "", enabled=False), "?")
+        self.assertIn(style.BRIGHT_GREEN, style.usd("$1.50", complete=True, enabled=True))
+        self.assertIn(style.YELLOW, style.usd("$ unknown", complete=False, enabled=True))
+        self.assertIn(style.CYAN, style.tokens("7.2k in", enabled=True))
 
 
 if __name__ == "__main__":

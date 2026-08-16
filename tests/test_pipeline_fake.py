@@ -4,10 +4,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from team.cli import main
+from team.runners import FakeRuntime
 from team.state import State
 
 
@@ -50,6 +52,7 @@ class FakePipelineTests(unittest.TestCase):
         work = self.repo / ".team" / "work" / "add-greet-helper"
         for name in (
             "brief.md",
+            "census.md",
             "design.md",
             "critic.md",
             "test-contract.md",
@@ -57,8 +60,6 @@ class FakePipelineTests(unittest.TestCase):
             "impl-summary.md",
             "baseline-report.md",
             "test-report.md",
-            "review.md",
-            "guardian.md",
             "adversarial.md",
             "state.json",
         ):
@@ -68,17 +69,32 @@ class FakePipelineTests(unittest.TestCase):
         self.assertTrue((self.repo / "tests" / "test_adversarial.py").is_file())
         self.assertTrue((work / "followups.md").is_file())
         self.assertTrue((work / "adversarial-test-report.md").is_file())
+        self.assertFalse((work / "review.md").is_file())
+        self.assertFalse((work / "guardian.md").is_file())
         state = State.load(work)
         self.assertEqual(state.stop_reason, "complete")
         self.assertIn("architect", state.phases_done)
         self.assertIn("implementer", state.phases_done)
-        self.assertIn("reviewer", state.phases_done)
         self.assertIn("adversarial", state.phases_done)
+        self.assertNotIn("reviewer", state.phases_done)
+        self.assertNotIn("guardian", state.phases_done)
         self.assertEqual(state.assignment["reviewer"], "both")
         self.assertIn("debugger", state.skipped)
         self.assertIn("repair", state.skipped)
-        review = (work / "review.md").read_text(encoding="utf-8")
-        self.assertIn("# Review", review)
+
+        rc = self._run(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "review",
+                "add-greet-helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        self.assertTrue((work / "review.md").is_file())
+        self.assertTrue((work / "guardian.md").is_file())
+        self.assertIn("reviewer", State.load(work).phases_done)
 
     def test_dry_run_writes_no_tests(self):
         rc = self._run(
@@ -142,12 +158,21 @@ class FakePipelineTests(unittest.TestCase):
                 "Add greet helper",
             ]
         )
+        self.assertEqual(
+            self._run(
+                ["--repo", str(self.repo), "--fake", "review", "add-greet-helper"]
+            ),
+            0,
+        )
         rc = self._run(["--repo", str(self.repo), "--fake", "replan", "add-greet-helper"])
         self.assertEqual(rc, 0)
-        text = (
-            self.repo / ".team" / "work" / "add-greet-helper" / "design-replan.md"
-        ).read_text(encoding="utf-8")
+        work = self.repo / ".team" / "work" / "add-greet-helper"
+        text = (work / "design-replan.md").read_text(encoding="utf-8")
+        living = (work / "design.md").read_text(encoding="utf-8")
         self.assertIn("Unchanged assumptions", text)
+        # team replan alone does not replace living design.md.
+        self.assertIn("no network", living)
+        self.assertNotIn("no network", text)
 
     def test_status_and_roles(self):
         self._run(
@@ -252,6 +277,12 @@ class FakePipelineTests(unittest.TestCase):
                 "Add greet helper",
             ]
         )
+        self.assertEqual(
+            self._run(
+                ["--repo", str(self.repo), "--fake", "review", "add-greet-helper"]
+            ),
+            0,
+        )
         rc = self._run(
             [
                 "--repo",
@@ -267,7 +298,11 @@ class FakePipelineTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         work = self.repo / ".team" / "work" / "add-greet-helper"
         design = (work / "design.md").read_text(encoding="utf-8")
+        delta = (work / "design-replan.md").read_text(encoding="utf-8")
         self.assertIn("Unchanged assumptions", design)
+        self.assertIn("no network", design)
+        self.assertNotIn("no network", delta)
+        self.assertNotEqual(design, delta)
 
     def test_refuse_without_force(self):
         argv = [
@@ -280,6 +315,61 @@ class FakePipelineTests(unittest.TestCase):
         ]
         self.assertEqual(self._run(argv), 0)
         self.assertEqual(self._run(argv), 1)
+
+    def test_every_hop_is_a_fresh_session(self):
+        calls = []
+        orig = FakeRuntime.complete
+
+        def spy(self, **kwargs):
+            calls.append(
+                {
+                    "phase": kwargs.get("phase"),
+                    "session_id": kwargs.get("session_id"),
+                    "resume": kwargs.get("resume"),
+                }
+            )
+            return orig(self, **kwargs)
+
+        with mock.patch.object(FakeRuntime, "complete", spy):
+            rc = self._run(
+                [
+                    "--repo",
+                    str(self.repo),
+                    "--fake",
+                    "--test-command",
+                    "true",
+                    "feature",
+                    "--force",
+                    "Add greet helper",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        self.assertGreater(len(calls), 1, calls)
+        self.assertTrue(all(c["resume"] is False for c in calls), calls)
+        sids = [c["session_id"] for c in calls]
+        self.assertTrue(all(sids), sids)
+        self.assertEqual(len(sids), len(set(sids)), sids)
+
+    def test_design_md_is_listed_not_inlined(self):
+        rc = self._run(
+            [
+                "--repo",
+                str(self.repo),
+                "--fake",
+                "--test-command",
+                "true",
+                "feature",
+                "--force",
+                "Add greet helper",
+            ]
+        )
+        self.assertEqual(rc, 0)
+        work = self.repo / ".team" / "work" / "add-greet-helper"
+        design = (work / "design.md").read_text(encoding="utf-8")
+        self.assertTrue(design.strip())
+        critic = (work / "prompts" / "critic.prompt.md").read_text(encoding="utf-8")
+        self.assertIn("design.md", critic)
+        self.assertNotIn(design, critic)
 
 
 if __name__ == "__main__":

@@ -10,12 +10,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from team.cli import main
 from team.config import (
+    CODING_RUNTIMES,
     ROLES,
+    WRITE_CAPABILITIES,
     apply_range_reviewer,
     collect_config_edits,
+    expand_reviewer,
+    is_model_runtime,
     load_config,
+    may_write,
+    normalize_effort,
     parse_simple_toml,
     resolve_config_key,
+    role_accepts_runtime,
     seed_config_text,
     update_simple_toml,
 )
@@ -78,6 +85,149 @@ class LoadConfigTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 load_config(Path(tmp), assign=["tester=both"])
 
+    def test_only_write_capabilities_may_write(self):
+        used = {
+            spec["capability"]
+            for spec in ROLES.values()
+            if may_write(spec["capability"])
+        }
+        self.assertEqual(used, set(WRITE_CAPABILITIES))
+        self.assertFalse(may_write("read-only"))
+        self.assertFalse(may_write("execute"))
+        self.assertFalse(may_write("future-inspect"))
+        self.assertFalse(may_write(""))
+        self.assertTrue(may_write("write-tests"))
+        self.assertTrue(may_write("write-code"))
+
+    def test_coding_roles_accept_every_shipped_adapter(self):
+        for role, spec in ROLES.items():
+            allowed = set(spec["runtimes"]) - {"both", "host"}
+            self.assertEqual(
+                allowed,
+                set(CODING_RUNTIMES),
+                "%s must accept every shipped coding runtime, got %s"
+                % (role, spec["runtimes"]),
+            )
+            for runtime in CODING_RUNTIMES:
+                self.assertTrue(role_accepts_runtime(role, runtime), (role, runtime))
+
+    def test_expand_reviewer_is_the_both_list(self):
+        self.assertEqual(expand_reviewer("both"), list(CODING_RUNTIMES))
+        self.assertEqual(expand_reviewer("claude"), ["claude"])
+        self.assertEqual(expand_reviewer("grok"), ["grok"])
+        self.assertEqual(expand_reviewer(""), [])
+
+    def test_host_is_not_a_model_runtime(self):
+        self.assertFalse(is_model_runtime("host"))
+        self.assertFalse(is_model_runtime("both"))
+        self.assertTrue(is_model_runtime("claude"))
+        self.assertTrue(is_model_runtime("grok"))
+        self.assertTrue(is_model_runtime("fake"))
+
+    def test_registered_adapter_is_assignable_like_the_shipped_pair(self):
+        from team.runners import FakeRuntime, register, unregister
+
+        register("codex", FakeRuntime)
+        try:
+            self.assertTrue(is_model_runtime("codex"))
+            self.assertTrue(role_accepts_runtime("architect", "codex"))
+            self.assertTrue(role_accepts_runtime("implementer", "codex"))
+            self.assertTrue(role_accepts_runtime("reviewer", "codex"))
+            self.assertFalse(role_accepts_runtime("tester", "both"))
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg = load_config(
+                    Path(tmp),
+                    assign=["architect=codex", "implementer=codex", "reviewer=codex"],
+                )
+                self.assertEqual(cfg.assignment("architect"), "codex")
+                self.assertEqual(cfg.assignment("implementer"), "codex")
+                self.assertEqual(cfg.assignment("reviewer"), "codex")
+                self.assertEqual(expand_reviewer(cfg.assignment("reviewer")), ["codex"])
+                cfg = load_config(Path(tmp), assign=["all=codex"])
+                self.assertEqual(cfg.assignment("architect"), "codex")
+                self.assertEqual(cfg.assignment("implementer"), "codex")
+                self.assertEqual(cfg.assignment("tester"), "codex")
+                self.assertEqual(cfg.assignment("reviewer"), "codex")
+        finally:
+            unregister("codex")
+
+    def test_unregistered_adapter_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), assign=["architect=codex"])
+        self.assertFalse(role_accepts_runtime("architect", "codex"))
+
+    def test_pipeline_does_not_name_the_shipped_pair(self):
+        src = (
+            Path(__file__).resolve().parents[1] / "src" / "team" / "pipeline.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn('["claude", "grok"]', src)
+        self.assertNotIn("['claude', 'grok']", src)
+        self.assertIn("expand_reviewer", src)
+
+    def test_assign_rejects_grokxhigh_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), assign=["architect=grokxhigh"])
+
+    def test_effort_from_toml_and_cli_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".team").mkdir()
+            (repo / ".team" / "config.toml").write_text(
+                '[effort]\narchitect = "xhigh"\n',
+                encoding="utf-8",
+            )
+            # Legacy names still load; they are stored as neutral levels.
+            cfg = load_config(repo)
+            self.assertEqual(cfg.effort["architect"], 4)
+            self.assertEqual(cfg.effort_for("architect"), 4)
+            self.assertEqual(cfg.effort_for("critic"), 3)
+            self.assertIsNone(cfg.effort_for("implementer"))
+            cfg = load_config(repo, effort=["implementer=2", "all=3"])
+            self.assertEqual(cfg.effort_for("architect"), 3)
+            self.assertEqual(cfg.effort_for("implementer"), 3)
+            cfg = load_config(repo, effort=["all=3", "implementer=2"])
+            self.assertEqual(cfg.effort_for("architect"), 3)
+            self.assertEqual(cfg.effort_for("implementer"), 2)
+            self.assertEqual(cfg.roles["architect"], "claude")
+            # Names and integers are the same setting, not two settings.
+            self.assertEqual(
+                load_config(repo, effort=["all=high"]).effort_for("architect"),
+                load_config(repo, effort=["all=3"]).effort_for("architect"),
+            )
+
+    def test_effort_integer_scale_covers_both_ends(self):
+        """0 is a real level, not "unset", and 5 is accepted even where a
+        runtime has no fifth rung -- runners snap it, config keeps it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            cfg = load_config(repo, effort=["all=0"])
+            self.assertEqual(cfg.effort_for("architect"), 0)
+            self.assertIsNotNone(cfg.effort_for("implementer"))
+            cfg = load_config(repo, effort=["all=5"])
+            self.assertEqual(cfg.effort_for("architect"), 5)
+            self.assertEqual(cfg.effort_for("architect"), normalize_effort("max"))
+
+    def test_effort_rejects_unknown_level_and_role(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), effort=["architect=ludicrous"])
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), effort=["not-a-role=xhigh"])
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), effort=["xhigh"])
+            # Out of the neutral range, on both ends.
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), effort=["architect=6"])
+            with self.assertRaises(SystemExit):
+                load_config(Path(tmp), effort=["architect=-1"])
+            # "max" is a real rung now (Claude has one); it must not be rejected.
+            self.assertEqual(
+                load_config(Path(tmp), effort=["architect=max"]).effort_for("architect"),
+                5,
+            )
+
     def test_project_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -114,16 +264,41 @@ class LoadConfigTests(unittest.TestCase):
             cfg = load_config(Path(tmp))
             apply_range_reviewer(cfg, pr=False, reviewer="claude")
             self.assertEqual(cfg.roles["reviewer"], "claude")
+            cfg = load_config(Path(tmp))
+            apply_range_reviewer(cfg, pr=False, reviewer="both")
+            self.assertEqual(cfg.roles["reviewer"], "both")
+            cfg = load_config(Path(tmp), assign=["reviewer=both"])
+            apply_range_reviewer(cfg, pr=False)
+            self.assertEqual(cfg.roles["reviewer"], "both")
 
-    def test_range_reviewer_rejects_both(self):
+    def test_range_reviewer_accepts_both(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / ".team").mkdir()
             (repo / ".team" / "config.toml").write_text(
                 '[review]\nrange_reviewer = "both"\n', encoding="utf-8"
             )
+            cfg = load_config(repo)
+            self.assertEqual(cfg.range_reviewer, "both")
+            apply_range_reviewer(cfg, pr=False)
+            self.assertEqual(cfg.roles["reviewer"], "both")
+
+    def test_range_reviewer_rejects_host(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / ".team").mkdir()
+            (repo / ".team" / "config.toml").write_text(
+                '[review]\nrange_reviewer = "host"\n', encoding="utf-8"
+            )
             with self.assertRaises(SystemExit):
                 load_config(repo)
+
+    def test_assign_all_both_sets_range_reviewer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = load_config(Path(tmp), assign=["all=both"])
+            self.assertEqual(cfg.roles["reviewer"], "both")
+            self.assertEqual(cfg.range_reviewer, "both")
+            self.assertEqual(cfg.roles["implementer"], "grok")
 
 
 class ConfigKeyTests(unittest.TestCase):
@@ -151,10 +326,39 @@ class ConfigKeyTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             collect_config_edits(assign=["tester=both"])
 
+    def test_collect_range_reviewer_both(self):
+        updates, deletes = collect_config_edits(range_reviewer="both")
+        self.assertEqual(deletes, [])
+        self.assertEqual(updates, [("review", "range_reviewer", "both")])
+        updates, deletes = collect_config_edits(assign=["all=both"])
+        self.assertIn(("review", "range_reviewer", "both"), updates)
+        with self.assertRaises(SystemExit):
+            collect_config_edits(range_reviewer="host")
+
     def test_collect_unset_role_deletes(self):
         updates, deletes = collect_config_edits(unsets=["architect"])
         self.assertEqual(updates, [])
         self.assertEqual(deletes, [("roles", "architect")])
+
+    def test_effort_config_key_and_collect(self):
+        self.assertEqual(
+            resolve_config_key("effort.architect"),
+            ("effort", "architect", "effort"),
+        )
+        updates, deletes = collect_config_edits(effort=["architect=xhigh"])
+        self.assertEqual(deletes, [])
+        self.assertEqual(updates, [("effort", "architect", 4)])
+        updates, deletes = collect_config_edits(effort=["all=low"])
+        self.assertEqual(deletes, [])
+        self.assertTrue(all(section == "effort" for section, _key, _val in updates))
+        self.assertEqual(len(updates), len(ROLES))
+        updates, deletes = collect_config_edits(unsets=["effort.reviewer"])
+        self.assertEqual(updates, [])
+        self.assertEqual(deletes, [("effort", "reviewer")])
+        with self.assertRaises(SystemExit):
+            collect_config_edits(effort=["architect=ludicrous"])
+        with self.assertRaises(SystemExit):
+            collect_config_edits(effort=["architect=6"])
 
 
 class TomlUpdateTests(unittest.TestCase):
@@ -191,6 +395,7 @@ class TomlUpdateTests(unittest.TestCase):
         text = seed_config_text()
         self.assertIn("code_root", text)
         self.assertIn("[roles]", text)
+        self.assertIn("[effort]", text)
 
 
 class ConfigCommandTests(unittest.TestCase):
@@ -295,6 +500,55 @@ class ConfigCommandTests(unittest.TestCase):
         self.assertEqual(cfg.test_command, "make test")
         self.assertEqual(cfg.phase_timeout, 60)
         self.assertEqual(cfg.range_reviewer, "claude")
+
+    def test_range_reviewer_flag_both(self):
+        rc, out, err = self._run(
+            [
+                "--repo",
+                str(self.repo),
+                "config",
+                "--range-reviewer",
+                "both",
+            ]
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("set review.range_reviewer", out)
+        cfg = load_config(self.repo)
+        self.assertEqual(cfg.range_reviewer, "both")
+
+    def test_writes_effort_and_load_config_sees_it(self):
+        rc, out, err = self._run(
+            [
+                "--repo",
+                str(self.repo),
+                "config",
+                "--effort",
+                "architect=xhigh",
+                "effort.implementer=low",
+            ]
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertIn("set effort.architect", out)
+        self.assertIn("set effort.implementer", out)
+        dest = self.repo / ".team" / "config.toml"
+        body = dest.read_text(encoding="utf-8")
+        self.assertIn("[effort]", body)
+        # Written as the neutral level, whichever spelling was typed.
+        self.assertIn("architect = 4", body)
+        self.assertIn("implementer = 1", body)
+        cfg = load_config(self.repo)
+        self.assertEqual(cfg.effort_for("architect"), 4)
+        self.assertEqual(cfg.effort_for("implementer"), 1)
+        rc, out, err = self._run(
+            ["--repo", str(self.repo), "config", "--unset", "effort.architect"]
+        )
+        self.assertEqual(rc, 0, err)
+        parsed = parse_simple_toml(dest.read_text(encoding="utf-8"))
+        self.assertNotIn("architect", parsed.get("effort") or {})
+        self.assertEqual((parsed.get("effort") or {}).get("implementer"), 1)
+        cfg = load_config(self.repo)
+        self.assertEqual(cfg.effort_for("architect"), 3)
+        self.assertEqual(cfg.effort_for("implementer"), 1)
 
     def test_unset_path_and_role(self):
         dest = self.repo / ".team"

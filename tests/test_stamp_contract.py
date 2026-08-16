@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import tempfile
@@ -17,9 +18,27 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from team.cli import main
-from team.gitutil import last_dedicated_tag, list_reviewed_tags
+from team.gitutil import last_dedicated_tag, list_reviewed_tags, paths_from_diff
 from tests.support.hostile import HostileRuntime, emit, register_runtime
 from tests.support.repo import git, head_sha, init_repo
+
+
+def _log_shas(text: str) -> list:
+    shas = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("("):
+            continue
+        shas.append(line.split()[0])
+    return shas
+
+
+def _range_md_commits(text: str) -> int:
+    for line in text.splitlines():
+        stripped = line.strip().lstrip("- ").strip()
+        if stripped.startswith("commits:"):
+            return int(stripped.split(":", 1)[1].strip())
+    raise AssertionError("range.md has no commits: line\n%s" % text)
 
 
 def _tag_type(repo: Path, tag: str) -> str:
@@ -55,6 +74,75 @@ class StampContractTests(unittest.TestCase):
         bindir = Path(self.tmp.name) / "nogh"
         bindir.mkdir(exist_ok=True)
         return str(bindir) + ":/usr/bin:/bin"
+
+    def _pr_work(self, pr: str) -> Path:
+        return self.repo / ".team" / "work" / ("review-pr-%s" % pr)
+
+    def _repo_commits(self) -> list:
+        return git(self.repo, "rev-list", "--reverse", "HEAD").strip().splitlines()
+
+    def _view_json(self, oids=None, headlines=None) -> str:
+        commits = []
+        for i, oid in enumerate(oids or self._repo_commits()):
+            msg = "c%d" % i
+            if headlines and i < len(headlines):
+                msg = headlines[i]
+            commits.append({"oid": oid, "messageHeadline": msg})
+        return json.dumps({"title": "x", "commits": commits}, separators=(",", ":"))
+
+    def _install_gh_pr(self, *, head_oid: str, diff: str, view_json: str) -> Path:
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir(exist_ok=True)
+        (bindir / "head.json").write_text(
+            json.dumps({"headRefOid": head_oid}), encoding="utf-8"
+        )
+        (bindir / "pr.diff").write_text(diff, encoding="utf-8")
+        (bindir / "view.json").write_text(view_json, encoding="utf-8")
+        gh = bindir / "gh"
+        gh.write_text(
+            "#!/bin/sh\n"
+            'echo "$*" | grep -q headRefOid && cat "%s" && exit 0\n'
+            'echo "$*" | grep -q "pr diff" && cat "%s" && exit 0\n'
+            'echo "$*" | grep -q "pr view" && cat "%s" && exit 0\n'
+            "exit 1\n"
+            % (bindir / "head.json", bindir / "pr.diff", bindir / "view.json"),
+            encoding="utf-8",
+        )
+        gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
+        return bindir
+
+    def _assert_log_is_oneline_commits(self, log: str, oids=None) -> list:
+        stripped = (log or "").strip()
+        self.assertTrue(stripped, "git/log.txt must be a commit list")
+        self.assertFalse(stripped.startswith("{"), log)
+        self.assertFalse(stripped.startswith("["), log)
+        first = stripped.splitlines()[0]
+        self.assertNotIn('"commits"', first, log)
+        listed = _log_shas(log)
+        self.assertTrue(listed, log)
+        if oids is not None:
+            self.assertEqual(len(listed), len(oids), log)
+            for sha, oid in zip(listed, oids):
+                self.assertTrue(
+                    oid.startswith(sha) or sha.startswith(oid[:7]),
+                    "log sha %s is not PR commit %s" % (sha, oid),
+                )
+        return listed
+
+    def _assert_pr_collect_is_commit_set(self, pr: str, *, oids, diff: str) -> None:
+        work = self._pr_work(pr)
+        log = (work / "git" / "log.txt").read_text(encoding="utf-8")
+        patch = (work / "git" / "diff.patch").read_text(encoding="utf-8")
+        names = [
+            p
+            for p in (work / "git" / "names.txt").read_text(encoding="utf-8").splitlines()
+            if p.strip()
+        ]
+        range_md = (work / "range.md").read_text(encoding="utf-8")
+        listed = self._assert_log_is_oneline_commits(log, oids)
+        self.assertEqual(names, paths_from_diff(diff))
+        self.assertEqual(names, paths_from_diff(patch))
+        self.assertEqual(_range_md_commits(range_md), len(listed))
 
     def test_successful_stamp_is_annotated_at_head_with_evidence(self):
         head = head_sha(self.repo)
@@ -175,6 +263,8 @@ class StampContractTests(unittest.TestCase):
             "merge-base" in range_md or "branch-fallback" in range_md or "fallback" in range_md,
             range_md,
         )
+        log = (self._pr_work("12") / "git" / "log.txt").read_text(encoding="utf-8")
+        self._assert_log_is_oneline_commits(log)
 
     def test_pr_stamp_refused_when_gh_exits_nonzero(self):
         bindir = self._install_gh("exit 1")
@@ -187,13 +277,16 @@ class StampContractTests(unittest.TestCase):
             )
         self.assertEqual(rc, 0)
         self.assertEqual(last_dedicated_tag(self.repo), "")
+        log = (self._pr_work("4") / "git" / "log.txt").read_text(encoding="utf-8")
+        self._assert_log_is_oneline_commits(log)
 
     def test_pr_stamp_refused_when_head_is_not_pr_head(self):
-        bindir = self._install_gh(
-            'echo "$*" | grep -q headRefOid && echo \'{"headRefOid":"0000000000000000000000000000000000000000"}\' && exit 0\n'
-            'echo "$*" | grep -q "pr diff" && echo "diff --git a/README b/README" && exit 0\n'
-            'echo "$*" | grep -q "pr view" && echo \'{"title":"x","commits":[]}\' && exit 0\n'
-            "exit 1"
+        oids = self._repo_commits()
+        diff = "diff --git a/README b/README\n+++ b/README\n+one\n"
+        bindir = self._install_gh_pr(
+            head_oid="0000000000000000000000000000000000000000",
+            diff=diff,
+            view_json=self._view_json(oids, headlines=["first"]),
         )
         env = os.environ.copy()
         env["PATH"] = self._path_with(bindir)
@@ -204,14 +297,16 @@ class StampContractTests(unittest.TestCase):
             )
         self.assertEqual(rc, 0)
         self.assertEqual(last_dedicated_tag(self.repo), "")
+        self._assert_pr_collect_is_commit_set("9", oids=oids, diff=diff)
 
     def test_pr_stamp_matching_head_creates_annotated_tag(self):
         head = head_sha(self.repo)
-        bindir = self._install_gh(
-            'echo "$*" | grep -q headRefOid && echo \'{"headRefOid":"%s"}\' && exit 0\n'
-            'echo "$*" | grep -q "pr diff" && echo "diff --git a/README b/README\\n+++ b/README\\n+one" && exit 0\n'
-            'echo "$*" | grep -q "pr view" && echo \'{"title":"x","commits":[]}\' && exit 0\n'
-            "exit 1" % head
+        oids = self._repo_commits()
+        diff = "diff --git a/README b/README\n+++ b/README\n+one\n"
+        bindir = self._install_gh_pr(
+            head_oid=head,
+            diff=diff,
+            view_json=self._view_json(oids, headlines=["first"]),
         )
         env = os.environ.copy()
         env["PATH"] = self._path_with(bindir)
@@ -225,6 +320,56 @@ class StampContractTests(unittest.TestCase):
         self.assertTrue(tag.startswith("reviewed-"), tag)
         self.assertEqual(_tag_type(self.repo, tag), "tag")
         self.assertEqual(git(self.repo, "rev-list", "-n", "1", tag).strip(), head)
+        self._assert_pr_collect_is_commit_set("7", oids=oids, diff=diff)
+
+    def test_pr_collect_log_is_oneline_not_gh_json(self):
+        """Stamp/tag success is not PR membership. log.txt must be the commit set."""
+        head = head_sha(self.repo)
+        oids = self._repo_commits()
+        self.assertTrue(oids)
+        view = self._view_json(oids, headlines=["first"])
+        self.assertNotIn("\n", view)
+        self.assertTrue(view.startswith("{"))
+        diff = "diff --git a/README b/README\n+++ b/README\n+one\n"
+        bindir = self._install_gh_pr(head_oid=head, diff=diff, view_json=view)
+        env = os.environ.copy()
+        env["PATH"] = self._path_with(bindir)
+        env["TEAM_HOME"] = str(ROOT)
+        with mock.patch.dict(os.environ, env, clear=True):
+            rc = main(
+                ["--repo", str(self.repo), "--fake", "review", "--pr", "3", "--force"]
+            )
+        self.assertEqual(rc, 0)
+        work = self._pr_work("3")
+        log = (work / "git" / "log.txt").read_text(encoding="utf-8")
+        self.assertNotEqual(log.strip(), view)
+        self._assert_pr_collect_is_commit_set("3", oids=oids, diff=diff)
+
+    def test_pr_empty_commits_array_is_not_how_gh_json_log(self):
+        """commits:[] + a real gh diff must not publish JSON (or empty) as log."""
+        head = head_sha(self.repo)
+        empty = json.dumps({"title": "x", "commits": []}, separators=(",", ":"))
+        diff = "diff --git a/README b/README\n+++ b/README\n+one\n"
+        bindir = self._install_gh_pr(head_oid=head, diff=diff, view_json=empty)
+        env = os.environ.copy()
+        env["PATH"] = self._path_with(bindir)
+        env["TEAM_HOME"] = str(ROOT)
+        with mock.patch.dict(os.environ, env, clear=True):
+            rc = main(
+                ["--repo", str(self.repo), "--fake", "review", "--pr", "8", "--force"]
+            )
+        self.assertEqual(rc, 0)
+        work = self._pr_work("8")
+        log = (work / "git" / "log.txt").read_text(encoding="utf-8")
+        self._assert_log_is_oneline_commits(log)
+        names = [
+            p
+            for p in (work / "git" / "names.txt").read_text(encoding="utf-8").splitlines()
+            if p.strip()
+        ]
+        patch = (work / "git" / "diff.patch").read_text(encoding="utf-8")
+        self.assertEqual(names, paths_from_diff(patch))
+        self.assertTrue(names, "PR names.txt must come from the collected patch")
 
 
 if __name__ == "__main__":

@@ -1,17 +1,42 @@
 {
   "type": "object",
-  "required": ["owner", "diagnosis_markdown"],
+  "required": [
+    "owner",
+    "diagnosis_markdown"
+  ],
   "properties": {
-    "owner": { "type": "string" },
-    "diagnosis_markdown": { "type": "string" },
-    "root_cause": { "type": "string" },
+    "owner": {
+      "type": "string",
+      "enum": [
+        "implementer",
+        "test-writer",
+        "architect",
+        "unknown"
+      ],
+      "description": "Who owns the fix. Closed set; only implementer|test-writer can auto-repair."
+    },
+    "diagnosis_markdown": {
+      "type": "string"
+    },
+    "root_cause": {
+      "type": "string"
+    },
     "disposition": {
       "type": "string",
-      "description": "retry | skip | reopen. Suggestion only; orchestrator does not execute reopen."
+      "description": "retry | skip | reopen. Suggestion only; orchestrator does not execute reopen.",
+      "enum": [
+        "retry",
+        "skip",
+        "reopen"
+      ]
     },
     "reopen_id": {
       "type": "string",
       "description": "Earlier applied class id when disposition is reopen."
+    },
+    "census_markdown": {
+      "type": "string",
+      "description": "Tree inventory if census.md is still missing. Do not recensus when it exists."
     }
   }
 }
