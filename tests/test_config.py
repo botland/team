@@ -391,6 +391,65 @@ class TomlUpdateTests(unittest.TestCase):
         self.assertIn("[run]", out)
         self.assertIn('skip = ["critic"]', out)
 
+    def test_written_values_read_back_unchanged(self):
+        """The seam: the writer is hand-rolled, the reader is tomllib.
+
+        Fails if either side moves alone. A ``#`` inside a quoted value was
+        the instance -- team config wrote a test_command the loader then
+        truncated, and testhost ran the truncated string with shell=True.
+        """
+        values = [
+            'pytest -k "not slow" -m "a#b"',
+            "# leading hash",
+            "trailing hash #",
+            "back\\slash",
+            'quote " and \\" escaped',
+            "tab\there",
+            "line\nbreak",
+            "unicode café ☕",
+            "equals = sign",
+            "bracket [not a section]",
+            "",
+            "   spaced   ",
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                text = update_simple_toml("", [("paths", "test_command", value)])
+                self.assertEqual(
+                    parse_simple_toml(text)["paths"]["test_command"], value
+                )
+        text = update_simple_toml(
+            "",
+            [
+                ("run", "skip", ["critic", "a#b", 'q"uote']),
+                ("run", "phase_timeout", 900),
+                ("default", "top_level", True),
+            ],
+        )
+        data = parse_simple_toml(text)
+        self.assertEqual(data["run"]["skip"], ["critic", "a#b", 'q"uote'])
+        self.assertEqual(data["run"]["phase_timeout"], 900)
+        self.assertEqual(data["default"]["top_level"], True)
+
+    def test_config_command_round_trips_a_hash_in_the_test_command(self):
+        cmd = 'pytest -k "not slow" -m "a#b"'
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            rc = main(["--repo", str(repo), "config", "--test-command", cmd])
+            self.assertEqual(rc, 0)
+            cfg = load_config(repo)
+            self.assertEqual(cfg.test_command, cmd)
+
+    def test_unreadable_config_file_stops_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            path = repo / ".team" / "config.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text('[paths]\ntest_command = "unterminated\n', encoding="utf-8")
+            with self.assertRaises(SystemExit) as ctx:
+                load_config(repo)
+            self.assertIn("config.toml", str(ctx.exception))
+
     def test_seed_example_has_path_keys(self):
         text = seed_config_text()
         self.assertIn("code_root", text)

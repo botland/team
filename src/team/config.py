@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import tomllib
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -288,7 +289,7 @@ def load_config(
     ]
     for path in files:
         if path.is_file():
-            _apply_toml(cfg, parse_simple_toml(path.read_text(encoding="utf-8")))
+            _apply_toml(cfg, read_config_file(path))
 
     if code_root:
         cfg.code_root = normalize_root(code_root)
@@ -322,6 +323,14 @@ def load_config(
         cfg.phase_timeout = int(timeout)
 
     return cfg
+
+
+def read_config_file(path: Path) -> Dict[str, Dict[str, Any]]:
+    """parse_simple_toml with the file named. An unreadable config stops the run."""
+    try:
+        return parse_simple_toml(path.read_text(encoding="utf-8"))
+    except TomlError as exc:
+        raise SystemExit("%s is not readable TOML: %s" % (path, exc))
 
 
 def expand_reviewer(assignment: str) -> List[str]:
@@ -664,6 +673,19 @@ def updates_from_effort(item: str) -> List[TomlUpdate]:
     return [("effort", name, probe.effort[name]) for name in sorted(probe.effort)]
 
 
+# TOML basic-string escapes. A control character is not writable raw, so the
+# whole set is spelled here rather than the two that happened to show up.
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def format_toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -671,8 +693,15 @@ def format_toml_value(value: Any) -> str:
         return str(value)
     if isinstance(value, list):
         return "[" + ", ".join(format_toml_value(item) for item in value) + "]"
-    text = str(value)
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    out = []
+    for char in str(value):
+        if char in _TOML_ESCAPES:
+            out.append(_TOML_ESCAPES[char])
+        elif char < " " or char == "\x7f":
+            out.append("\\u%04X" % ord(char))
+        else:
+            out.append(char)
+    return '"' + "".join(out) + '"'
 
 
 def update_simple_toml(text: str, updates: Sequence[TomlUpdate]) -> str:
@@ -843,43 +872,40 @@ def _upsert_toml_key(text: str, section: str, key: str, value: Any) -> str:
 
 
 def parse_simple_toml(text: str) -> Dict[str, Dict[str, Any]]:
-    """Minimal TOML: [section], key = \"str\" | true | false | int | [list]."""
-    sections: Dict[str, Dict[str, Any]] = {}
-    current = "default"
-    sections[current] = {}
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line.startswith("[") and line.endswith("]"):
-            current = line[1:-1].strip()
-            sections.setdefault(current, {})
-            continue
-        if "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        sections[current][key.strip()] = _parse_toml_value(val.strip())
+    """Read the config file. TOML is parsed by the layer that owns the format.
+
+    ``tomllib`` is the reader: quoting, escapes, and where a ``#`` starts a
+    comment are its rules, not a second opinion here. The writer stays
+    hand-rolled because it preserves comments and unknown keys, which
+    ``tomllib`` cannot do -- so writer and reader are a seam, held by the
+    round-trip contract test, not by two parsers agreeing by inspection.
+
+    Shape is flattened to ``{section: {key: value}}``; a nested table keeps
+    its dotted name. Top-level keys land under ``default``.
+    """
+    try:
+        data = tomllib.loads(text or "")
+    except tomllib.TOMLDecodeError as exc:
+        raise TomlError(str(exc)) from exc
+    sections: Dict[str, Dict[str, Any]] = {"default": {}}
+    _flatten_tables(data, "", sections)
     return sections
 
 
-def _parse_toml_value(val: str) -> Any:
-    if val.startswith("[") and val.endswith("]"):
-        inner = val[1:-1].strip()
-        if not inner:
-            return []
-        return [_parse_toml_value(p.strip()) for p in inner.split(",")]
-    if (val.startswith('"') and val.endswith('"')) or (
-        val.startswith("'") and val.endswith("'")
-    ):
-        return val[1:-1]
-    if val.lower() == "true":
-        return True
-    if val.lower() == "false":
-        return False
-    try:
-        return int(val)
-    except ValueError:
-        return val
+class TomlError(ValueError):
+    """Unreadable config file. Carries tomllib's own message."""
+
+
+def _flatten_tables(
+    table: Dict[str, Any], prefix: str, out: Dict[str, Dict[str, Any]]
+) -> None:
+    name = prefix or "default"
+    out.setdefault(name, {})
+    for key, value in table.items():
+        if isinstance(value, dict):
+            _flatten_tables(value, "%s.%s" % (prefix, key) if prefix else str(key), out)
+            continue
+        out[name][str(key)] = value
 
 
 def _apply_toml(cfg: Config, data: Dict[str, Dict[str, Any]]) -> None:
