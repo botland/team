@@ -27,6 +27,7 @@ from team.config import (
 )
 from team.merge import merge_reviews
 from team.runners import (
+    write_tool_path_filters,
     Result,
     Runtime,
     describe_runtime_failure,
@@ -49,7 +50,9 @@ from team.util import (
     engine_root,
     explicit_roots,
     load_json,
+    posix,
     normalize_root,
+    write_atomic,
     write_text,
 )
 
@@ -62,6 +65,31 @@ class PipelineError(RuntimeError):
 # later hops read it so they do not recensus. Census is a map, not evidence.
 # Diffs and working-tree files remain required reading.
 CENSUS_ARTIFACT = "census.md"
+
+# An artifact this small travels in the prompt instead of costing the hop a
+# tool round trip. Deliberately conservative: see Pipeline._inline_choice.
+INLINE_ARTIFACT_MAX = 4 * 1024
+INLINE_TOTAL_MAX = 12 * 1024
+
+# Artifacts that aggregate findings across roles. Never inlined at any size:
+# a role's scope is what the orchestrator *hands* it, and pasting the whole
+# plan into a test-writer's prompt hands it every implementation finding
+# too. They stay listed, exactly as before, so a hop that genuinely needs the
+# wider picture can still open one. The scoped findings for a hop arrive by
+# their own route (_findings_prompt_lines), already filtered by kind.
+# Names appended to a reused census. A cap, not a summary: past this many the
+# map is stale enough that the count is the useful signal.
+_CENSUS_MOVED_MAX = 40
+
+# Accumulated context past which a warm chain costs more than it saves. A turn
+# re-sends everything the session holds, so a long chain inverts: measured
+# hops average ~54k context per turn, and a session carrying twice that is
+# paying more per turn than a cold hop pays in total.
+WARM_CONTEXT_CEILING = 120_000
+
+CROSS_ROLE_ARTIFACTS = frozenset(
+    {"apply-plan.md", "review.md", "guardian.md", "followups.md", "apply-seq.md"}
+)
 
 # HEAD copies of product law, for comparison. Live AGENTS.md is still R.
 RANGE_HEAD_LAW = (
@@ -133,6 +161,18 @@ class Pipeline:
         # raises "dictionary changed size during iteration", and two unsynchronised
         # read-modify-writes of last_review drop one reviewer's recording.
         self._state_lock = threading.RLock()
+        # Bytes the last _listed_artifacts offered this hop, for the ledger.
+        # Thread-local for the same reason the lock exists: reviewer="both"
+        # builds two prompts on this one Pipeline at once, and a shared
+        # attribute would bill one reviewer's listing to the other.
+        self._tls = threading.local()
+        # Live warm chains, (role, runtime, capability) -> session + context.
+        # In-process only: a resumed run has no live session and starts cold.
+        self._warm_chains: Dict[tuple, Dict[str, Any]] = {}
+        # Paths this process wrote itself, path -> content id. The fence bills
+        # a hop for what the hop wrote, not for these.
+        self._orchestrator_writes: Dict[str, str] = {}
+        self._seed_census()
 
     def log(self, msg: str) -> None:
         self.log_lines.append(msg)
@@ -229,9 +269,6 @@ class Pipeline:
         self._require_write_scope(role, cap)
         rt: Runtime = runtime_for(runtime_name)
         session_key = "%s:%s" % (role, runtime_name)
-        # Files are the handoff. A stored session is a log id, not a thread.
-        # Always mint a new --session-id; never --resume / -r.
-        sid = str(uuid.uuid4())
         extra = dict(extra or {})
         extra.setdefault("code_root", normalize_root(self.cfg.code_root))
         extra.setdefault("test_root", normalize_root(self.cfg.test_root))
@@ -239,6 +276,13 @@ class Pipeline:
         level = self.cfg.effort_for(role)
         if level:
             extra.setdefault("effort", level)
+        # Files are the handoff. A stored session is a log id, not a thread.
+        # Cold by default: mint a new --session-id, never --resume / -r.
+        # Under [run] warm the chain below may reuse one, and only then.
+        # The key needs `extra`, hence the ordering: the tool filters are a
+        # function of the roots, not of the capability alone.
+        warm_key = self._warm_key(role, runtime_name, cap, extra)
+        sid, resume = self._warm_session(warm_key)
         before = self._snapshot_for_restore()
         complete_err: Optional[BaseException] = None
         result: Optional[Result] = None
@@ -251,7 +295,7 @@ class Pipeline:
                 schema=self.schema(schema_name),
                 capability=cap,
                 session_id=sid,
-                resume=False,
+                resume=resume,
                 work=self.work,
                 repo=self.repo,
                 timeout=self.cfg.phase_timeout,
@@ -294,7 +338,14 @@ class Pipeline:
             )
             if str(phase).startswith("reviewer-"):
                 self._record_review_result(result_path, num_turns=result.num_turns)
-            self._record_usage(role, phase, runtime_name, result)
+            self._record_usage(
+                role,
+                phase,
+                runtime_name,
+                result,
+                prompt_bytes=len(prompt.encode("utf-8")),
+                **self._take_listing_bytes(),
+            )
         if before is not None:
             self._fence_after_invoke(cap, phase, before, write_verify)
         if complete_err is not None:
@@ -406,8 +457,103 @@ class Pipeline:
                 runtime_name=runtime_name,
                 write_verify=write_verify,
             )
+        # Only here: every way out of invoke above this line raised, and a hop
+        # that raised leaves its session in a state the next hop must not
+        # inherit. result.success is the *runtime's* verdict ("the CLI exited
+        # 0 and returned JSON"), which is true for a schema failure, a fence
+        # violation and an unfinished inspect alike.
+        self._note_warm_hop(warm_key, result)
         self._adopt_census(result.output)
         return result
+
+    def _warm_key(
+        self, role: str, runtime: str, capability: str, extra: Dict[str, Any]
+    ) -> tuple:
+        """Everything that must match for two hops to share a session.
+
+        Not `(role, runtime, capability)`: for the write capabilities the
+        tool filters are not a function of capability alone. Both adapters
+        derive them with ``write_tool_path_filters(capability, extra)``, whose
+        `extra` carries code_root, test_root and submodule_paths -- and
+        `_adopt_design_roots` rewrites those mid-run from any architect or
+        replan output. Two implementer hops separated by a replan that moved
+        code_root would otherwise share a session while declaring different
+        --allowedTools / --allow globs on resume, which is exactly the vendor
+        behaviour capability was added to keep out of a chain.
+
+        Keyed on the filters themselves, so the key is derived from the argv
+        rather than from a proxy for it.
+        """
+        allow, deny = write_tool_path_filters(capability, extra)
+        return (
+            role,
+            runtime,
+            capability,
+            tuple(allow),
+            tuple(deny),
+        )
+
+    def _warm_session(self, key: tuple) -> tuple:
+        """``(session_id, resume)`` for this hop. Cold unless a chain is live.
+
+        Files stay the protocol: every prompt is self-contained and every
+        artifact is written either way, so any link can be dropped and run
+        cold without changing the result. That is what the warm/cold
+        equivalence test pins, and it is why this is an accelerator rather
+        than a second channel.
+
+        A chain needs the same role, runtime **and capability**. Capability
+        because a resumed hop re-declaring different tool filters is exactly
+        the vendor semantics nothing here executes (open class L2) -- so the
+        gate/write pair stays cold, deliberately.
+
+        It also needs the accumulated context to be under a ceiling. A warm
+        chain saves re-derivation for two or three hops and then inverts: a
+        turn re-sends the whole context, so a session that has grown past the
+        ceiling costs more per turn than a cold hop pays in total.
+        """
+        fresh = str(uuid.uuid4())
+        if not getattr(self.cfg, "warm", False):
+            return fresh, False
+        # Consumed, not merely read. A hop must re-earn the chain by finishing
+        # cleanly -- _note_warm_hop re-arms it at the one exit where the whole
+        # hop has succeeded. Anything that raises in between therefore leaves
+        # no chain, including a hop that resumed one and then failed.
+        with self._state_lock:
+            live = self._warm_chains.pop(key, None)
+        if not live:
+            return fresh, False
+        if live.get("context", 0) > WARM_CONTEXT_CEILING:
+            self.log(
+                "warm chain %s/%s broken: context %s over ceiling"
+                % (key[0], key[1], live.get("context"))
+            )
+            return fresh, False
+        return str(live["session"]), True
+
+    def _note_warm_hop(self, key: tuple, result: Result) -> None:
+        """Arm this chain. Called only where the whole hop has succeeded."""
+        if not getattr(self.cfg, "warm", False):
+            return
+        with self._state_lock:
+            if not result.success or not result.session_id:
+                self._warm_chains.pop(key, None)
+                return
+            usage = result.usage
+            context = 0
+            if usage is not None:
+                context = (usage.input_tokens or 0) + (
+                    usage.cache_read_input_tokens or 0
+                )
+                turns = result.num_turns or 0
+                if turns:
+                    # cache_read is context summed over turns; one turn's worth
+                    # is the best available estimate of what the session holds.
+                    context = int(context / turns)
+            self._warm_chains[key] = {
+                "session": result.session_id,
+                "context": context,
+            }
 
     def _require_write_scope(self, role: str, capability: str) -> None:
         if capability == "write-code" and not explicit_roots(self.cfg.code_root):
@@ -428,7 +574,17 @@ class Pipeline:
             self.state.last_review = {"attempt": attempt, "results": []}
             self.save()
 
-    def _record_usage(self, role: str, phase: str, runtime: str, result: Result) -> None:
+    def _record_usage(
+        self,
+        role: str,
+        phase: str,
+        runtime: str,
+        result: Result,
+        *,
+        prompt_bytes: Optional[int] = None,
+        listed_bytes: Optional[int] = None,
+        inlined_bytes: Optional[int] = None,
+    ) -> None:
         """Persist provider spend for this hop. Missing $ is logged, not dropped."""
         rec = usage_mod.hop_record(
             slug=self.state.slug,
@@ -439,6 +595,9 @@ class Pipeline:
             success=result.success,
             num_turns=result.num_turns,
             usage=result.usage,
+            prompt_bytes=prompt_bytes,
+            listed_bytes=listed_bytes,
+            inlined_bytes=inlined_bytes,
         )
         usage_mod.record_hop(self.work, rec)
         self.log(usage_mod.format_hop_console(rec))
@@ -618,6 +777,52 @@ class Pipeline:
             self.cfg.test_root = test
             self.state.test_root = test
 
+    def _take_listing_bytes(self) -> Dict[str, Any]:
+        """Read and clear what the last _listed_artifacts on this thread offered.
+
+        Cleared, not merely read: the value travels by thread-local because
+        prompt building and invoking are separate calls, and a hop whose
+        prompt listed nothing must bill nothing rather than inherit its
+        predecessor's figure. Absent is unknown, the same rule as the $ column.
+        """
+        out = {
+            "listed_bytes": getattr(self._tls, "listed_bytes", None),
+            "inlined_bytes": getattr(self._tls, "inlined_bytes", None),
+        }
+        self._tls.listed_bytes = None
+        self._tls.inlined_bytes = None
+        return out
+
+    def _inline_choice(self, sizes: Dict[str, int]) -> set:
+        """Which listed artifacts travel in the prompt instead of as a path.
+
+        Carrying S bytes inline costs S on every turn of the hop. Making the
+        model fetch them costs S on every turn *after* the read, plus a whole
+        extra turn -- and a turn re-sends the entire context, which is the
+        expensive part (measured: ~54k tokens/turn, 20 turns/hop).
+
+        The caps are deliberately small because that comparison has an
+        unmeasured term: an agent can fetch several files in one turn, so N
+        listed artifacts may cost one round trip rather than N. Under batching
+        the two strategies converge, and inlining only stays ahead for
+        artifacts small enough that carrying them is nearly free. A 4 KB file
+        is ~1k tokens, ~20k over a whole hop, well under one turn's context;
+        a 40 KB one would not be. Large dumps stay listed. prompt_bytes and
+        listed_bytes in the ledger are what these numbers get tuned against.
+
+        Small files are taken first because their ratio is best.
+        """
+        chosen = set()
+        spent = 0
+        for name, size in sorted(sizes.items(), key=lambda kv: (kv[1], kv[0])):
+            if name in CROSS_ROLE_ARTIFACTS:
+                continue
+            if size > INLINE_ARTIFACT_MAX or spent + size > INLINE_TOTAL_MAX:
+                continue
+            chosen.add(name)
+            spent += size
+        return chosen
+
     def _listed_artifacts(self, names: List[str]) -> str:
         seen = set()
         ordered: List[str] = []
@@ -626,15 +831,39 @@ class Pipeline:
                 continue
             seen.add(name)
             ordered.append(name)
-        present: List[str] = []
+        sizes: Dict[str, int] = {}
         missing: List[str] = []
         for name in ordered:
             path = self.artifact(name)
             if path.is_file():
-                present.append("- %s" % path)
+                sizes[name] = path.stat().st_size
             else:
                 missing.append("- %s" % name)
+        inline = self._inline_choice(sizes)
+        # Only what is left to fetch. Counting inlined artifacts here too
+        # would double-count them -- they are already inside prompt_bytes --
+        # and moving one from listed to inlined would not move the ledger on
+        # this axis at all, which is precisely the comparison the field
+        # exists to make.
+        self._tls.listed_bytes = sum(
+            size for name, size in sizes.items() if name not in inline
+        )
+        self._tls.inlined_bytes = sum(
+            size for name, size in sizes.items() if name in inline
+        )
+        present = [
+            "- %s" % self.artifact(name) for name in ordered if name in sizes and name not in inline
+        ]
         lines = ["Work directory: %s" % self.work]
+        for name in ordered:
+            if name not in inline:
+                continue
+            lines.append("")
+            lines.append("--- %s (inlined below; do not open it again) ---" % name)
+            lines.append(self.read_artifact(name).rstrip("\n"))
+            lines.append("--- end %s ---" % name)
+        if inline:
+            lines.append("")
         if present:
             lines.append("Read these files with tools before answering:")
             lines.extend(present)
@@ -654,11 +883,125 @@ class Pipeline:
                 "Judgments stay in your role artifact. "
                 "The orchestrator writes census.md once."
             )
+        # Inlined artifacts are already in front of the model, but the tree is
+        # not: a hop that answers from artifacts alone has reviewed nobody's
+        # code. unfinished_inspect enforces the same rule from the other side.
         lines.append(
-            "Use tools on the listed present files and the paths your task names. "
+            "%sUse tools on the paths your task names, and on the tree itself. "
+            "An inlined artifact is a claim, not the code. "
             "An empty or thin answer is valid only after that inspect."
+            % ("Do not re-open anything inlined above. " if inline else "")
         )
         return "\n".join(lines)
+
+    def _census_key(self) -> str:
+        """What a cached census is a census *of*. Empty when unanswerable.
+
+        HEAD alone: a census is a tree inventory, which is a property of the
+        commit, not of the slug that paid for it. The dirty set rides in the
+        sidecar rather than the key, because a working tree changes on every
+        hop and keying on it would never hit.
+        """
+        if not gitutil.is_git_repo(self.repo):
+            return ""
+        return gitutil.head(self.repo) or ""
+
+    def _census_cache(self, key: str) -> Path:
+        return self.repo / ".team" / "census" / ("%s.md" % key)
+
+    def _publish_census(self) -> None:
+        """Copy this slug's census into the repo-wide cache.
+
+        ``.team/census`` is deliberately **not** fence-exempt: it is durable
+        and repo-wide, so anything a hop could leave there would be an input
+        to every later run's prompts. The write is declared instead, so the
+        fence bills the hop for what the hop wrote and not for this.
+        """
+        key = self._census_key()
+        if not key:
+            return
+        text = self.read_artifact(CENSUS_ARTIFACT)
+        if not text.strip():
+            return
+        cached = self._census_cache(key)
+        if cached.is_file():
+            return
+        # Sidecar first: a reader that finds the map without it refuses to
+        # reuse, so the incomplete state is the safe one.
+        dump_json(
+            cached.with_suffix(".json"),
+            {
+                "head": key,
+                "slug": self.state.slug,
+                "entries": self._census_entries(),
+            },
+        )
+        # Atomic, for the reason dump_json's own docstring gives: write_text
+        # truncates then writes, and two reviewer threads can reach this path
+        # concurrently, leaving a reader in another process a torn map beside
+        # a valid sidecar.
+        write_atomic(cached, text)
+        self._note_orchestrator_write(cached)
+        self._note_orchestrator_write(cached.with_suffix(".json"))
+
+    def _census_entries(self) -> Dict[str, str]:
+        """Content ids of the dirty tree this census describes."""
+        snap = gitutil.snapshot(self.repo)
+        entries = dict(snap.get("entries") or {})
+        return {
+            rel: cid
+            for rel, cid in entries.items()
+            if rel in set(gitutil.product_paths(entries.keys()))
+        }
+
+    def _seed_census(self) -> None:
+        """Reuse this repo state's census instead of buying it again.
+
+        census.md was per-slug, so every feature and every review paid an
+        inspect hop to re-derive the same tree map. Under .team/census it is
+        written once per commit and read by every later run. Nothing is
+        assumed about the dirty tree: paths that moved since the census was
+        written are named, so a reused map is never stale-in-a-lying-way.
+        """
+        if self.artifact(CENSUS_ARTIFACT).is_file():
+            return
+        key = self._census_key()
+        if not key:
+            return
+        cached = self._census_cache(key)
+        sidecar = cached.with_suffix(".json")
+        # No sidecar means no record of the tree it describes, so nothing can be
+        # said about what moved. Buy a fresh census rather than reuse a map
+        # whose staleness is unknowable.
+        if not cached.is_file() or not sidecar.is_file():
+            return
+        text = cached.read_text(encoding="utf-8")
+        # Content ids, not a path list. A path dirty when the census was
+        # written and still dirty now, with entirely different bytes, is in
+        # both path sets and would never be named -- the map would assert a
+        # fact about a file it has never seen. gitutil.snapshot already
+        # derives these and the fence already trusts them.
+        stamped = dict(load_json(sidecar).get("entries") or {})
+        now = self._census_entries()
+        moved = sorted(
+            rel
+            for rel in set(now) | set(stamped)
+            if now.get(rel) != stamped.get(rel)
+        )
+        if moved:
+            text = text.rstrip() + "\n\n## Changed since this census\n\n" + "".join(
+                "- %s\n" % rel for rel in moved[:_CENSUS_MOVED_MAX]
+            )
+            if len(moved) > _CENSUS_MOVED_MAX:
+                text += "- ... and %d more\n" % (len(moved) - _CENSUS_MOVED_MAX)
+            text += (
+                "\nThese paths differ from the tree this census describes. "
+                "Read them; do not trust the map for them.\n"
+            )
+        self.write_artifact(CENSUS_ARTIFACT, text)
+        self.log(
+            "census reused from %s (%d path(s) changed since)" % (cached, len(moved))
+        )
 
     def _adopt_census(self, output: Any) -> None:
         """First inspect hop to emit census_markdown writes census.md. Later hops read it."""
@@ -672,6 +1015,7 @@ class Pipeline:
             return
         self.write_artifact(CENSUS_ARTIFACT, text)
         self.log("census written")
+        self._publish_census()
 
     def _engineering_rules(self) -> str:
         path = engine_root() / "docs" / "engineering.md"
@@ -722,6 +1066,40 @@ class Pipeline:
             return dict(start.get("entries") or {})
         return dict(phase_before.get("entries") or {})
 
+    def _note_orchestrator_write(self, path: Path) -> None:
+        """Record a path this process wrote, with the bytes it wrote.
+
+        The fence's question is "did the *hop* write outside its roots". A
+        sibling reviewer thread's window is open while orchestrator code
+        writes the census cache, so without this the orchestrator's own write
+        is billed to whichever hop happens to be running. The alternative --
+        exempting the path by name -- would make it hop-writable, and a
+        durable repo-wide path a hop can write is an input to every later run.
+
+        Content id, not just the path: a hop that later changes those bytes
+        no longer matches and is a violation again. Writing byte-identical
+        content is the only way to be forgiven, which changes nothing.
+        """
+        try:
+            rel = posix(str(path.resolve().relative_to(self.repo.resolve())))
+        except (OSError, ValueError):
+            return
+        with self._state_lock:
+            self._orchestrator_writes[rel] = gitutil.content_id(self.repo, rel)
+
+    def _drop_orchestrator_writes(self, delta: List[str], after: dict) -> List[str]:
+        """Remove paths this process wrote and the hop left alone."""
+        with self._state_lock:
+            mine = dict(self._orchestrator_writes)
+        if not mine:
+            return delta
+        entries = dict(after.get("entries") or {})
+        return [
+            rel
+            for rel in delta
+            if not (rel in mine and entries.get(rel) == mine[rel])
+        ]
+
     def _verify_write(
         self,
         phase: str,
@@ -736,13 +1114,14 @@ class Pipeline:
             before_snap = {"head": "", "paths": list(before or []), "entries": {}}
         after = self._snapshot()
         delta = gitutil.changed_paths(self.repo, before_snap, after)
+        delta = self._drop_orchestrator_writes(delta, after)
         work_root = ".team/work/%s" % self.state.slug
         roots = explicit_roots(allowed)
         denied_roots = explicit_roots(denied or [])
         ok, bad = gitutil.verify_delta(
             delta,
             roots,
-            always_allowed=[work_root, ".team/work"],
+            always_allowed=[work_root, *gitutil.PROTOCOL_ROOTS],
             denied_roots=denied_roots,
         )
         # Extra-worktree is a different space than in-repo membership.
@@ -764,7 +1143,7 @@ class Pipeline:
             self._run_start_entries(before_snap),
             dict(before_snap.get("entries") or {}),
             dict(after.get("entries") or {}),
-            exempt_roots=(work_root, ".team/work"),
+            exempt_roots=(work_root, *gitutil.PROTOCOL_ROOTS),
         )
         gitutil.write_path_list(self.work / "git" / ("after-%s.txt" % phase), delta)
         report = gitutil.describe_verify(
@@ -1150,10 +1529,26 @@ class Pipeline:
             gitutil.write_path_list(self.work / "git" / "apply-names.txt", [])
             return
         dirty = gitutil.porcelain_paths(self.repo)
-        patch = gitutil.worktree_diff(self.repo, dirty)
-        self.write_artifact("git/apply.patch", patch or "(empty apply tree)\n")
-        names = gitutil.paths_from_diff(patch) or gitutil.product_paths(dirty)
+        # Sections carry their -z name, so the budget can drop bytes without
+        # dropping the path from apply-names.txt. The fence still sees every
+        # dirty path: porcelain_paths above is untouched by any of this.
+        sections = gitutil.worktree_diff_sections(self.repo, dirty)
+        patch, omitted = gitutil.budget_sections(
+            sections,
+            total=self.cfg.diff_budget,
+            prefer=[self.cfg.code_root, self.cfg.test_root],
+        )
+        note = gitutil.budget_note(
+            omitted, names_file="git/apply-names.txt", total=self.cfg.diff_budget
+        )
+        self.write_artifact("git/apply.patch", note + (patch or "(empty apply tree)\n"))
+        names = [rel for rel, _text in sections] or gitutil.product_paths(dirty)
         gitutil.write_path_list(self.work / "git" / "apply-names.txt", names)
+        if omitted:
+            self.log(
+                "apply surface: %d file(s) over the %d-byte budget, named in "
+                "git/apply-names.txt" % (len(omitted), self.cfg.diff_budget)
+            )
         range_md = self.read_artifact("range.md")
         if range_md and "## Apply working tree" not in range_md:
             extra = [
@@ -1556,7 +1951,7 @@ class Pipeline:
             and before.get("head") != after.get("head")
         )
         try:
-            self._verify_write(phase, [".team/work"], before)
+            self._verify_write(phase, list(gitutil.PROTOCOL_ROOTS), before)
             if head_changed:
                 raise PipelineError(
                     "%s changed HEAD %s -> %s (read-only hop must not commit)"
@@ -2451,8 +2846,24 @@ class Pipeline:
     ) -> None:
         end = self._snapshot()
         touched = gitutil.product_paths(gitutil.changed_paths(self.repo, start, end))
-        patch = gitutil.worktree_diff(self.repo, touched) if gitutil.is_git_repo(self.repo) else ""
-        if patch:
+        patch = ""
+        if gitutil.is_git_repo(self.repo):
+            sections = gitutil.worktree_diff_sections(self.repo, touched)
+            patch, omitted = gitutil.budget_sections(
+                sections,
+                total=self.cfg.diff_budget,
+                prefer=[self.cfg.code_root, self.cfg.test_root],
+            )
+            note = gitutil.budget_note(
+                omitted,
+                names_file="this class's checkpoint.json (\"touched\")",
+                total=self.cfg.diff_budget,
+            )
+            # Only when there is a diff to annotate. A file containing nothing
+            # but an omission header is not "exactly what this class changed",
+            # which is what phase_seq_review tells the hop it is reading.
+            patch = (note + patch) if patch.strip() else ""
+        if patch.strip():
             write_text(seq_dir / "delta.patch", patch)
         assumptions = []
         if item.get("kind") == "architecture":
@@ -2579,6 +2990,17 @@ class Pipeline:
             % (self.cfg.code_root, self.cfg.test_root)
         )
 
+    def _seq_delta_artifact(self, seq_dir: Path) -> List[str]:
+        """The one patch a class hop needs: what this class changed.
+
+        _write_seq_checkpoint already derives it from the class's own start
+        and end snapshots. Listing it is what turns "inspect git status" --
+        which an inspect hop has no terminal for -- into something the hop can
+        actually do, and it is a fraction of the whole apply surface.
+        """
+        rel = seq_dir.relative_to(self.work) / "delta.patch"
+        return [str(rel)] if (self.work / rel).is_file() else []
+
     def phase_seq_review(self, seq_dir: Path, items: List[Dict[str, Any]]) -> None:
         runtimes = expand_reviewer(self.cfg.assignment("reviewer"))
         artifacts = [
@@ -2589,6 +3011,7 @@ class Pipeline:
             "apply-impl-summary.md",
             "apply-tdd-summary.md",
             "apply-test-report.md",
+            *self._seq_delta_artifact(seq_dir),
         ]
 
         def one(runtime: str) -> Result:
@@ -2599,7 +3022,8 @@ class Pipeline:
                     "CLASS REVIEW. Review only the class that apply --seq just closed.",
                     "The original review.md is out of scope. Do not rewrite it.",
                     *self._inspect_only_lines(),
-                    "Inspect the actual files and git status.",
+                    "The listed delta.patch is exactly what this class changed. "
+                    "Read it and the files it names. You have no terminal.",
                     self._reviewer_finding_rules(),
                     "Class:\n" + json.dumps(items, indent=2),
                     "You are the %s reviewer. Do not assume another reviewer exists."
@@ -2653,6 +3077,7 @@ class Pipeline:
                         "test-contract.md",
                         "apply-plan.md",
                         "apply-test-report.md",
+                        *self._seq_delta_artifact(seq_dir),
                     ]
                 ),
                 "CLASS GUARDIAN. Evaluate only this applied class.",
@@ -2968,12 +3393,19 @@ def start_range_review(
     write_text(work / "brief.md", desc + "\n")
     write_text(work / "range.md", "# Range\n\n%s\n\n- base: `%s`\n- kind: %s\n- commits: %d\n" % (desc, base or "(root)", kind, count))
     write_text(work / "git" / "log.txt", log or "(empty range)\n")
-    write_text(work / "git" / "diff.patch", diff or "(empty diff)\n")
     # Superset of the patch's paths: names.txt is the cheap map, so it carries
     # paths the deduped cumulative patch no longer shows (a file renamed or
-    # deleted mid-range). One derivation, in gitutil.
+    # deleted mid-range). One derivation, in gitutil. Read from the *uncapped*
+    # patch on the PR rail -- capping first would hide exactly the paths the
+    # budget note promises are listed here.
     names = gitutil.range_name_only(repo, base) if not pr else gitutil.paths_from_diff(diff)
     gitutil.write_path_list(work / "git" / "names.txt", names)
+    # The one rail with only patch text; names.txt above is the complete list.
+    diff, dropped = gitutil.budget_patch_text(diff, total=cfg.diff_budget)
+    diff_note = gitutil.budget_note(
+        count=dropped, names_file="git/names.txt", total=cfg.diff_budget
+    )
+    write_text(work / "git" / "diff.patch", diff_note + (diff or "(empty diff)\n"))
     for src, dest in RANGE_HEAD_LAW:
         blob = gitutil.committed_blob(repo, src)
         if blob.strip():

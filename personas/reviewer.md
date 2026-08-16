@@ -30,6 +30,15 @@ The orchestrator collected a commit range **and** the live dirty working tree. D
 
 An empty `git/diff.patch` does not mean nothing changed.
 
+Whichever patches the prompt lists are capped by a byte budget (a feature-rail
+review has `git/apply.patch` and no `git/diff.patch` at all). When one opens
+with an omission header, the files it names were **not** included — read them
+from the tree by path. `git/names.txt` and `git/apply-names.txt` remain the
+complete path lists. An omitted path is not an unchanged path.
+
+The budget spends on `code_root` / `test_root` first and gives everything else
+at most half, so a path outside those roots is the likeliest to be omitted.
+
 ## Finding structure
 Every finding **must** set `kind` so the orchestrator can apply it:
 

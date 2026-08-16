@@ -350,7 +350,7 @@ class FakePipelineTests(unittest.TestCase):
         self.assertTrue(all(sids), sids)
         self.assertEqual(len(sids), len(set(sids)), sids)
 
-    def test_design_md_is_listed_not_inlined(self):
+    def test_small_inputs_ride_in_the_prompt_and_big_dumps_do_not(self):
         rc = self._run(
             [
                 "--repo",
@@ -369,7 +369,10 @@ class FakePipelineTests(unittest.TestCase):
         self.assertTrue(design.strip())
         critic = (work / "prompts" / "critic.prompt.md").read_text(encoding="utf-8")
         self.assertIn("design.md", critic)
-        self.assertNotIn(design, critic)
+        # A few-KB design is cheaper carried than fetched: a tool round trip
+        # re-sends the hop's whole context, which dwarfs the file.
+        self.assertIn(design.strip(), critic)
+        self.assertIn("do not open it again", critic)
 
 
 if __name__ == "__main__":

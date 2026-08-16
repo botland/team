@@ -127,6 +127,17 @@ def _parser() -> argparse.ArgumentParser:
         help="Skip optional phases (critic, adversarial, guardian, debugger).",
     )
     p.add_argument("--fake", action="store_true", help="Do not call Claude/Grok; emit canned artifacts.")
+    p.add_argument(
+        "--warm",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Resume a session across consecutive hops of one role+runtime+capability "
+            "instead of minting a new one. Files stay the protocol; any link can be "
+            "dropped and rerun cold with the same result. --no-warm overrides "
+            "[run] warm for one run."
+        ),
+    )
     p.add_argument("--code-root", default="", help="Override implementation root")
     p.add_argument("--test-root", default="", help="Override test root")
     p.add_argument("--test-command", default="", help="Override test command")
@@ -349,6 +360,12 @@ def _parser() -> argparse.ArgumentParser:
         default="",
         help="Work slug. Omit to list every .team/work run.",
     )
+    costs.add_argument(
+        "--by",
+        choices=("slug", "phase", "role", "runtime"),
+        default="",
+        help="Group spend by this field, dearest first, with turns and context/turn.",
+    )
     costs.set_defaults(func=cmd_costs)
 
     roles = sub.add_parser(
@@ -439,6 +456,20 @@ def _parser() -> argparse.ArgumentParser:
         help="Write run.phase_timeout (seconds; 0 = no limit)",
     )
     cfg_cmd.add_argument(
+        "--diff-budget",
+        dest="set_diff_budget",
+        default=None,
+        type=int,
+        help="Write run.diff_budget (patch bytes handed to a hop; 0 = no cap)",
+    )
+    cfg_cmd.add_argument(
+        "--warm",
+        dest="set_warm",
+        default=None,
+        action=argparse.BooleanOptionalAction,
+        help="Write run.warm (resume sessions within one role+runtime+capability)",
+    )
+    cfg_cmd.add_argument(
         "--unset",
         dest="unset_keys",
         action="append",
@@ -488,6 +519,7 @@ def _cfg(args, **kwargs):
         test_command=args.test_command,
         depth=getattr(args, "depth", "") or "",
         effort=getattr(args, "effort", None) or [],
+        warm=getattr(args, "warm", None),
         **kwargs,
     )
 
@@ -1049,6 +1081,7 @@ def cmd_status(args) -> int:
 def cmd_costs(args) -> int:
     repo = Path(args.repo).resolve() if args.repo else Path.cwd()
     slug = args.slug or ""
+    group = getattr(args, "by", "") or ""
     if slug:
         hops = usage_mod.load_repo_hops(repo, slug=slug)
         if not hops:
@@ -1057,6 +1090,9 @@ def cmd_costs(args) -> int:
                 print("No run at %s (missing state.json)" % work, file=sys.stderr)
                 return 1
             print("no usage logged for %s" % slug)
+            return 0
+        if group:
+            print(_costs_grouped(hops, group))
             return 0
         print(usage_mod.render_console(hops, slug=slug))
         ledger = usage_mod.repo_ledger_path(repo)
@@ -1072,6 +1108,9 @@ def cmd_costs(args) -> int:
     if not hops:
         print("no usage logged in %s" % (repo / ".team" / "work"))
         return 0
+    if group:
+        print(_costs_grouped(hops, group))
+        return 0
     by_slug: Dict[str, List[dict]] = {}
     for hop in hops:
         by_slug.setdefault(str(hop.get("slug") or "(none)"), []).append(hop)
@@ -1080,6 +1119,16 @@ def cmd_costs(args) -> int:
         rows.append(("total", usage_mod.summarize(hops)))
     print(usage_mod.format_costs_listing(rows))
     return 0
+
+
+def _costs_grouped(hops: List[dict], group: str) -> str:
+    """One grouped listing. A hop costs turns x context; both columns show."""
+    rows = usage_mod.group_hops(hops, group)
+    if len(rows) > 1:
+        rows.append(("total", usage_mod.summarize(hops)))
+    return usage_mod.format_costs_listing(
+        rows, label=group.upper(), show_turns=True
+    )
 
 
 def cmd_roles(args) -> int:
@@ -1144,6 +1193,8 @@ def cmd_config(args) -> int:
             skip=_config_skip(args.set_skip, args.skip),
             range_reviewer=args.set_range_reviewer,
             phase_timeout=args.set_phase_timeout,
+            diff_budget=args.set_diff_budget,
+            warm=args.set_warm,
             effort=args.set_effort or args.effort,
         )
     except SystemExit as exc:
@@ -1197,6 +1248,8 @@ def _print_effective_config(dest: Path, cfg) -> None:
     print("[run]")
     print("  skip           %s" % (", ".join(cfg.skip) if cfg.skip else "(none)"))
     print("  phase_timeout  %s" % cfg.phase_timeout)
+    print("  diff_budget    %s" % (cfg.diff_budget or "(no cap)"))
+    print("  warm           %s" % ("on" if cfg.warm else "off"))
     print("")
     print("[review]")
     print("  range_reviewer %s" % cfg.range_reviewer)

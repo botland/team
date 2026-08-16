@@ -7,6 +7,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from team import gitutil
 from team.util import engine_root, normalize_root, write_text
 
 # Shipped headless coding-agent adapters. Interchangeable: any role that
@@ -238,6 +239,14 @@ class Config:
         self.roles: Dict[str, str] = {name: spec["default"] for name, spec in ROLES.items()}
         self.skip: List[str] = []
         self.phase_timeout = 1800
+        # Bytes of patch a hop is handed. Not a fence: the write fence still
+        # sees every dirty path. This caps what a reader is asked to ingest,
+        # because a hop pays its context on every turn.
+        self.diff_budget = gitutil.DIFF_BUDGET
+        # Opt-in: consecutive hops of one role+runtime+capability resume a
+        # session instead of minting a new one. An accelerator, never the
+        # channel -- see Pipeline._warm_session.
+        self.warm = False
         self.fake = False
         self.dry_run = False
         self.force = False
@@ -298,6 +307,7 @@ def load_config(
     test_command: str = "",
     depth: str = "",
     effort: Optional[Iterable[str]] = None,
+    warm: Optional[bool] = None,
 ) -> Config:
     cfg = Config()
     cfg.repo = repo.resolve()
@@ -344,9 +354,27 @@ def load_config(
     if env_skip:
         cfg.skip.extend(resolve_skip(p) for p in env_skip.split(",") if p.strip())
 
+    # Through the same validator the file and the flag use: an env var is
+    # another spelling of the option, not a bypass. TEAM_DIFF_BUDGET=abc was
+    # an uncaught traceback and =-5 silently disabled a cap the writer
+    # explicitly refuses to store.
     timeout = os.environ.get("TEAM_PHASE_TIMEOUT")
     if timeout:
-        cfg.phase_timeout = int(timeout)
+        cfg.phase_timeout = validate_config_update(
+            "run", "phase_timeout", "int", timeout
+        )
+
+    budget = os.environ.get("TEAM_DIFF_BUDGET")
+    if budget:
+        cfg.diff_budget = validate_config_update(
+            "run", "diff_budget", "int", budget
+        )
+
+    warm_env = os.environ.get("TEAM_WARM")
+    if warm_env:
+        cfg.warm = parse_bool(warm_env, what="TEAM_WARM")
+    if warm is not None:
+        cfg.warm = bool(warm)
 
     return cfg
 
@@ -489,6 +517,8 @@ _CONFIG_ALIASES = {
     "test_command": ("paths", "test_command", "str"),
     "skip": ("run", "skip", "list"),
     "phase_timeout": ("run", "phase_timeout", "int"),
+    "diff_budget": ("run", "diff_budget", "int"),
+    "warm": ("run", "warm", "bool"),
     "range_reviewer": ("review", "range_reviewer", "str"),
 }
 _UNSET_DEFAULTS = {
@@ -497,6 +527,8 @@ _UNSET_DEFAULTS = {
     ("paths", "test_command"): "",
     ("run", "skip"): [],
     ("run", "phase_timeout"): 1800,
+    ("run", "diff_budget"): gitutil.DIFF_BUDGET,
+    ("run", "warm"): False,
     ("review", "range_reviewer"): "grok",
 }
 _KEY_LINE = re.compile(r"^(\s*)([A-Za-z0-9_.-]+)(\s*=\s*)(.*)$")
@@ -527,6 +559,10 @@ def resolve_config_key(name: str) -> Tuple[str, str, str]:
                 return "run", "skip", "list"
             if key == "phase_timeout":
                 return "run", "phase_timeout", "int"
+            if key == "diff_budget":
+                return "run", "diff_budget", "int"
+            if key == "warm":
+                return "run", "warm", "bool"
         elif section == "review":
             key = rest.replace("-", "_")
             if key == "range_reviewer":
@@ -547,12 +583,34 @@ def resolve_config_key(name: str) -> Tuple[str, str, str]:
     if alias in _CONFIG_ALIASES:
         return _CONFIG_ALIASES[alias]
     raise SystemExit(
-        "Unknown config key %r (paths, skip, phase_timeout, range_reviewer, effort.<role>, or a role)"
+        "Unknown config key %r (paths, skip, phase_timeout, diff_budget, warm, "
+        "range_reviewer, effort.<role>, or a role)"
         % name
     )
 
 
+_TRUE = ("1", "true", "yes", "on")
+_FALSE = ("0", "false", "no", "off")
+
+
+def parse_bool(raw: Any, *, what: str) -> bool:
+    """One spelling law for every boolean option, however it arrived."""
+    if isinstance(raw, bool):
+        return raw
+    text = str(raw if raw is not None else "").strip().lower()
+    if text in _TRUE:
+        return True
+    if text in _FALSE:
+        return False
+    raise SystemExit(
+        "%s must be a boolean (%s), got %r"
+        % (what, " | ".join(_TRUE + _FALSE), raw)
+    )
+
+
 def parse_config_value(kind: str, raw: str) -> Any:
+    if kind == "bool":
+        return parse_bool(raw, what="boolean option")
     if kind == "int":
         try:
             return int(str(raw).strip())
@@ -600,6 +658,8 @@ def collect_config_edits(
     skip: Optional[Sequence[str]] = None,
     range_reviewer: Optional[str] = None,
     phase_timeout: Optional[int] = None,
+    diff_budget: Optional[int] = None,
+    warm: Optional[bool] = None,
     effort: Sequence[str] = (),
 ) -> Tuple[List[TomlUpdate], List[TomlDelete]]:
     """Build validated file edits. Later inputs win (pairs last)."""
@@ -636,6 +696,10 @@ def collect_config_edits(
         put("review", "range_reviewer", "str", range_reviewer)
     if phase_timeout is not None:
         put("run", "phase_timeout", "int", phase_timeout)
+    if diff_budget is not None:
+        put("run", "diff_budget", "int", diff_budget)
+    if warm is not None:
+        put("run", "warm", "bool", warm)
     for item in effort:
         for section, key, value in updates_from_effort(item):
             put(section, key, "effort", value)
@@ -662,6 +726,16 @@ def validate_config_update(section: str, key: str, kind: str, value: Any) -> Any
         return probe.effort[key]
     if section == "review" and key == "range_reviewer":
         return normalize_reviewer(str(value), what="review.range_reviewer")
+    if section == "run" and key == "warm":
+        return parse_bool(value, what="run.warm")
+    if section == "run" and key == "diff_budget":
+        try:
+            budget = int(value)
+        except (TypeError, ValueError):
+            raise SystemExit("diff_budget must be an integer, got %r" % value)
+        if budget < 0:
+            raise SystemExit("diff_budget must be >= 0 (0 disables the cap)")
+        return budget
     if section == "run" and key == "phase_timeout":
         try:
             timeout = int(value)
@@ -952,6 +1026,10 @@ def _apply_toml(cfg: Config, data: Dict[str, Dict[str, Any]]) -> None:
         cfg.skip.extend(resolve_skip(str(x)) for x in run["skip"])
     if run.get("phase_timeout") is not None:
         cfg.phase_timeout = int(run["phase_timeout"])
+    if run.get("diff_budget") is not None:
+        cfg.diff_budget = int(run["diff_budget"])
+    if run.get("warm") is not None:
+        cfg.warm = parse_bool(run["warm"], what="run.warm")
     review = data.get("review") or {}
     if review.get("range_reviewer"):
         cfg.range_reviewer = normalize_reviewer(

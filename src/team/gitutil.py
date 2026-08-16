@@ -17,6 +17,13 @@ EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 _DIFF_GIT = re.compile(r"^diff --git a/(.+) b/(.+)$", re.M)
 
+# Review-surface budget. A hop costs turns x context, so bytes handed to a
+# reader are paid on every one of that hop's turns. 512 KB is already ~128k
+# tokens of patch; past that a reader is skimming, not reviewing.
+DIFF_BUDGET = 512 * 1024
+_MIN_FILE_BUDGET = 32 * 1024
+_NOTE_NAMES = 20
+
 
 @dataclass
 class RangeSpec:
@@ -152,9 +159,18 @@ def name_status_paths(records: Sequence[str]) -> List[str]:
     return out
 
 
+# The one orchestrator-owned tree the fence ignores. Deliberately just this
+# one: it is per-slug, ephemeral, and already holds model-authored artifacts
+# scoped to that run. A durable, repo-wide path (the census cache) is *not*
+# exempt -- an exemption that outlives the run makes anything a hop leaves
+# there an input to every later run. The orchestrator writes such caches
+# outside every hop's fence window instead, which needs no exemption.
+PROTOCOL_ROOTS = (".team/work",)
+
+
 def _is_team_work(rel: str) -> bool:
-    """Orchestrator work dir — exempt from product-tree membership."""
-    return under_root(rel, ".team/work")
+    """Orchestrator-owned paths — exempt from product-tree membership."""
+    return any(under_root(rel, root) for root in PROTOCOL_ROOTS)
 
 
 def porcelain_paths(repo: Path) -> List[str]:
@@ -171,6 +187,11 @@ def porcelain_paths(repo: Path) -> List[str]:
         if not _is_team_work(rel):
             paths.add(rel)
     return sorted(paths)
+
+
+def content_id(repo: Path, rel: str) -> str:
+    """Public name for the fence's content identity of one path."""
+    return _content_id(repo, rel)
 
 
 def _content_id(repo: Path, rel: str) -> str:
@@ -438,12 +459,12 @@ def revert_product(
     repo: Path,
     before: dict,
     *,
-    skip_prefixes: Sequence[str] = (".team/work",),
+    skip_prefixes: Sequence[str] = PROTOCOL_ROOTS,
 ) -> None:
     """Revert product-tree create/modify/delete/commit to ``before``.
 
     Not unlink-only: tracked files return via git/HEAD; hop-start dirty
-    files return from stored blobs. ``.team/work`` is left alone.
+    files return from stored blobs. ``PROTOCOL_ROOTS`` are left alone.
     """
     before = before or {}
     before_head = str(before.get("head") or "")
@@ -537,20 +558,166 @@ def ignored_untracked(repo: Path) -> Set[str]:
     return {posix(rel) for rel in records if rel}
 
 
-def worktree_diff(repo: Path, paths: Sequence[str]) -> str:
-    """Unified diff of product paths vs HEAD, including new untracked files.
+def file_budget(total: int) -> int:
+    """Per-file cap derived from the total, so there is one knob to turn.
+
+    A single file may not eat the whole allowance: without this, one 1 MB
+    generated HTML report displaces every hand-written change behind it.
+    """
+    return max(_MIN_FILE_BUDGET, int(total) // 8)
+
+
+def budget_sections(
+    sections: Sequence[Tuple[str, str]],
+    *,
+    total: int,
+    prefer: Sequence[str] = (),
+) -> Tuple[str, List[str]]:
+    """Cap a patch by bytes. Returns ``(patch, omitted paths)``.
+
+    A review surface with no size law costs every downstream hop its full byte
+    count -- the same reason ``ignored_untracked`` exists, except that rule
+    delegates to the target repo's .gitignore and a repo that does not ignore
+    its build output gets an 11 MB patch.
+
+    Which bytes survive matters as much as how many. Sections arrive in git's
+    status order, which is lexical, so ``coverage-html/`` precedes ``src/``;
+    spending the allowance first-come-first-served fills it with generated
+    output that is individually *under* the per-file cap, and the reviewer
+    gets a correctly-sized patch of the wrong files. Two passes fix it:
+    paths under ``prefer`` (the role roots -- the code actually under review)
+    are served first, and inside each pass the smallest go first, because a
+    small section buys the most understanding per byte. That is the same
+    policy, for the same reason, as ``Pipeline._inline_choice``.
+
+    Omitted sections are *named*, never silently dropped: the caller writes
+    them to the path list beside the patch, so a reviewer can still open any.
+
+    ``total <= 0`` disables the cap.
+    """
+    if total <= 0:
+        return "".join(text for _rel, text in sections), []
+    per_file = file_budget(total)
+    order = {rel: i for i, (rel, _text) in enumerate(sections)}
+    roots = [posix(r).strip("/") for r in prefer if str(r).strip() not in ("", ".")]
+
+    def preferred(rel: str) -> bool:
+        # No usable roots (unset, or '.') means nothing is second-class.
+        return not roots or any(under_root(rel, root) for root in roots)
+
+    ranked = sorted(
+        sections,
+        key=lambda pair: (
+            not preferred(pair[0]),
+            len(pair[1].encode("utf-8", "replace")),
+            pair[0],
+        ),
+    )
+    # A budget is a cap, not a quota to spend. Once the role roots are served,
+    # filling the remainder with whatever else is dirty buys nothing and is
+    # paid on every turn of every hop that reads it, so paths outside those
+    # roots may take at most half the allowance.
+    outside_cap = total // 2 if roots else total
+    kept: List[Tuple[str, str]] = []
+    omitted: List[str] = []
+    spent = 0
+    spent_outside = 0
+    for rel, text in ranked:
+        size = len(text.encode("utf-8", "replace"))
+        outside = not preferred(rel)
+        if (
+            size > per_file
+            or spent + size > total
+            or (outside and spent_outside + size > outside_cap)
+        ):
+            omitted.append(rel)
+            continue
+        kept.append((rel, text))
+        spent += size
+        if outside:
+            spent_outside += size
+    # Emitted in the order the caller derived them: a patch that reads in tree
+    # order is the one a reviewer expects, whatever order the budget chose.
+    kept.sort(key=lambda pair: order.get(pair[0], 0))
+    return "".join(text for _rel, text in kept), sorted(omitted, key=lambda r: order.get(r, 0))
+
+
+def budget_patch_text(patch: str, *, total: int) -> Tuple[str, int]:
+    """Cap an already-assembled patch. Returns ``(patch, sections dropped)``.
+
+    For the one rail that has only patch text (a range or PR bundle). Splits on
+    the section boundary and *counts* what it drops -- it deliberately does not
+    read the names out of those headers, because the authoritative path list is
+    already written beside the patch from ``-z`` records (``range_name_only``).
+    Counting a boundary is safe where naming from it would not be (open class
+    L5).
+    """
+    if total <= 0 or len(patch.encode("utf-8", "replace")) <= total:
+        return patch, 0
+    per_file = file_budget(total)
+    parts = patch.split("\ndiff --git ")
+    sections = [parts[0]] + ["\ndiff --git " + rest for rest in parts[1:]]
+    kept: List[str] = []
+    dropped = 0
+    spent = 0
+    for text in sections:
+        size = len(text.encode("utf-8", "replace"))
+        if size > per_file or spent + size > total:
+            dropped += 1
+            continue
+        kept.append(text)
+        spent += size
+    return "".join(kept), dropped
+
+
+def budget_note(
+    omitted: Sequence[str] = (),
+    *,
+    count: int = 0,
+    names_file: str,
+    total: int,
+) -> str:
+    """The header that keeps an omission honest. Empty when nothing was cut.
+
+    Pass ``omitted`` when the caller kept real names, or ``count`` when it only
+    knows how many sections went (the patch-text rail). Either way the note
+    says where the complete list lives, so nothing is dropped silently.
+    """
+    dropped = len(omitted) or count
+    if not dropped:
+        return ""
+    listed = "".join("#   %s\n" % rel for rel in list(omitted)[:_NOTE_NAMES])
+    if omitted and len(omitted) > _NOTE_NAMES:
+        listed += "#   ... and %d more\n" % (len(omitted) - _NOTE_NAMES)
+    return (
+        "# %d file(s) omitted from this patch: over the %d-byte review budget\n"
+        "# (per-file cap %d). Every path in this range is listed in %s -- open\n"
+        "# the ones your task names. An omitted path is not an unchanged path.\n"
+        "%s"
+        "\n" % (dropped, total, file_budget(total), names_file, listed)
+    )
+
+
+def worktree_diff_sections(repo: Path, paths: Sequence[str]) -> List[Tuple[str, str]]:
+    """``(path, diff)`` per product path vs HEAD, new untracked files included.
+
+    The per-path primitive. Callers that need to drop or cap a section keep the
+    real ``-z`` name beside its bytes here, instead of recovering the name from
+    a ``diff --git`` header afterwards (open class L5).
 
     Gitignored-untracked paths are fence members but not diff material; see
     ``ignored_untracked``.
     """
-    chunks: List[str] = []
+    sections: List[Tuple[str, str]] = []
     skip = ignored_untracked(repo) if is_git_repo(repo) else set()
     for rel in product_paths(paths):
         if rel in skip:
             continue
         tracked = git(repo, "diff", "HEAD", "--", rel, check=False)
         if tracked.strip():
-            chunks.append(tracked if tracked.endswith("\n") else tracked + "\n")
+            sections.append(
+                (rel, tracked if tracked.endswith("\n") else tracked + "\n")
+            )
             continue
         path = repo / rel
         if not path.is_file():
@@ -565,8 +732,15 @@ def worktree_diff(repo: Path, paths: Sequence[str]) -> str:
             text=True,
         )
         if proc.stdout.strip():
-            chunks.append(proc.stdout if proc.stdout.endswith("\n") else proc.stdout + "\n")
-    return "".join(chunks)
+            sections.append(
+                (rel, proc.stdout if proc.stdout.endswith("\n") else proc.stdout + "\n")
+            )
+    return sections
+
+
+def worktree_diff(repo: Path, paths: Sequence[str]) -> str:
+    """Unified diff of product paths vs HEAD, including new untracked files."""
+    return "".join(text for _rel, text in worktree_diff_sections(repo, paths))
 
 
 def changed_paths(repo: Path, before: dict, after: dict) -> List[str]:
